@@ -360,17 +360,14 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
         "run_shell",
         "import_conversation_files_to_project",
         "export_project_artifact",
+        "read_project_artifact",
     ] {
         assert!(
             names.contains(&promoted),
             "{promoted} must be adaptive-direct"
         );
     }
-    for low_level_artifact in [
-        "save_project_artifact",
-        "read_project_artifact",
-        "artifact_upload_begin",
-    ] {
+    for low_level_artifact in ["save_project_artifact", "artifact_upload_begin"] {
         assert!(
             !names.contains(&low_level_artifact),
             "{low_level_artifact} must remain behind the adaptive gateway"

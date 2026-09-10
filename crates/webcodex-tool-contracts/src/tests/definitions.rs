@@ -154,6 +154,7 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
     for (name, expected_rank) in [
         ("import_conversation_files_to_project", 55),
         ("export_project_artifact", 56),
+        ("read_project_artifact", 57),
         ("run_shell", 75),
     ] {
         let definition = derived
@@ -177,7 +178,6 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         "close_session_shell",
         "run_script",
         "save_project_artifact",
-        "read_project_artifact",
         "artifact_upload_begin",
         "artifact_upload_chunk",
         "artifact_upload_finish",

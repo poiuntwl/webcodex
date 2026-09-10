@@ -270,6 +270,7 @@ mod tests {
         "read_files",
         "import_conversation_files_to_project",
         "export_project_artifact",
+        "read_project_artifact",
         "apply_text_edits",
         "apply_patch",
         "run_process",

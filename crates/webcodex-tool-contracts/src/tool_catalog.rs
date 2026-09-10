@@ -491,6 +491,7 @@ pub const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
     "search_project_texts",
     "read_file",
     "read_files",
+    "read_project_artifact",
     // LSP navigation
     "lsp_status",
     "document_symbols",
