@@ -1,5 +1,6 @@
 mod agent_tasks;
 mod artifacts;
+#[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
 mod cleanup;
 mod coding;
@@ -10,6 +11,7 @@ mod computer;
 mod discovery;
 mod files;
 mod git;
+mod goals;
 mod hygiene;
 mod jobs;
 mod line_edits;
@@ -39,6 +41,7 @@ pub use artifacts::{
     read_project_artifact_input_schema, read_project_artifact_metadata_input_schema,
     save_project_artifact_input_schema,
 };
+#[cfg(feature = "workspace-checkpoints")]
 pub use checkpoints::{
     checkpoint_create_input_schema, checkpoint_delete_input_schema, checkpoint_labels_schema,
     checkpoint_list_input_schema, checkpoint_restore_input_schema, checkpoint_show_input_schema,
@@ -54,12 +57,16 @@ pub use coding_agents::{
     coding_agent_start_input_schema,
 };
 pub use communication::{
-    attach_agent_endpoint_input_schema, bootstrap_agent_conversation_input_schema,
-    consume_agent_deliveries_input_schema, consume_agent_wake_input_schema,
-    create_agent_identity_input_schema, create_conversation_input_schema,
-    detach_agent_endpoint_input_schema, list_agent_identities_input_schema,
-    list_agent_inbox_input_schema, list_conversations_input_schema,
-    post_conversation_message_input_schema, read_conversation_input_schema,
+    agent_continuation_bind_input_schema, agent_continuation_recover_endpoint_input_schema,
+    agent_continuation_state_input_schema, agent_continuation_unbind_input_schema,
+    agent_continuation_wake_acquire_input_schema, agent_continuation_wake_finish_input_schema,
+    agent_continuation_wake_prepare_input_schema, attach_agent_endpoint_input_schema,
+    bootstrap_agent_conversation_input_schema, consume_agent_deliveries_input_schema,
+    consume_agent_wake_input_schema, create_agent_identity_input_schema,
+    create_conversation_input_schema, detach_agent_endpoint_input_schema,
+    list_agent_identities_input_schema, list_agent_inbox_input_schema,
+    list_conversations_input_schema, post_conversation_message_input_schema,
+    present_agent_continuation_input_schema, read_conversation_input_schema,
     update_agent_identity_input_schema,
 };
 pub use computer::{
@@ -84,21 +91,23 @@ pub use discovery::{
 };
 pub use files::{
     list_project_files_input_schema, list_project_tracked_files_input_schema,
-    project_overview_input_schema, read_file_input_schema, read_files_input_schema,
-    search_project_text_input_schema, search_project_texts_input_schema,
+    project_overview_input_schema, read_files_input_schema, search_project_texts_input_schema,
 };
 pub use git::{
-    git_commit_paths_input_schema, git_diff_hunks_input_schema, git_diff_input_schema,
-    git_diff_summary_input_schema, git_log_input_schema, git_review_summary_input_schema,
-    git_status_input_schema, show_changes_input_schema,
+    git_commit_paths_input_schema, git_diff_hunks_input_schema, git_log_input_schema,
+    git_review_summary_input_schema, git_status_input_schema, show_changes_input_schema,
+};
+pub use goals::{
+    associate_goal_agent_task_input_schema, associate_goal_workflow_session_input_schema,
+    create_goal_input_schema, get_goal_input_schema, goal_plan_state_input_schema,
+    list_goals_input_schema, present_goal_plan_input_schema, update_goal_input_schema,
 };
 pub use hygiene::workspace_hygiene_check_input_schema;
 pub use jobs::{
-    job_log_input_schema, job_status_input_schema, list_jobs_input_schema,
-    observe_jobs_input_schema, open_session_shell_input_schema, run_detached_process_input_schema,
-    run_job_input_schema, run_process_input_schema, run_script_input_schema,
-    run_shell_input_schema, session_shell_exec_input_schema, session_shell_identity_input_schema,
-    stop_job_input_schema,
+    list_jobs_input_schema, observe_jobs_input_schema, open_session_shell_input_schema,
+    run_detached_process_input_schema, run_job_input_schema, run_process_input_schema,
+    run_script_input_schema, run_shell_input_schema, session_shell_exec_input_schema,
+    session_shell_identity_input_schema, stop_job_input_schema,
 };
 pub use line_edits::apply_text_edits_input_schema;
 pub use lsp::{

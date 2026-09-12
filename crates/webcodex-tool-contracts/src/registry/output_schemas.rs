@@ -2,6 +2,7 @@ use serde_json::Value;
 
 mod agent_tasks;
 mod artifacts;
+#[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
 mod coding_agents;
 mod coding_tasks;
@@ -12,6 +13,7 @@ mod discovery;
 mod edits;
 mod files;
 mod git;
+mod goals;
 mod hygiene;
 mod jobs;
 mod lsp;
@@ -27,6 +29,9 @@ use common::default_output_schema;
 
 pub fn output_schema_for_tool(name: &str) -> Value {
     if let Some(schema) = agent_tasks::output_schema_for_tool(name) {
+        return schema;
+    }
+    if let Some(schema) = goals::output_schema_for_tool(name) {
         return schema;
     }
     if let Some(schema) = coding_agents::output_schema_for_tool(name) {
@@ -53,6 +58,7 @@ pub fn output_schema_for_tool(name: &str) -> Value {
     if let Some(schema) = coding_tasks::output_schema_for_tool(name) {
         return schema;
     }
+    #[cfg(feature = "workspace-checkpoints")]
     if let Some(schema) = checkpoints::output_schema_for_tool(name) {
         return schema;
     }

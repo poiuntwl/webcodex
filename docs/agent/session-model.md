@@ -98,6 +98,8 @@ handoff, and finish can reason about the same unit of work.
 - Validation evidence and closeout summaries
 - Handoff / finish tooling (`session_handoff_summary`, `finish_coding_task`, …)
 
+Workflow Session lifecycle is independent from the durable `wc_goal_*` Goal domain. A Session may be explicitly correlated to a Goal, but that correlation grants no Session/Project authority and does not make the Session the Goal's lifecycle owner. In particular, `finish_coding_task` does not transition a Goal to `completed`; any Goal transition is a separate explicit Goal-domain mutation.
+
 ### Identity
 
 | Aspect | Contract |
@@ -169,7 +171,7 @@ Surfaces that do not expose this ACK protocol (including legacy MCP, generic RES
 
 This watermark is independent of `ack_session_message_ids` and the message-observation revision: message ACKs mean only that specific unresolved guidance is still remembered for one request, while context ACKs describe the retained model-facing checkpoint watermark. Neither implicitly acknowledges or resolves the other.
 
-Stateless MCP 2026 Full Operator tools also accept an explicit bounded `context_request` wrapper sidecar request. It is independent of both ACK protocols and is removed before concrete `ToolCall` parsing. A static canonical material registry authorizes every requested material before its provider is read: `webcodex.workflow` is public; `project.instructions` requires the resolved Project plus `project:read`; `skills.catalog` additionally requires the Skill runtime surface; and `memory.bootstrap` requires the Memory surface plus both `project:read` and `memory:read`. Scope or material-surface denial is nonfatal to the main ToolResult and returns a bounded unavailable material without provider content. Unknown material keys are nonfatal and remain open-ended at the MCP schema layer. Sidecar material is projected only after the main tool effect or observation has completed, never grants authority, never retroactively makes requested guidance a precondition of that effect, never records caller-read state, and never infers a Project or model-memory state from a Workflow Session, connection, credential, `Mcp-Session-Id`, or hidden window identity. A model that has lost Project rules or durable Memory guidance must recover `project.instructions` and/or `memory.bootstrap` on an observation call, use `memory_read` when detailed Memory content is needed, reason over that context, and only then issue a later mutation that must obey it. Legacy MCP, ProjectConnector, generic REST/GPT Actions/OpenAPI, and other non-target surfaces do not expose this sidecar request contract.
+Stateless MCP 2026 Full Operator tools also accept an explicit bounded `context_request` wrapper sidecar request. It is independent of both ACK protocols and is removed before concrete `ToolCall` parsing. A static canonical material registry authorizes every requested material before its provider is read: `webcodex.workflow` is public; `project.instructions` requires the resolved Project plus `project:read`; `skills.catalog` additionally requires the Skill runtime surface; `plugins.catalog` requires the resolved Project plus both `project:read` and `plugin:inspect`; and `memory.bootstrap` requires the Memory surface plus both `project:read` and `memory:read`. Scope or material-surface denial is nonfatal to the main ToolResult and returns a bounded unavailable material without provider content. Unknown material keys are nonfatal and remain open-ended at the MCP schema layer. Sidecar material is projected only after the main tool effect or observation has completed, never grants authority, never retroactively makes requested guidance a precondition of that effect, never records caller-read state, and never infers a Project or model-memory state from a Workflow Session, connection, credential, `Mcp-Session-Id`, or hidden window identity. A model that has lost Project rules or durable Memory guidance must recover `project.instructions` and/or `memory.bootstrap` on an observation call, use `memory_read` when detailed Memory content is needed, reason over that context, and only then issue a later mutation that must obey it. Legacy MCP, ProjectConnector, generic REST/GPT Actions/OpenAPI, and other non-target surfaces do not expose this sidecar request contract.
 
 Project Memory is a separate durable knowledge plane from Workflow Session continuity. `memory_search`/`memory_read` require both `project:read` and `memory:read`; `memory_set`/`memory_delete` require both `project:write` and `memory:manage`, with mutations still passing the independent permission evaluator. Direct shared-key Full Operator credentials explicitly carry both Memory scopes, while Open Anonymous, ProjectCredential, Project Share, and legacy/default OAuth client scope sets do not gain them from project scopes. A Memory `memory_key` is logical semantic identity, `memory_id` identifies the current incarnation, the internal `definition_hash` identifies canonical model-relevant content, and model-facing `revision` is a generation-bound state ETag/CAS identity; delete and identical recreate therefore produce a different `memory_id` and `revision`. Session events never create or consolidate Memory automatically. `ack_session_context_revision` proves only the caller-held Session checkpoint prefix and never acknowledges Memory content, while `ack_session_message_ids` remains specific to Session guidance messages. Memory reads/searches may leave bounded metadata-only consequences in Session history, but Memory bodies, summaries, search results, and `memory.bootstrap` projections are not copied into durable Session recovery. Re-registering the same runtime Project id to a different authoritative registered root resolves to a distinct internal Memory scope rather than inheriting the old root's Memory.
 
@@ -416,12 +418,19 @@ explicit lifecycle operation says otherwise.
 identity, a client-window key, credentials, project identity, or Server lifetime
 as evidence that the current model still retains static bootstrap content. The
 same `wc_sess_*` may be explicitly resumed by multiple independent ChatGPT
-conversations. Its `include_workflow_guidance` and
-`include_project_instructions` flags are caller-explicit model-facing projection
+conversations. Its `include_workflow_guidance`, `include_project_instructions`, and
+`include_extension_catalog` flags are caller-explicit model-facing projection
 preferences only: their defaults are true, and false is appropriate only when
 the caller's current model context already retains the corresponding content.
 Repository instruction files are still re-observed and Session metadata/delta
-status still update when instruction bodies are suppressed.
+status still update when instruction bodies are suppressed. The default bounded
+extension catalog contains selection metadata only: Skills are drawn from the
+same canonical union as `skill_list` (project `.agents/skills`, Runner-configured
+live `skills.roots`, and active Runner-managed Skill Store packages), while
+Plugins are limited to ready committed providers whose configured `cwd` matches
+the authoritative Project root. Skill bodies, Plugin schemas, bindings, native
+paths, commands, environments, and provider identities are not projected; using
+a selected Plugin still requires `plugin_tool describe` before `call`.
 
 Startup selection is strict and ordered:
 
@@ -490,8 +499,7 @@ a `finish_coding_task` verdict.
   `event_range.complete = false` — the projection never masquerades a truncated
   retained window as `session_start` with `complete = true`.
 - **Exploration workset:** `attempt.exploration` projects only successful,
-  structured evidence from focused `read_file`, `read_files`,
-  `search_project_text`, `search_project_texts`, and
+  structured evidence from focused `read_files`, `search_project_texts`, and
   typed LSP navigation calls. The existing ledger retains only a bounded set
   of validated project-relative paths; it never retains search patterns or
   previews, file contents, symbol/hover/diagnostic bodies, arbitrary result

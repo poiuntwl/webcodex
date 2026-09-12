@@ -6,6 +6,7 @@ mod agent_tasks;
 mod apply_text_edits;
 mod assignment_fence;
 mod builtin_coding_workflow;
+#[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
 mod coding_task;
 mod coding_task_semantic_navigation;
@@ -19,6 +20,7 @@ mod execution_context;
 mod files;
 mod files_helpers;
 mod git;
+mod goals;
 mod handoff;
 mod handoff_brief;
 mod hygiene;

@@ -7,11 +7,15 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::Instant;
+use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES;
 use webcodex_workspace::file_read_normalize::MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
-use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
 pub(crate) const MAX_OBSERVE_JOBS_ITEMS: usize = 8;
 pub(crate) const MAX_OBSERVE_JOBS_TAIL_LINES: usize = 200;
+const MAX_OBSERVE_JOBS_WAIT_SECS: u64 = 60;
+/// Final serialized model-facing budget for packing multiple already-bounded
+/// Job observations. This does not change any single Job stream/tail retention.
+const MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES: usize = MODEL_INSPECTION_MAX_RESULT_BYTES;
 const MAX_OBSERVE_JOBS_ERROR_CHARS: usize = 512;
 
 #[derive(Debug)]
@@ -191,7 +195,8 @@ fn serialized_batch_fits(output: &Value) -> bool {
     serde_json::to_vec(&ToolResult::ok(output.clone()))
         .map(|bytes| {
             bytes.len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES.saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+                    .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
         })
         .unwrap_or(false)
 }
@@ -514,6 +519,16 @@ pub(crate) fn sparsify_observe_jobs_model_result(result: &mut ToolResult) {
     }
 }
 
+fn normalize_observe_jobs_preferences(
+    tail_lines: usize,
+    wait_secs: Option<u64>,
+) -> (usize, Option<u64>) {
+    (
+        tail_lines.min(MAX_OBSERVE_JOBS_TAIL_LINES),
+        wait_secs.map(|wait_secs| wait_secs.min(MAX_OBSERVE_JOBS_WAIT_SECS)),
+    )
+}
+
 impl ToolRuntime {
     fn validate_observe_jobs_input(
         items: &[ObserveJobsItem],
@@ -536,11 +551,11 @@ impl ToolRuntime {
                 item.job_id
             ));
         }
-        if !(1..=MAX_OBSERVE_JOBS_TAIL_LINES).contains(&tail_lines) {
-            return Err("observe_jobs tail_lines must be between 1 and 200".into());
+        if tail_lines == 0 {
+            return Err("observe_jobs tail_lines must be at least 1".into());
         }
-        if wait_secs.is_some_and(|wait_secs| !(1..=60).contains(&wait_secs)) {
-            return Err("observe_jobs wait_secs must be between 1 and 60".into());
+        if wait_secs == Some(0) {
+            return Err("observe_jobs wait_secs must be at least 1".into());
         }
         let mut seen = HashSet::with_capacity(items.len());
         if let Some(duplicate) = items
@@ -677,6 +692,7 @@ impl ToolRuntime {
         wait_secs: Option<u64>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let (tail_lines, wait_secs) = normalize_observe_jobs_preferences(tail_lines, wait_secs);
         if let Err(error) = Self::validate_observe_jobs_input(&items, tail_lines, wait_secs) {
             return ToolResult::err(error);
         }
@@ -746,6 +762,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_observation_preferences_are_clamped() {
+        assert_eq!(
+            normalize_observe_jobs_preferences(500, Some(120)),
+            (
+                MAX_OBSERVE_JOBS_TAIL_LINES,
+                Some(MAX_OBSERVE_JOBS_WAIT_SECS)
+            )
+        );
+        assert_eq!(
+            normalize_observe_jobs_preferences(40, Some(5)),
+            (40, Some(5))
+        );
+    }
+
+    #[test]
     fn batch_item_failures_expose_bounded_recovery_and_success_omits_it() {
         let missing = batch_item(ObservedJob {
             index: 0,
@@ -787,7 +818,7 @@ mod tests {
             "output": {
                 "changed": false,
                 "terminal": false,
-                "stdout_tail": "x".repeat(MAX_SERIALIZED_OUTPUT_BYTES),
+                "stdout_tail": "x".repeat(MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES),
             },
             "error_kind": null,
             "error": null,
@@ -802,7 +833,7 @@ mod tests {
         assert_eq!(output["output_truncated"], false);
         assert!(
             serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
         );
     }
 
@@ -829,13 +860,43 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(output["returned_count"], 2);
-        assert_eq!(output["output_truncated"], true);
-        assert_eq!(output["next_index"], 2);
+        // Four ~90 KiB observations straddle the old 256 KiB aggregate budget
+        // but fit comfortably inside the explicit 512 KiB model-facing packer.
+        assert_eq!(output["returned_count"], 4);
+        assert_eq!(output["output_truncated"], false);
+        assert!(output["next_index"].is_null());
         assert_eq!(output["wait"]["outcome"], "immediate");
         assert!(
             serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+        );
+
+        let output =
+            apply_output_budget(8, (0..8).map(item).collect(), WakeReason::Immediate, 0).unwrap();
+        assert!(output["returned_count"].as_u64().unwrap() > 2);
+        assert!(output["returned_count"].as_u64().unwrap() < 8);
+        assert_eq!(output["output_truncated"], true);
+        assert_eq!(
+            output["next_index"], output["returned_count"],
+            "next_index must identify the first whole observation omitted by aggregate packing"
+        );
+        assert!(
+            serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn aggregate_ceiling_does_not_expand_single_job_snapshot_or_tail_contracts() {
+        assert_eq!(MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES, 512 * 1024);
+        assert_eq!(MAX_OBSERVE_JOBS_TAIL_LINES, 200);
+        assert_eq!(
+            webcodex_core::runtime_contract::DEFAULT_OBSERVE_JOBS_TAIL_LINES,
+            40
+        );
+        assert_eq!(
+            webcodex_core::runner_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
+            64 * 1024
         );
     }
 }

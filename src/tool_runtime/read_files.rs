@@ -6,8 +6,8 @@ use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::Instant;
+use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 use webcodex_workspace::file_read_normalize::MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
-use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
 pub(crate) const MAX_READ_FILES_ITEMS: usize = 8;
 // A max-size read batch may issue all eight independent read-only requests in
@@ -26,12 +26,6 @@ pub(crate) use webcodex_core::runtime_contract::{
 #[derive(Clone, Debug)]
 pub(crate) enum ReadModelProjection {
     None,
-    Single {
-        project: String,
-        path: String,
-        session_id: Option<String>,
-        with_line_numbers: Option<bool>,
-    },
     Batch {
         project: String,
         items: Vec<ReadFilesItem>,
@@ -44,18 +38,6 @@ pub(crate) enum ReadModelProjection {
 impl ReadModelProjection {
     pub(crate) fn capture(call: &ToolCall) -> Self {
         match call {
-            ToolCall::ReadFile {
-                project,
-                path,
-                session_id,
-                with_line_numbers,
-                ..
-            } => Self::Single {
-                project: project.clone(),
-                path: path.clone(),
-                session_id: session_id.clone(),
-                with_line_numbers: *with_line_numbers,
-            },
             ToolCall::ReadFiles {
                 project,
                 items,
@@ -81,35 +63,12 @@ impl ReadModelProjection {
             return;
         };
         match self {
-            Self::Single { project, .. } | Self::Batch { project, .. } => {
+            Self::Batch { project, .. } => {
                 *project = resolved.resolved_id.clone();
             }
             Self::None => {}
         }
     }
-}
-
-fn read_file_suggested_arguments(
-    project: &str,
-    path: &str,
-    start_line: usize,
-    limit: usize,
-    session_id: Option<&str>,
-    with_line_numbers: Option<bool>,
-) -> Value {
-    let mut arguments = json!({
-        "project": project,
-        "path": path,
-        "start_line": start_line,
-        "limit": limit,
-    });
-    if let Some(session_id) = session_id {
-        arguments["session_id"] = json!(session_id);
-    }
-    if let Some(with_line_numbers) = with_line_numbers {
-        arguments["with_line_numbers"] = json!(with_line_numbers);
-    }
-    arguments
 }
 
 fn read_range_continuation(
@@ -118,6 +77,7 @@ fn read_range_continuation(
     output: &serde_json::Map<String, Value>,
     session_id: Option<&str>,
     with_line_numbers: Option<bool>,
+    max_result_bytes: Option<usize>,
 ) -> Option<Value> {
     if output.get("has_more").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -143,14 +103,17 @@ fn read_range_continuation(
         "source_sha256": source_sha256,
         "snapshot_stable": false,
         "suggested_call": {
-            "tool": "read_file",
-            "arguments": read_file_suggested_arguments(
+            "tool": "read_files",
+            "arguments": read_files_suggested_arguments(
                 project,
-                path,
-                next_start_line,
-                limit,
+                &[ReadFilesItem {
+                    path: path.to_string(),
+                    start_line: Some(next_start_line),
+                    limit: Some(limit),
+                }],
                 session_id,
                 with_line_numbers,
+                max_result_bytes,
             )
         }
     }))
@@ -161,6 +124,7 @@ fn add_item_read_continuation(
     project: &str,
     session_id: Option<&str>,
     with_line_numbers: Option<bool>,
+    max_result_bytes: Option<usize>,
 ) {
     if item.get("success").and_then(Value::as_bool) != Some(true) {
         return;
@@ -172,7 +136,14 @@ fn add_item_read_continuation(
         .get("output")
         .and_then(Value::as_object)
         .and_then(|output| {
-            read_range_continuation(project, &path, output, session_id, with_line_numbers)
+            read_range_continuation(
+                project,
+                &path,
+                output,
+                session_id,
+                with_line_numbers,
+                max_result_bytes,
+            )
         });
     if let (Some(continuation), Some(item)) = (continuation, item.as_object_mut()) {
         item.insert("continuation".to_string(), continuation);
@@ -318,27 +289,6 @@ pub(crate) fn add_actionable_read_continuations(
     }
     match projection {
         ReadModelProjection::None => {}
-        ReadModelProjection::Single {
-            project,
-            path,
-            session_id,
-            with_line_numbers,
-        } => {
-            let continuation = result.output.as_object().and_then(|output| {
-                read_range_continuation(
-                    project,
-                    path,
-                    output,
-                    session_id.as_deref(),
-                    *with_line_numbers,
-                )
-            });
-            if let (Some(continuation), Some(output)) =
-                (continuation, result.output.as_object_mut())
-            {
-                output.insert("continuation".to_string(), continuation);
-            }
-        }
         ReadModelProjection::Batch {
             project,
             items: original_items,
@@ -353,6 +303,7 @@ pub(crate) fn add_actionable_read_continuations(
                         project,
                         session_id.as_deref(),
                         *with_line_numbers,
+                        *max_result_bytes,
                     );
                 }
             }
@@ -433,6 +384,7 @@ fn projected_read_item_len(item: &Value, projection: &ReadModelProjection) -> us
         project,
         session_id,
         with_line_numbers,
+        max_result_bytes,
         ..
     } = projection
     {
@@ -441,6 +393,7 @@ fn projected_read_item_len(item: &Value, projection: &ReadModelProjection) -> us
             project,
             session_id.as_deref(),
             *with_line_numbers,
+            *max_result_bytes,
         );
     }
     if projected["success"].as_bool() == Some(true) {
@@ -739,7 +692,7 @@ fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {
     root.insert("truncation_reason".to_string(), json!("hard_result_cap"));
 }
 
-/// Enforce the repository-wide 256 KiB ceiling against the actual final
+/// Enforce the explicit 512 KiB model-inspection ceiling against the actual final
 /// serialized ToolResult, including Session/continuity overlays. The primary
 /// batch budget remains independent; this pass only removes/shortens read body
 /// content when the fully decorated response would otherwise violate the hard
@@ -1053,15 +1006,17 @@ mod tests {
                 "error": null
             })
         };
-        let projection = batch_projection(2, Some(MAX_SERIALIZED_OUTPUT_BYTES));
+        let legacy_budget = 256 * 1024;
+        let projection = batch_projection(2, Some(legacy_budget));
+        let completed = vec![
+            item(0, "x".repeat(140 * 1024)),
+            item(1, "y".repeat(140 * 1024)),
+        ];
         let output = apply_output_budget(
             "agent:oe:demo",
             2,
-            vec![
-                item(0, "x".repeat(140 * 1024)),
-                item(1, "y".repeat(140 * 1024)),
-            ],
-            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+            completed.clone(),
+            Some(legacy_budget),
             &projection,
         );
         assert_eq!(output["returned_count"], 1);
@@ -1069,24 +1024,36 @@ mod tests {
         assert_eq!(output["next_index"], 1);
         assert_eq!(output["items"].as_array().unwrap().len(), 1);
         let serialized = serde_json::to_vec(&ToolResult::ok(output.clone())).unwrap();
-        assert!(serialized.len() <= MAX_SERIALIZED_OUTPUT_BYTES);
+        assert!(serialized.len() <= legacy_budget);
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
         super::super::dispatch::sparsify_complete_read_success("read_files", &mut model);
         let serialized = serde_json::to_vec(&model).unwrap();
         assert!(
-            serialized.len() <= MAX_SERIALIZED_OUTPUT_BYTES,
-            "actionable continuation must remain inside the 256 KiB hard cap: {} bytes",
+            serialized.len() <= legacy_budget,
+            "actionable continuation must remain inside the explicit 256 KiB budget: {} bytes",
             serialized.len()
         );
+
+        let expanded_projection = batch_projection(2, Some(MAX_SERIALIZED_OUTPUT_BYTES));
+        let expanded = apply_output_budget(
+            "agent:oe:demo",
+            2,
+            completed,
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+            &expanded_projection,
+        );
+        assert_eq!(expanded["returned_count"], 2);
+        assert_eq!(expanded["output_truncated"], false);
     }
 
     #[test]
     fn omitted_batch_items_have_reusable_sliced_read_files_call() {
+        let legacy_budget = 256 * 1024;
         let first = vec!["x".repeat(140 * 1024)];
         let second = vec!["y".repeat(140 * 1024)];
         let third = vec!["z".to_string()];
-        let mut projection = batch_projection(3, Some(MAX_SERIALIZED_OUTPUT_BYTES));
+        let mut projection = batch_projection(3, Some(legacy_budget));
         if let ReadModelProjection::Batch { session_id, .. } = &mut projection {
             *session_id = Some("wc_sess_batch_recovery".to_string());
         }
@@ -1098,7 +1065,7 @@ mod tests {
                 ranged_item(1, 1, &second),
                 ranged_item(2, 1, &third),
             ],
-            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+            Some(legacy_budget),
             &projection,
         );
         assert_eq!(output["output_truncated"], true);
@@ -1140,7 +1107,7 @@ mod tests {
                 session_id: Some(ref next_session_id),
                 max_result_bytes: Some(bytes),
                 ..
-            } if bytes == MAX_SERIALIZED_OUTPUT_BYTES
+            } if bytes == legacy_budget
                 && next_session_id == "wc_sess_batch_recovery"
                 && items.iter().map(|item| item.path.as_str()).collect::<Vec<_>>()
                     == vec!["src/1.rs", "src/2.rs"]
@@ -1184,11 +1151,11 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(
-            item_continuation["suggested_call"]["arguments"]["start_line"],
+            item_continuation["suggested_call"]["arguments"]["items"][0]["start_line"],
             expected_next_start
         );
         assert_eq!(
-            item_continuation["suggested_call"]["arguments"]["limit"],
+            item_continuation["suggested_call"]["arguments"]["items"][0]["limit"],
             expected_limit
         );
         ToolCall::from_tool_name(
@@ -1321,9 +1288,9 @@ mod tests {
             "agent:oe:demo",
             3,
             vec![
-                item(0, "x".repeat(120 * 1024)),
-                item(1, "y".repeat(120 * 1024)),
-                item(2, "z".repeat(120 * 1024)),
+                item(0, "x".repeat(180 * 1024)),
+                item(1, "y".repeat(180 * 1024)),
+                item(2, "z".repeat(180 * 1024)),
             ],
             Some(MAX_SERIALIZED_OUTPUT_BYTES),
             &batch_projection(3, Some(MAX_SERIALIZED_OUTPUT_BYTES)),
@@ -1443,9 +1410,6 @@ mod tests {
 
     #[test]
     fn read_continuation_byte_measurements_cover_complete_partial_and_batch_recovery() {
-        let default_limit =
-            webcodex_workspace::file_read_range::EffectiveRange::new(None, None).limit;
-        let sha = "e".repeat(64);
         let canonical_bytes = |output: &Value| {
             serde_json::to_vec(&ToolResult::ok(output.clone()))
                 .unwrap()
@@ -1457,44 +1421,6 @@ mod tests {
             super::super::dispatch::sparsify_complete_read_success(tool, &mut model);
             serde_json::to_vec(&model).unwrap().len()
         };
-
-        let complete_single = json!({
-            "text": "one\ntwo",
-            "format": "plain",
-            "path": "src/lib.rs",
-            "sha256": sha,
-            "start_line": 1,
-            "limit": default_limit,
-            "total_lines": 2,
-            "returned_lines": 2,
-            "end_line": 2,
-            "has_more": false,
-            "next_start_line": null
-        });
-        let single_projection = ReadModelProjection::Single {
-            project: "agent:oe:demo".to_string(),
-            session_id: None,
-            path: "src/lib.rs".to_string(),
-            with_line_numbers: None,
-        };
-        let complete_single_canonical = canonical_bytes(&complete_single);
-        let complete_single_model = model_bytes("read_file", &complete_single, &single_projection);
-
-        let partial_single = json!({
-            "text": "two",
-            "format": "plain",
-            "path": "src/lib.rs",
-            "sha256": "f".repeat(64),
-            "start_line": 2,
-            "limit": 1,
-            "total_lines": 3,
-            "returned_lines": 1,
-            "end_line": 2,
-            "has_more": true,
-            "next_start_line": 3
-        });
-        let partial_single_canonical = canonical_bytes(&partial_single);
-        let partial_single_model = model_bytes("read_file", &partial_single, &single_projection);
 
         let complete_batch = batch_output(
             "agent:oe:demo",
@@ -1586,13 +1512,25 @@ mod tests {
         );
 
         eprintln!(
-            "read_continuation_bytes complete_read_file={complete_single_canonical}->{complete_single_model} partial_read_file={partial_single_canonical}->{partial_single_model} complete_read_files={complete_batch_canonical}->{complete_batch_model} partial_item={partial_batch_canonical}->{partial_batch_model} batch_budget={budget_batch_canonical}->{budget_batch_model} partial_plus_batch={partial_plus_later_canonical}->{partial_plus_later_model}"
+            "read_continuation_bytes complete_read_files={complete_batch_canonical}->{complete_batch_model} partial_item={partial_batch_canonical}->{partial_batch_model} batch_budget={budget_batch_canonical}->{budget_batch_model} partial_plus_batch={partial_plus_later_canonical}->{partial_plus_later_model}"
         );
 
-        assert!(complete_single_model < complete_single_canonical);
         assert!(complete_batch_model < complete_batch_canonical);
         assert!(budget_batch_model <= MAX_SERIALIZED_OUTPUT_BYTES);
         assert!(partial_plus_later_model <= DEFAULT_READ_FILES_RESULT_BYTES);
+    }
+
+    #[test]
+    fn inspection_ceiling_is_independent_from_single_file_read_cap() {
+        assert_eq!(MAX_SERIALIZED_OUTPUT_BYTES, 512 * 1024);
+        assert_eq!(
+            webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES,
+            256 * 1024
+        );
+        assert_eq!(
+            webcodex_workspace::file_read_range::MAX_RANGE_CONTENT_BYTES,
+            192 * 1024
+        );
     }
 
     #[test]

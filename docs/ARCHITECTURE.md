@@ -78,8 +78,13 @@ Conversation membership and Durable Agent identity grant only the communication/
 
 Maintainer-level lifecycle and Agent Task/TaskAttempt details live in [Durable Agent runtime and asynchronous work](architecture/durable-agent-runtime.md) and [Durable Agent/Conversation/Wake contract](architecture/durable-agent-conversation.md).
 
+The Server also owns an independent durable **Goal** domain for high-level intent/control state. A Goal answers what the user ultimately wants and the authoritative high-level lifecycle of that intent. It is not a Workflow Session, Agent Task, Job, Project selector, credential, or execution authority. Goal references to Agent Tasks and Workflow Sessions are explicit correlation only; dereferencing those ids always re-runs the referenced domain's normal authorization.
+
+Stateless MCP 2026 can optionally present one exact Goal through the sparse Goal Plan App. `present_goal_plan(goal_id)` is the sole model-visible App-bound entry; the View converges through the ModelHidden/app-only `goal_plan_state(goal_id)` read. Both are bounded observations over the same SQLite Goal truth and carry no Project, Runner, Job, Workflow Session mutation, or Host-continuation authority. Existing coding tools do not require Goal identity and keep their normal/native presentation.
+
 ## Task, Job, and Workflow Session continuity
 
+- **Goal** — high-level durable intent/control state (`wc_goal_*`). It can correlate multiple work/execution records, but it does not run them and is never inferred from the current Project, window, credential, or Workflow Session.
 - **Connector Task** — project-first work created by the task-oriented Connector. It can be explicitly resumed by its task handle.
 - **Job** — a long-running command or validation that continues after the initiating call returns. Observe the same Job instead of starting another copy.
 - **Workflow Session** — bounded coding evidence/continuity used by the regular runtime for review, validation, collaboration, and closeout. It is not a credential.
@@ -133,7 +138,7 @@ See [SECURITY.md](../SECURITY.md) and [AUTH_MODEL.md](AUTH_MODEL.md).
 
 ## Persistence and recovery
 
-The Server persists managed accounts, OAuth state, project/task history, and durable Agent/Conversation state. Workflow/task continuity is restored from its own durable identifiers; WebCodex does not invent continuity from a credential or current browser window.
+The Server persists managed accounts, OAuth state, project/task history, durable Agent/Conversation state, and durable Goal state. Workflow/task/Goal continuity is restored from each domain's own durable identifiers; WebCodex does not invent continuity from a credential, current browser window, Project, or neighboring domain identity.
 
 Runner Jobs are reconciled when the same live Runner process reconnects. Ordinary child processes cannot be adopted by an unrelated replacement Runner; specialized detached execution has its own explicit durable ownership path. The stable Runner `client_id` and the current process lease are separate, but the exact lease field is an internal wire detail.
 
@@ -146,6 +151,7 @@ MCP / OpenAPI / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runne
                                                |      |--> File/Edit/Git/Validation/Job tools
                                                |      +--> Workflow Session / Handoff / Hygiene
                                                +--> Durable Agent / Conversation / Delivery / Wake
+                                               +--> Goal (high-level durable intent/control; no execution dispatch)
 Runtime Console -----------------------> canonical Server HTTP/kernel paths above
 ```
 
@@ -160,6 +166,15 @@ Runtime Console -----------------------> canonical Server HTTP/kernel paths abov
 - `tool_runtime` — protocol-independent tool parsing, dispatch, project
   resolution, registry metadata, sessions, handoff, hygiene, files, Git,
   patches, validation, shell, Jobs, artifacts, and checkpoints.
+  Workspace Git/worktree snapshots (`workspace_checkpoint_*`) are opt-in:
+  build Server and Runner with `--features workspace-checkpoints`. The root
+  feature forwards to tool contracts, runtime contracts, and workspace; Runner
+  forwards separately to workspace. Default builds omit the implementation,
+  tools, schemas, and checkpoint handoff projection. `include_checkpoints`
+  remains accepted and is ignored when disabled; dormant Runner checkpoint
+  wire operations fail closed. Workflow Session context revisions, ACK,
+  recovery, collaboration, validation evidence, and Jobs remain always active.
+  The shared workspace path policy stays compiled for `project_overview`.
 - `auth` / `oauth_http` / `db` — authentication, OAuth endpoints, and
   persistence.
 - `webcodex-runner` crates — the Runner binary: config, transport, project

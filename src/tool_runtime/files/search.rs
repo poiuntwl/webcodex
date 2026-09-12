@@ -849,10 +849,11 @@ enum SearchTruncation {
     /// The `head -c` byte budget cut the stream, possibly mid-record; the
     /// parser drops the partial tail so only complete records are returned.
     OutputBytes,
-    /// stdout was transport-truncated (the Runner keeps a tail of the output).
-    /// Public identity validation rejects prefix loss before retained records
-    /// can be promoted; this remains parser-level truncation metadata only.
-    Transport,
+    /// stdout lost its prefix to Runner/Server result retention. Public
+    /// identity validation rejects that loss before retained records can be
+    /// promoted. The public reason string remains the legacy `transport`
+    /// spelling for compatibility; this is not a wire/body/frame ceiling.
+    ResultRetention,
     /// The search did not finish within the effective timeout; records
     /// collected before the timeout are still complete and trusted.
     Timeout,
@@ -863,7 +864,7 @@ impl SearchTruncation {
         match self {
             SearchTruncation::Limit => "limit",
             SearchTruncation::OutputBytes => "output_bytes",
-            SearchTruncation::Transport => "transport",
+            SearchTruncation::ResultRetention => "transport",
             SearchTruncation::Timeout => "timeout",
         }
     }
@@ -1127,7 +1128,7 @@ fn parse_search_line_records(stdout: &str) -> (Vec<SearchLineRecord>, bool) {
     (records, bytes_truncated)
 }
 
-fn strip_leading_transport_truncation_marker(stdout: &str) -> (&str, bool) {
+fn strip_leading_result_retention_truncation_marker(stdout: &str) -> (&str, bool) {
     for marker in ["[output truncated]\n", "[...]\n"] {
         if let Some(rest) = stdout.strip_prefix(marker) {
             return (rest, true);
@@ -1270,7 +1271,8 @@ fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, 
 }
 
 fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -> SearchResult {
-    let (stdout, transport_truncated) = strip_leading_transport_truncation_marker(stdout);
+    let (stdout, result_retention_truncated) =
+        strip_leading_result_retention_truncation_marker(stdout);
     let (data, limit_truncated, bytes_truncated) = match options.result_mode {
         SearchResultMode::Matches => {
             let (records, bytes_truncated) = parse_search_line_records(stdout);
@@ -1296,15 +1298,17 @@ fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -
                 SearchResultData::Count {
                     files,
                     returned_match_count,
-                    count_complete: !limit_truncated && !bytes_truncated && !transport_truncated,
+                    count_complete: !limit_truncated
+                        && !bytes_truncated
+                        && !result_retention_truncated,
                 },
                 limit_truncated,
                 bytes_truncated,
             )
         }
     };
-    let truncation = if transport_truncated {
-        Some(SearchTruncation::Transport)
+    let truncation = if result_retention_truncated {
+        Some(SearchTruncation::ResultRetention)
     } else if limit_truncated {
         Some(SearchTruncation::Limit)
     } else if bytes_truncated {
@@ -1547,63 +1551,6 @@ fn empty_search_project_text_output(project: &str, options: &SearchOptions) -> T
 /// Maximum accepted size for `write_project_file` `content`.
 
 impl ToolRuntime {
-    /// `search_project_text`: bounded rg-first text search with grep fallback.
-    /// Excludes sensitive/build paths by default. Each match carries a
-    /// project-relative path, 1-based line number, preview line, and bounded
-    /// context arrays.
-    pub(crate) async fn search_project_text(
-        &self,
-        project: String,
-        pattern: String,
-        pattern_mode: Option<SearchPatternMode>,
-        path: Option<String>,
-        limit: Option<usize>,
-        context_before: Option<usize>,
-        context_after: Option<usize>,
-        include_globs: Option<Vec<String>>,
-        exclude_globs: Option<Vec<String>>,
-        result_mode: Option<SearchResultMode>,
-        timeout_secs: Option<i64>,
-    ) -> ToolResult {
-        let request = SearchRequest {
-            pattern,
-            path,
-            limit,
-            context_before,
-            context_after,
-            include_globs,
-            exclude_globs,
-            result_mode,
-            timeout_secs,
-        };
-        // Preserve the single-query validation-before-resolution ordering.
-        let options = match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-            Ok(options) => options,
-            Err(error) => return error.into_tool_result(),
-        };
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        self.search_one_resolved_project_text(&proj, &project, options, None)
-            .await
-    }
-
-    pub(crate) async fn search_project_text_resolved(
-        &self,
-        resolved: &ResolvedProject,
-        output_project: &str,
-        request: SearchRequest,
-        pattern_mode: Option<SearchPatternMode>,
-    ) -> ToolResult {
-        let options = match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-            Ok(options) => options,
-            Err(error) => return error.into_tool_result(),
-        };
-        self.search_one_resolved_project_text(&resolved.config, output_project, options, None)
-            .await
-    }
-
     pub(crate) async fn search_one_resolved_project_text(
         &self,
         proj: &ProjectConfig,
@@ -2244,7 +2191,7 @@ mod tests {
         assert_eq!(matches[0]["path"], "src/a.rs");
     }
 
-    fn transport_truncation_markers() -> [&'static str; 3] {
+    fn result_retention_truncation_markers() -> [&'static str; 3] {
         [
             "[output truncated to last 12000 bytes]\n",
             "[output truncated]\n",
@@ -2290,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_truncated_stdout_cannot_recover_backend_identity() {
+    fn search_result_retention_truncated_stdout_cannot_recover_backend_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2317,7 +2264,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_forms_cannot_recover_match_identity() {
+    fn search_result_retention_marker_forms_cannot_recover_match_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2331,7 +2278,7 @@ mod tests {
         })
         .unwrap();
 
-        for marker in transport_truncation_markers() {
+        for marker in result_retention_truncation_markers() {
             let stdout = format!(
                 "{marker}{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\nsrc/a.rs:1:needle one\nsrc/b.rs:2:needle two\n"
             );
@@ -2350,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_forms_cannot_recover_file_identity() {
+    fn search_result_retention_marker_forms_cannot_recover_file_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2364,7 +2311,7 @@ mod tests {
         })
         .unwrap();
 
-        for marker in transport_truncation_markers() {
+        for marker in result_retention_truncation_markers() {
             let stdout = format!(
                 "{marker}{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\nsrc/a.rs\nsrc/b.rs\n"
             );
@@ -2383,7 +2330,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_forms_cannot_recover_count_identity() {
+    fn search_result_retention_marker_forms_cannot_recover_count_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2397,7 +2344,7 @@ mod tests {
         })
         .unwrap();
 
-        for marker in transport_truncation_markers() {
+        for marker in result_retention_truncation_markers() {
             let stdout = format!(
                 "{marker}{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\nsrc/a.rs:2\nsrc/b.rs:3\n"
             );
@@ -2416,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_text_in_middle_is_not_transport_truncation() {
+    fn search_result_retention_marker_text_in_middle_is_not_prefix_loss() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,

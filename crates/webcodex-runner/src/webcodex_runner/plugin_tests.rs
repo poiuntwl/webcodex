@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use tempfile::TempDir;
 use webcodex_core::plugin::{
     PluginContent, PluginGatewayResponsePayload, PluginProviderView, PluginSchemaObservation,
-    PLUGIN_MAX_ARGUMENT_BYTES,
+    PLUGIN_MAX_ARGUMENT_BYTES, PLUGIN_MAX_MESSAGE_BYTES, PLUGIN_MAX_RESULT_BYTES,
 };
 
 static FAKE_PLUGIN: OnceLock<Mutex<Weak<FakeBinary>>> = OnceLock::new();
@@ -213,6 +213,223 @@ fn runner_config(
 }
 
 #[test]
+fn project_affine_catalog_uses_exact_committed_cwd_without_process_side_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path().join("repo");
+    let other_root = temp.path().join("tmp");
+    let project_registry_dir = temp.path().join("project-registry");
+    fs::create_dir_all(&project_root).unwrap();
+    fs::create_dir_all(&other_root).unwrap();
+    fs::create_dir_all(&project_registry_dir).unwrap();
+    let marker = temp.path().join("marker.log");
+    let fake = fake_binary();
+    let providers = vec![
+        PluginProviderConfig {
+            id: "repo-context".to_string(),
+            name: "Repo Context".to_string(),
+            command: fake.path.to_string_lossy().into_owned(),
+            args: vec![
+                "project_repo_context".to_string(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(project_root.to_string_lossy().into_owned()),
+            profile: None,
+            timeout_secs: Some(2),
+        },
+        PluginProviderConfig {
+            id: "safe-delete".to_string(),
+            name: "Safe Delete".to_string(),
+            command: fake.path.to_string_lossy().into_owned(),
+            args: vec![
+                "project_safe_delete".to_string(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(other_root.to_string_lossy().into_owned()),
+            profile: None,
+            timeout_secs: Some(2),
+        },
+    ];
+    let config = runner_config(
+        PluginConfig {
+            request_timeout_secs: 2,
+            providers,
+        },
+        ShellConfig::default(),
+        &project_registry_dir,
+    );
+    let manager = PluginManager::new(&config, temp.path().join("runner.toml"));
+    let project_toml = format!(
+        "id = \"repo\"\nname = \"Repo\"\npath = {:?}\nallow_patch = true\n",
+        project_root.to_string_lossy().as_ref()
+    );
+    fs::write(project_registry_dir.join("repo.toml"), project_toml).unwrap();
+
+    let before = fs::read_to_string(&marker).unwrap_or_default();
+    let response = manager.handle_project_catalog("repo", &project_registry_dir);
+    let after = fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        after, before,
+        "catalog reads must not interact with provider processes"
+    );
+    let Some(PluginGatewayResponsePayload::ProjectCatalog { catalog }) = response.payload else {
+        panic!("missing project catalog: {:?}", response.error);
+    };
+    assert_eq!(catalog.total_count, 1);
+    assert_eq!(catalog.entries.len(), 1);
+    let entry = &catalog.entries[0];
+    assert_eq!(entry.plugin, "repo-context");
+    assert_eq!(entry.name, "Repo Context");
+    assert_eq!(entry.tool, "repo_context");
+    assert_eq!(entry.title.as_deref(), Some("Repository context"));
+    assert_eq!(entry.annotations.read_only_hint, Some(true));
+    assert_eq!(entry.annotations.destructive_hint, Some(false));
+    assert_eq!(entry.annotations.idempotent_hint, Some(true));
+    assert_eq!(entry.annotations.open_world_hint, Some(false));
+    assert!(catalog.catalog_revision.starts_with("wc_plugcat_"));
+
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    for forbidden in [
+        project_root.to_string_lossy().as_ref(),
+        other_root.to_string_lossy().as_ref(),
+        fake.path.to_string_lossy().as_ref(),
+        "provider_instance_id",
+        "inputSchema",
+        "outputSchema",
+        "command",
+        "argv",
+        "cwd",
+        "env",
+        "stderr",
+        "pid",
+        "binding",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "leaked {forbidden}: {serialized}"
+        );
+    }
+}
+
+#[test]
+fn project_catalog_bounds_aggregate_wire_response_without_losing_total() {
+    let entries: Vec<_> = (0..webcodex_core::plugin::PLUGIN_MAX_PROJECT_CATALOG_ENTRIES)
+        .map(|index| ProjectPluginCatalogEntry {
+            plugin: format!("plugin-{:03}", index / 128),
+            name: "n".repeat(128),
+            tool: format!("tool-{index:04}"),
+            title: Some("t".repeat(128)),
+            description: Some("\\".repeat(512)),
+            annotations: PluginSelectionAnnotations::default(),
+        })
+        .collect();
+    let revision = format!("wc_plugcat_{}", "a".repeat(64));
+    let full = ProjectPluginCatalog {
+        catalog_revision: revision.clone(),
+        total_count: entries.len(),
+        entries: entries.clone(),
+    };
+    webcodex_core::plugin::validate_project_plugin_catalog(&full).unwrap();
+    assert!(
+        webcodex_core::plugin::validate_response(&PluginGatewayResponse::success(
+            PluginGatewayResponsePayload::ProjectCatalog { catalog: full },
+        ))
+        .is_err()
+    );
+    let catalog = bounded_project_catalog(revision.clone(), entries.clone());
+    assert_eq!(catalog.catalog_revision, revision);
+    assert_eq!(catalog.total_count, entries.len());
+    assert!(!catalog.entries.is_empty());
+    assert!(catalog.entries.len() < catalog.total_count);
+    assert_eq!(catalog.entries, entries[..catalog.entries.len()]);
+    let mut invalid = catalog.clone();
+    invalid.total_count = invalid.entries.len() - 1;
+    assert!(webcodex_core::plugin::validate_project_plugin_catalog(&invalid).is_err());
+    invalid.total_count = webcodex_core::plugin::PLUGIN_MAX_PROJECT_CATALOG_ENTRIES + 1;
+    assert!(webcodex_core::plugin::validate_project_plugin_catalog(&invalid).is_err());
+    let response =
+        PluginGatewayResponse::success(PluginGatewayResponsePayload::ProjectCatalog { catalog });
+    webcodex_core::plugin::validate_response(&response).unwrap();
+    assert!(serde_json::to_vec(&response).unwrap().len() <= PLUGIN_MAX_MESSAGE_BYTES);
+}
+
+#[test]
+fn project_affine_catalog_excludes_absent_cwd_and_retired_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path().join("repo");
+    fs::create_dir_all(&project_root).unwrap();
+    let marker = temp.path().join("marker.log");
+    let fake = fake_binary();
+    let providers = vec![
+        PluginProviderConfig {
+            id: "no-cwd".to_string(),
+            name: "No Cwd".to_string(),
+            command: fake.path.to_string_lossy().into_owned(),
+            args: vec!["normal".to_string(), marker.to_string_lossy().into_owned()],
+            cwd: None,
+            profile: None,
+            timeout_secs: Some(2),
+        },
+        PluginProviderConfig {
+            id: "repo-context".to_string(),
+            name: "Repo Context".to_string(),
+            command: fake.path.to_string_lossy().into_owned(),
+            args: vec![
+                "project_repo_context".to_string(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(project_root.to_string_lossy().into_owned()),
+            profile: None,
+            timeout_secs: Some(2),
+        },
+    ];
+    let config = runner_config(
+        PluginConfig {
+            request_timeout_secs: 2,
+            providers,
+        },
+        ShellConfig::default(),
+        temp.path(),
+    );
+    let manager = PluginManager::new(&config, temp.path().join("runner.toml"));
+    let root = project_root.canonicalize().unwrap();
+    let before = manager.project_catalog_for_root(&root);
+    assert_eq!(before.entries.len(), 1);
+    assert_eq!(before.entries[0].plugin, "repo-context");
+
+    let provider = manager
+        .committed
+        .lock()
+        .unwrap()
+        .providers
+        .get("repo-context")
+        .unwrap()
+        .clone();
+    provider.retire("test_retired");
+    let after = manager.project_catalog_for_root(&root);
+    assert!(after.entries.is_empty());
+    assert_ne!(after.catalog_revision, before.catalog_revision);
+}
+
+#[test]
+fn project_affine_catalog_revision_changes_when_provider_is_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("marker.log");
+    let fake = fake_binary();
+    let config_path = temp.path().join("runner.toml");
+    write_runner_toml(&config_path, temp.path(), &fake.path, &marker, "normal");
+    let config = super::super::config::load_config(&config_path).unwrap();
+    let manager = PluginManager::new(&config, config_path);
+    let root = temp.path().canonicalize().unwrap();
+    let before = manager.project_catalog_for_root(&root);
+    assert_eq!(before.entries.len(), 1);
+    let reloaded = manager.handle(PluginGatewayRequest::Reload);
+    assert!(reloaded.error.is_none(), "{:?}", reloaded.error);
+    let after = manager.project_catalog_for_root(&root);
+    assert_eq!(after.entries.len(), 1);
+    assert_ne!(after.catalog_revision, before.catalog_revision);
+}
+
+#[test]
 fn initial_committed_provider_is_eager_persistent_and_reused() {
     let fixture = Fixture::new("normal", 2);
     assert_eq!(fixture.marker_count("start"), 1);
@@ -320,6 +537,42 @@ fn invalid_input_schema_is_not_started_and_provider_sees_no_call() {
     let valid = fixture.call_with_arguments(json!({"value": "valid"}));
     assert!(valid.error.is_none());
     assert_eq!(fixture.marker_count("call"), 1);
+}
+
+#[test]
+fn large_tool_results_cross_plugin_bridge_with_output_schema_validation() {
+    assert_eq!(PLUGIN_MAX_RESULT_BYTES, 512 * 1024);
+    assert_eq!(PLUGIN_MAX_MESSAGE_BYTES, 1024 * 1024);
+
+    let text_fixture = Fixture::new("large_text_result", 2);
+    let text_response = text_fixture.call();
+    let Some(PluginGatewayResponsePayload::ToolResult { result }) = text_response.payload else {
+        panic!("missing large text result: {:?}", text_response.error);
+    };
+    let [PluginContent::Text { text }] = result.content.as_slice() else {
+        panic!("unexpected large text content");
+    };
+    assert_eq!(text.len(), 192 * 1024);
+    assert!(text_fixture.list().error.is_none());
+
+    let structured_fixture = Fixture::new("large_structured_result", 2);
+    let structured_response = structured_fixture.call();
+    let Some(PluginGatewayResponsePayload::ToolResult { result }) = structured_response.payload
+    else {
+        panic!(
+            "missing large structured result: {:?}",
+            structured_response.error
+        );
+    };
+    assert!(result.content.is_empty());
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["payload"]
+            .as_str()
+            .unwrap()
+            .len(),
+        192 * 1024
+    );
+    assert!(structured_fixture.list().error.is_none());
 }
 
 #[test]
@@ -451,18 +704,26 @@ fn crash_after_effect_send_is_outcome_unknown_and_instance_is_retired() {
 }
 
 #[test]
-fn unsupported_result_is_completed_and_retires_protocol_broken_instance() {
-    let fixture = Fixture::new("bad_result", 2);
-    let response = fixture.call();
-    assert_eq!(response.dispatch_state, PluginDispatchState::Completed);
-    assert_eq!(
-        response.error.as_ref().unwrap().code,
-        "plugin_result_invalid"
-    );
-    assert_eq!(
-        fixture.list().error.as_ref().unwrap().code,
-        "plugin_provider_unavailable"
-    );
+fn unsupported_or_oversized_result_is_completed_and_retires_protocol_broken_instance() {
+    for scenario in ["bad_result", "oversized_result"] {
+        let fixture = Fixture::new(scenario, 2);
+        let response = fixture.call();
+        assert_eq!(
+            response.dispatch_state,
+            PluginDispatchState::Completed,
+            "{scenario}"
+        );
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "plugin_result_invalid",
+            "{scenario}"
+        );
+        assert_eq!(
+            fixture.list().error.as_ref().unwrap().code,
+            "plugin_provider_unavailable",
+            "{scenario}"
+        );
+    }
 }
 
 #[test]
@@ -558,7 +819,9 @@ fn prepared_environment_reuses_shell_env_default_profile_and_clears_sensitive_va
     use super::super::config::ShellProfileConfig;
     use std::collections::BTreeMap;
     let _guard = crate::tests::test_env_lock();
-    let _env = crate::tests::EnvGuard::new().set("WEBCODEX_AGENT_TOKEN", "must-not-leak");
+    let _env = crate::tests::EnvGuard::new()
+        .set("WEBCODEX_AGENT_TOKEN", "must-not-leak")
+        .set("WEBCODEX_PAT", "inherited-pat-must-not-leak");
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("marker.log");
     let fake = fake_binary();
@@ -566,14 +829,24 @@ fn prepared_environment_reuses_shell_env_default_profile_and_clears_sensitive_va
     shell
         .env
         .insert("WEBCODEX_PLUGIN_TEST_ENV".to_string(), "base".to_string());
+    shell.env.insert(
+        "WEBCODEX_PAT".to_string(),
+        "shell-pat-must-not-leak".to_string(),
+    );
     shell.default_profile = Some("plugin".to_string());
     shell.profiles = BTreeMap::from([(
         "plugin".to_string(),
         ShellProfileConfig {
-            env: BTreeMap::from([(
-                "WEBCODEX_PLUGIN_TEST_ENV".to_string(),
-                "profile-ready".to_string(),
-            )]),
+            env: BTreeMap::from([
+                (
+                    "WEBCODEX_PLUGIN_TEST_ENV".to_string(),
+                    "profile-ready".to_string(),
+                ),
+                (
+                    "WEBCODEX_PAT".to_string(),
+                    "profile-pat-must-not-leak".to_string(),
+                ),
+            ]),
             ..ShellProfileConfig::default()
         },
     )]);

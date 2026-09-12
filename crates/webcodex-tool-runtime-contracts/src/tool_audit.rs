@@ -3,6 +3,7 @@
 #[cfg(test)]
 use super::tool_call::ComputerSnapshotRegion;
 use super::tool_call::ToolCall;
+#[cfg(feature = "workspace-checkpoints")]
 use super::tool_inputs::{is_checkpoint_kind, is_checkpoint_validation_status};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -180,6 +181,106 @@ fn typed_structured_validation_request_audit(
         .cloned()
     {
         out.insert("sync_wait_secs".to_string(), sync_wait_secs);
+    }
+    Value::Object(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GoalRequestAudit {
+    Create,
+    Get,
+    List,
+    Update,
+    AssociateAgentTask,
+    AssociateWorkflowSession,
+}
+
+fn typed_goal_request_audit(kind: GoalRequestAudit, arguments: &Value) -> Value {
+    let Some(obj) = arguments.as_object() else {
+        return empty_audit_projection();
+    };
+    let mut out = serde_json::Map::new();
+    match kind {
+        GoalRequestAudit::Create => {
+            out.insert(
+                "title_chars".to_string(),
+                Value::from(
+                    obj.get("title")
+                        .and_then(Value::as_str)
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "objective_bytes".to_string(),
+                Value::from(
+                    obj.get("objective")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        GoalRequestAudit::Get => copy_keys(obj, &mut out, &["goal_id"]),
+        GoalRequestAudit::List => copy_keys(obj, &mut out, &["lifecycle", "offset", "limit"]),
+        GoalRequestAudit::Update => {
+            copy_keys(
+                obj,
+                &mut out,
+                &["goal_id", "expected_revision", "lifecycle"],
+            );
+            out.insert(
+                "title_chars".to_string(),
+                Value::from(
+                    obj.get("title")
+                        .and_then(Value::as_str)
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "objective_bytes".to_string(),
+                Value::from(
+                    obj.get("objective")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "terminal_reason_bytes".to_string(),
+                Value::from(
+                    obj.get("terminal_reason")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        GoalRequestAudit::AssociateAgentTask => {
+            copy_keys(obj, &mut out, &["goal_id", "task_id"]);
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        GoalRequestAudit::AssociateWorkflowSession => {
+            copy_keys(obj, &mut out, &["goal_id", "session_id"]);
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
     }
     Value::Object(out)
 }
@@ -1271,7 +1372,7 @@ mod computer_privacy_tests {
         let malformed = json!({"secret": "MALFORMED_READ_SECRET"});
         let malformed_before = malformed.clone();
         assert_eq!(
-            session_log_arguments_for_tool_request("read_file", &malformed),
+            session_log_arguments_for_tool_request("read_files", &malformed),
             json!({})
         );
         assert_eq!(malformed, malformed_before);
@@ -1360,15 +1461,18 @@ mod computer_privacy_tests {
         assert!(!register_serialized.contains(PROJECT_PATH));
         assert!(!register_serialized.contains("PRIVATE PROJECT DESCRIPTION"));
 
-        let job_log = json!({
-            "job_id": "job-safe",
-            "after_observation_token": JOB_TOKEN,
+        let observe_jobs = json!({
+            "items": [{
+                "job_id": "job-safe",
+                "after_observation_token": JOB_TOKEN
+            }],
             "tail_lines": 20,
             "wait_secs": 1
         });
-        let job_summary = session_log_arguments_for_tool_request("job_log", &job_log);
-        assert_eq!(job_summary["job_id"], "job-safe");
-        assert_eq!(job_summary["token_present"], true);
+        let job_summary = session_log_arguments_for_tool_request("observe_jobs", &observe_jobs);
+        assert_eq!(job_summary["item_count"], 1);
+        assert_eq!(job_summary["token_count"], 1);
+        assert_eq!(job_summary["job_ids"], json!(["job-safe"]));
         assert!(!serde_json::to_string(&job_summary)
             .unwrap()
             .contains(JOB_TOKEN));
@@ -1392,6 +1496,55 @@ mod computer_privacy_tests {
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("UNKNOWN_RESULT_SECRET"));
         assert!(!serialized.contains("PRIVATE_RESULT_TOKEN"));
+    }
+
+    #[test]
+    fn agent_continuation_app_audit_omits_host_binding_and_resume_secrets() {
+        let args = json!({
+            "agent_id": "wc_agent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "endpoint_id": "wc_endpoint_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "expected_controller_generation": 7,
+            "binding_id": "wc_host_binding_PRIVATE_BINDING",
+            "wake_id": "wc_wake_cccccccccccccccccccccccccccccccc",
+            "attempt_id": "wc_wake_attempt_dddddddddddddddddddddddddddddddd"
+        });
+        let arguments =
+            session_log_arguments_for_tool_request("agent_continuation_wake_prepare", &args);
+        let arguments_text = serde_json::to_string(&arguments).unwrap();
+        assert_eq!(arguments["agent_id"], args["agent_id"]);
+        assert_eq!(arguments["wake_id"], args["wake_id"]);
+        assert!(!arguments_text.contains("PRIVATE_BINDING"));
+        assert!(!arguments_text.contains("binding_id"));
+
+        let result = json!({
+            "agent_id": args["agent_id"],
+            "endpoint_id": args["endpoint_id"],
+            "wake_id": args["wake_id"],
+            "attempt_id": args["attempt_id"],
+            "wake_revision": 9,
+            "dispatch_observation": "dispatch_prepared",
+            "state_changed": true,
+            "app_protocol": {
+                "binding_id": "wc_host_binding_PRIVATE_BINDING",
+                "automatic_message": "consume_token=wc_wake_consume_PRIVATE_TOKEN\nPRIVATE MESSAGE BODY"
+            }
+        });
+        let projected = session_log_result_for_tool("agent_continuation_wake_prepare", &result);
+        let projected_text = serde_json::to_string(&projected).unwrap();
+        assert_eq!(projected["wake_id"], args["wake_id"]);
+        assert_eq!(projected["dispatch_observation"], "dispatch_prepared");
+        for forbidden in [
+            "PRIVATE_BINDING",
+            "PRIVATE_TOKEN",
+            "PRIVATE MESSAGE BODY",
+            "automatic_message",
+            "app_protocol",
+        ] {
+            assert!(
+                !projected_text.contains(forbidden),
+                "audit leaked {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -3196,11 +3349,9 @@ impl ToolCall {
                     "message_present": true,
                 })
             }
-            Self::GitStatus { project, .. } | Self::GitDiffSummary { project, .. } => {
-                serde_json::json!({
-                    "project": project,
-                })
-            }
+            Self::GitStatus { project, .. } => serde_json::json!({
+                "project": project,
+            }),
             Self::GitReviewSummary {
                 project,
                 base_commit,
@@ -3227,15 +3378,12 @@ impl ToolCall {
                 "limit": limit,
                 "skip": skip,
             }),
-            Self::GitDiff { project, args, .. } => serde_json::json!({
-                "project": project,
-                "args_count": args.as_ref().map(Vec::len),
-            }),
             Self::GitDiffHunks {
                 project,
                 paths,
                 max_hunks,
                 max_hunk_lines,
+                max_page_bytes,
                 cached,
                 base_commit,
                 head_commit,
@@ -3253,6 +3401,7 @@ impl ToolCall {
                     "paths": paths,
                     "max_hunks": max_hunks,
                     "max_hunk_lines": max_hunk_lines,
+                    "max_page_bytes": max_page_bytes,
                     "cached": cached,
                     "base_commit_valid": base_commit.is_some(),
                     "head_commit_valid": head_commit.is_some(),
@@ -3358,20 +3507,6 @@ impl ToolCall {
                     "sync_wait_secs": sync_wait_secs,
                 }),
             ),
-            Self::ReadFile {
-                project,
-                path,
-                start_line,
-                limit,
-                with_line_numbers,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "start_line": start_line,
-                "limit": limit,
-                "with_line_numbers": with_line_numbers,
-            }),
             Self::ReadFiles {
                 project,
                 items,
@@ -3382,6 +3517,84 @@ impl ToolCall {
                 "items": items,
                 "with_line_numbers": with_line_numbers,
             }),
+            Self::CreateGoal {
+                title,
+                objective,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::Create,
+                &serde_json::json!({
+                    "title": title,
+                    "objective": objective,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::GetGoal { goal_id } => typed_goal_request_audit(
+                GoalRequestAudit::Get,
+                &serde_json::json!({"goal_id": goal_id}),
+            ),
+            Self::PresentGoalPlan { goal_id } | Self::GoalPlanState { goal_id } => {
+                typed_goal_request_audit(
+                    GoalRequestAudit::Get,
+                    &serde_json::json!({"goal_id": goal_id}),
+                )
+            }
+            Self::ListGoals {
+                lifecycle,
+                offset,
+                limit,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::List,
+                &serde_json::json!({
+                    "lifecycle": lifecycle,
+                    "offset": offset,
+                    "limit": limit,
+                }),
+            ),
+            Self::UpdateGoal {
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::Update,
+                &serde_json::json!({
+                    "goal_id": goal_id,
+                    "expected_revision": expected_revision,
+                    "title": title,
+                    "objective": objective,
+                    "lifecycle": lifecycle,
+                    "terminal_reason": terminal_reason,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::AssociateGoalAgentTask {
+                goal_id,
+                task_id,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::AssociateAgentTask,
+                &serde_json::json!({
+                    "goal_id": goal_id,
+                    "task_id": task_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
+            Self::AssociateGoalWorkflowSession {
+                goal_id,
+                session_id,
+                idempotency_key,
+            } => typed_goal_request_audit(
+                GoalRequestAudit::AssociateWorkflowSession,
+                &serde_json::json!({
+                    "goal_id": goal_id,
+                    "session_id": session_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ),
             Self::CreateAgentTask {
                 title,
                 instruction,
@@ -3556,7 +3769,13 @@ impl ToolCall {
                     "specialty_labels": specialty_labels,
                 }),
             ),
-            Self::AttachAgentEndpoint {
+            Self::RotateAgentContinuationEndpoint {
+                agent_id,
+                host,
+                client_attachment_id,
+                idempotency_key,
+            }
+            | Self::AttachAgentEndpoint {
                 agent_id,
                 host,
                 client_attachment_id,
@@ -3570,6 +3789,75 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::PresentAgentContinuation {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+            }
+            | Self::AgentContinuationBind {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationRecoverEndpoint {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationState {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationWakeAcquire {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            }
+            | Self::AgentContinuationUnbind {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                ..
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+            }),
+            Self::AgentContinuationWakePrepare {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                wake_id,
+                attempt_id,
+                ..
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "wake_id": wake_id,
+                "attempt_id": attempt_id,
+            }),
+            Self::AgentContinuationWakeFinish {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                wake_id,
+                attempt_id,
+                outcome,
+                ..
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "wake_id": wake_id,
+                "attempt_id": attempt_id,
+                "outcome": outcome,
+            }),
             Self::DetachAgentEndpoint { endpoint_id } => typed_communication_request_audit(
                 CommunicationRequestAudit::DetachEndpoint,
                 &serde_json::json!({"endpoint_id": endpoint_id}),
@@ -3907,11 +4195,13 @@ impl ToolCall {
                 project,
                 path,
                 limit,
+                offset,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "path": path,
                 "limit": limit,
+                "offset": offset,
             }),
             Self::ProjectOverview {
                 project,
@@ -3924,29 +4214,6 @@ impl ToolCall {
                 "path": path,
                 "max_depth": max_depth,
                 "limit": limit,
-            }),
-            Self::SearchProjectText {
-                project,
-                path,
-                limit,
-                context_before,
-                context_after,
-                include_globs,
-                exclude_globs,
-                result_mode,
-                timeout_secs,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "pattern_present": true,
-                "path": path,
-                "limit": limit,
-                "context_before": context_before,
-                "context_after": context_after,
-                "include_glob_count": include_globs.as_ref().map(Vec::len).unwrap_or(0),
-                "exclude_glob_count": exclude_globs.as_ref().map(Vec::len).unwrap_or(0),
-                "result_mode": result_mode,
-                "timeout_secs": timeout_secs,
             }),
             Self::SearchProjectTexts {
                 project, queries, ..
@@ -4197,6 +4464,7 @@ impl ToolCall {
                     "dry_run": dry_run,
                 })
             }
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointCreate {
                 project,
                 title,
@@ -4240,10 +4508,12 @@ impl ToolCall {
                     "validation_status": validation_status,
                 })
             }
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointList { project, limit, .. } => serde_json::json!({
                 "project": project,
                 "limit": limit,
             }),
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointShow {
                 project,
                 checkpoint_id,
@@ -4254,6 +4524,7 @@ impl ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "include_diff_stat": include_diff_stat,
             }),
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointRestore {
                 project,
                 checkpoint_id,
@@ -4264,6 +4535,7 @@ impl ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "confirm": confirm,
             }),
+            #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointDelete {
                 project,
                 checkpoint_id,
@@ -4394,6 +4666,7 @@ impl ToolCall {
                 include_project_instructions,
                 include_workflow_guidance,
                 session_id,
+                include_extension_catalog,
             } => serde_json::json!({
                 "project": project,
                 "client_id": client_id,
@@ -4404,6 +4677,7 @@ impl ToolCall {
                 "instruction_summary": command_preview(instruction),
                 "include_project_instructions": include_project_instructions,
                 "include_workflow_guidance": include_workflow_guidance,
+                "include_extension_catalog": include_extension_catalog,
                 "session_id": session_id,
             }),
             Self::UpdateSessionContext {
@@ -4535,26 +4809,6 @@ impl ToolCall {
                 "timeout_secs": timeout_secs,
                 "cwd": cwd,
                 "purpose": purpose,
-            }),
-            Self::JobStatus {
-                job_id,
-                include_command_preview,
-            } => serde_json::json!({
-                "job_id": job_id,
-                "include_command_preview": include_command_preview,
-            }),
-            Self::JobLog {
-                job_id,
-                offset,
-                tail_lines,
-                after_observation_token,
-                wait_secs,
-            } => serde_json::json!({
-                "job_id": job_id,
-                "offset": offset,
-                "tail_lines": tail_lines,
-                "token_present": after_observation_token.is_some(),
-                "wait_secs": wait_secs,
             }),
             Self::JobTail {
                 job_id,

@@ -6,21 +6,32 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let desc = |name: &str| spec_named(&specs, name).description.to_lowercase();
 
-    let read_file_desc = desc("read_file");
+    let work_on_project_desc = desc("work_on_project");
     for phrase in [
-        "simple single-range utf-8 read primitive",
-        "local-coding contract",
-        "adaptive runtime prefer batch-capable read_files even for one known range",
-        "line numbers",
-        "read_range",
-        "not snapshot-stable",
-        "sha256",
-        "exact resolved project",
-        "business session_id",
+        "canonical bootstrap",
+        "ordinary coding/review",
+        "omit session_id",
+        "fresh workflow session",
+        "exact resume",
+        "active accessible session",
+        "never guesses prior session",
+        "project instructions",
+        "workflow guidance",
+        "skills",
+        "plugin",
+        "selection metadata",
+        "current model context",
+        "does not require git",
+        "never proves retention",
+        "skill_read_file",
+        "plugin_tool describe",
+        "mode=worktree",
+        "exact git base",
+        "project authority",
     ] {
         assert!(
-            read_file_desc.contains(phrase),
-            "read_file description should mention {phrase}: {read_file_desc}"
+            work_on_project_desc.contains(phrase),
+            "work_on_project description should mention {phrase}: {work_on_project_desc}"
         );
     }
 
@@ -35,33 +46,13 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "increase_result_budget",
         "no fake continuation",
         "complete a current partial item",
-        "256 kib",
+        "512 kib",
         "exact resolved project",
         "business session_id",
     ] {
         assert!(
             read_files_desc.contains(phrase),
             "read_files description should mention {phrase}: {read_files_desc}"
-        );
-    }
-
-    let search_desc = desc("search_project_text");
-    for phrase in [
-        "simple single-query project-text search primitive",
-        "local-coding contract",
-        "adaptive runtime prefer batch-capable search_project_texts even for one query",
-        "rg-first",
-        "grep fallback",
-        "pattern_mode=literal",
-        "matches",
-        "context",
-        "truncated",
-        "no safe match cursor",
-        "refine",
-    ] {
-        assert!(
-            search_desc.contains(phrase),
-            "search_project_text description should mention {phrase}: {search_desc}"
         );
     }
 
@@ -146,6 +137,37 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    let git_log_desc = desc("git_log");
+    for phrase in ["next_skip", "parser-ready", "10000 skip bound"] {
+        assert!(git_log_desc.contains(phrase), "git_log: {phrase}");
+    }
+    let list_files_desc = desc("list_project_files");
+    for phrase in [
+        "deterministic page",
+        "next_offset",
+        "complete directory source",
+        "retained-tail truncation fails closed",
+    ] {
+        assert!(
+            list_files_desc.contains(phrase),
+            "list_project_files: {phrase}"
+        );
+    }
+    let tracked_files_desc = desc("list_project_tracked_files");
+    for phrase in [
+        "bounded producer source",
+        "source acquisition is complete",
+        "list_truncated=true",
+        "next_offset is null",
+        "narrow path",
+        "retained-tail source truncation fails closed",
+    ] {
+        assert!(
+            tracked_files_desc.contains(phrase),
+            "list_project_tracked_files: {phrase}"
+        );
+    }
+
     let show_changes_desc = desc("show_changes");
     for phrase in [
         "default inspect/review tool",
@@ -169,6 +191,10 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "scope",
         "paging inputs",
         "later records",
+        "max_page_bytes",
+        "raw producer page",
+        "512 kib",
+        "final model-facing",
         "hunk_line_limit",
         "larger max_hunk_lines",
         "narrower paths",
@@ -190,6 +216,8 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "paths",
         "max_hunks",
         "max_hunk_lines",
+        "max_page_bytes",
+        "later records",
         "scope-bound",
         "does not reconstruct",
     ] {
@@ -237,7 +265,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     let apply_text_edits_desc = desc("apply_text_edits");
     for phrase in [
         "canonical default guarded edit path",
-        "after read_file/read_files",
+        "after read_files",
         "current worktree",
         "ordinary model-generated changes",
         "many changed lines alone are not a reason to choose apply_patch",
@@ -265,7 +293,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "external raw unified-diff mutation path",
         "input is already a standard unified diff",
         "ordinary model-generated edits",
-        "read_file/read_files followed by apply_text_edits",
+        "read_files followed by apply_text_edits",
         "contextual or large patch-shaped changes use apply_patch",
         "bounded preflight",
         "never needs a separate validation call",
@@ -282,7 +310,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "create new files",
         "whole-file rewrites",
         "ordinary model-generated changes",
-        "after read_file/read_files",
+        "after read_files",
         "prefer apply_text_edits",
         "returned current sha",
         "use apply_patch only when",
@@ -431,6 +459,8 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "replacement",
         "ownership is handed off before payload start",
         "expired keys are not retry tokens",
+        "workflow will restart, upgrade, stop, or replace this runner",
+        "duration alone is not a reason to detach",
     ] {
         assert!(
             detached_desc.contains(phrase),
@@ -545,6 +575,66 @@ fn removed_legacy_edit_tools_are_not_known_tools() {
             !spec_names.contains(removed),
             "{removed} must not keep a model-facing ToolSpec"
         );
+    }
+}
+
+#[test]
+fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema() {
+    let specs = registered_tool_specs();
+    let cases: &[(&str, &[&str])] = &[
+        ("run_process", &["timeout_secs", "sync_wait_secs"]),
+        ("run_detached_process", &["timeout_secs"]),
+        ("run_script", &["timeout_secs", "sync_wait_secs"]),
+        ("run_shell", &["timeout_secs"]),
+        ("session_shell_exec", &["timeout_secs"]),
+        ("observe_jobs", &["tail_lines", "wait_secs"]),
+        ("list_jobs", &["limit"]),
+        ("cargo_fmt", &["timeout_secs", "sync_wait_secs"]),
+        ("cargo_check", &["timeout_secs", "sync_wait_secs"]),
+        ("cargo_test", &["timeout_secs", "sync_wait_secs"]),
+        ("go_test", &["timeout_secs", "sync_wait_secs"]),
+        ("session_discussion_summary", &["limit"]),
+        ("workspace_hygiene_check", &["max_findings"]),
+        ("list_projects", &["limit"]),
+        ("list_session_messages", &["limit"]),
+        ("observe_session_messages", &["wait_secs", "limit"]),
+        ("validation_summary", &["limit"]),
+        ("session_handoff_summary", &["limit"]),
+        ("document_symbols", &["limit"]),
+        ("document_diagnostics", &["limit"]),
+        ("workspace_symbols", &["limit"]),
+        ("goto_definition", &["limit"]),
+        ("find_references", &["limit"]),
+        ("computer_list_windows", &["limit"]),
+        ("computer_list_displays", &["limit"]),
+        ("computer_list_applications", &["limit"]),
+        ("computer_accessibility_tree", &["max_depth", "max_nodes"]),
+        ("computer_find_elements", &["limit"]),
+        ("coding_agent_observe", &["wait_secs"]),
+        ("list_agent_tasks", &["limit"]),
+        ("list_agent_identities", &["limit"]),
+        ("list_conversations", &["limit"]),
+        ("read_conversation", &["limit"]),
+        ("list_agent_inbox", &["limit"]),
+    ];
+
+    for (tool_name, fields) in cases {
+        let spec = spec_named(&specs, tool_name);
+        for field in *fields {
+            let property = &spec.input_schema["properties"][*field];
+            assert!(
+                property.get("maximum").is_none(),
+                "{tool_name}.{field} must let the runtime clamp oversized preferences: {property}"
+            );
+            let description = property["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            assert!(
+                description.contains("clamp"),
+                "{tool_name}.{field} should document runtime clamping: {description}"
+            );
+        }
     }
 }
 
@@ -754,6 +844,22 @@ fn session_tool_specs_describe_explicit_targeting() {
             .is_some(),
         "update_session_context must expose the named SSH resource field"
     );
+
+    let work = spec_named(&specs, "work_on_project");
+    let session_id_description = work.input_schema["properties"]["session_id"]["description"]
+        .as_str()
+        .expect("work_on_project session_id description")
+        .to_lowercase();
+    for phrase in [
+        "does not prove",
+        "fresh model context",
+        "include_* defaults true",
+    ] {
+        assert!(
+            session_id_description.contains(phrase),
+            "work_on_project session_id description should mention {phrase}: {session_id_description}"
+        );
+    }
     let update_desc = update.description.to_lowercase();
     for phrase in [
         "authorized project",

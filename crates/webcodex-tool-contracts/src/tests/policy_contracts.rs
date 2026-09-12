@@ -168,6 +168,7 @@ fn tool_definitions_are_session_evidence_policy_ssot() {
         runtime_tool_session_evidence_policy("__unknown_session_evidence_tool__"),
         ToolSessionEvidencePolicy::NONE
     );
+    #[cfg(feature = "workspace-checkpoints")]
     assert_eq!(
         lookup_tool_definition("workspace_checkpoint_create")
             .unwrap()
@@ -320,6 +321,17 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .copied()
         .collect::<BTreeSet<_>>();
 
+    for retired_primitive in ["git_diff", "git_diff_summary"] {
+        assert!(
+            lookup_tool_definition(retired_primitive).is_none(),
+            "{retired_primitive} must stay retired from the public runtime contract"
+        );
+        assert!(
+            !git_group.contains(retired_primitive),
+            "{retired_primitive} must stay absent from Git discovery"
+        );
+    }
+
     for definition in tool_definitions() {
         let metadata = definition.metadata();
         assert_eq!(
@@ -351,12 +363,6 @@ fn tool_definitions_drive_session_and_permission_policy() {
             definition.is_shell_like(),
             metadata.shell_like || metadata.risk == ToolRisk::JobRun,
             "{} shell-like guard policy must include job-run tools",
-            definition.name
-        );
-        assert_eq!(
-            definition.is_git_like(),
-            git_group.contains(definition.name),
-            "{} git-like ledger policy must mirror the git discovery group",
             definition.name
         );
         assert_eq!(
@@ -489,12 +495,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         change_summary_tools,
-        vec![
-            "git_diff_summary",
-            "git_review_summary",
-            "show_changes",
-            "git_diff_hunks",
-        ]
+        vec!["git_review_summary", "show_changes", "git_diff_hunks",]
     );
 
     let validation_output_tools = tool_definitions()
@@ -572,6 +573,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("computer_save_snapshot", PERMISSION_RISK_ARTIFACT_WRITE),
         ("apply_patch", PERMISSION_RISK_PATCH),
         ("apply_unified_diff", PERMISSION_RISK_PATCH),
+        #[cfg(feature = "workspace-checkpoints")]
         ("workspace_checkpoint_restore", PERMISSION_RISK_PATCH),
         ("write_project_file", PERMISSION_RISK_WRITE),
         ("apply_text_edits", PERMISSION_RISK_WRITE),
@@ -580,6 +582,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("heartbeat_agent_task_attempt", PERMISSION_RISK_WRITE),
         ("complete_agent_task_attempt", PERMISSION_RISK_WRITE),
         ("update_agent_identity", PERMISSION_RISK_WRITE),
+        ("rotate_agent_continuation_endpoint", PERMISSION_RISK_WRITE),
         ("attach_agent_endpoint", PERMISSION_RISK_WRITE),
         ("detach_agent_endpoint", PERMISSION_RISK_WRITE),
         ("consume_agent_deliveries", PERMISSION_RISK_WRITE),
@@ -776,11 +779,6 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::GitOrShell,
         ),
         (
-            "git_diff",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
             "git_diff_hunks",
             ToolRisk::Read,
             RunnerCapabilityRequirement::GitOrShell,
@@ -814,11 +812,6 @@ fn required_runner_capability_matches_metadata_risk_table() {
             "go_test",
             ToolRisk::JobRun,
             RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        (
-            "read_file",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
         ),
         (
             "read_files",
@@ -886,19 +879,9 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::Shell,
         ),
         (
-            "search_project_text",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
             "search_project_texts",
             ToolRisk::Read,
             RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "git_diff_summary",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
         ),
         (
             "show_changes",
@@ -910,26 +893,31 @@ fn required_runner_capability_matches_metadata_risk_table() {
             ToolRisk::Read,
             RunnerCapabilityRequirement::GitOrShell,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_create",
             ToolRisk::CheckpointManage,
             RunnerCapabilityRequirement::FileRead,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_restore",
             ToolRisk::ProjectWrite,
             RunnerCapabilityRequirement::FileWrite,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_list",
             ToolRisk::Read,
             RunnerCapabilityRequirement::OwnerOnly,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_show",
             ToolRisk::Read,
             RunnerCapabilityRequirement::OwnerOnly,
         ),
+        #[cfg(feature = "workspace-checkpoints")]
         (
             "workspace_checkpoint_delete",
             ToolRisk::ProjectWrite,
@@ -1039,4 +1027,22 @@ fn assert_agent_capability_lookup_rejects_non_runtime_name(name: &str) {
         result.is_err(),
         "{name} must not resolve Runner capability through metadata fallback"
     );
+}
+
+#[cfg(not(feature = "workspace-checkpoints"))]
+#[test]
+fn workspace_checkpoints_disabled_registry_and_discovery() {
+    assert!(registered_tool_specs()
+        .iter()
+        .all(|spec| !spec.name.starts_with("workspace_checkpoint_")));
+    assert!(crate::tool_catalog::TOOL_DISCOVERY_GROUPS
+        .iter()
+        .all(|group| group.name != "checkpoint"
+            && group
+                .tools
+                .iter()
+                .all(|name| !name.starts_with("workspace_checkpoint_"))));
+    for suffix in ["create", "list", "show", "restore", "delete"] {
+        assert!(lookup_tool_definition(&format!("workspace_checkpoint_{suffix}")).is_none());
+    }
 }

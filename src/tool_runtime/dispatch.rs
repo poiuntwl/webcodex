@@ -204,9 +204,6 @@ pub(super) fn sparsify_failure_model_result_metadata(tool_name: &str, result: &m
 
 enum SearchModelProjection {
     None,
-    Single {
-        default_timeout: bool,
-    },
     Batch {
         default_timeouts: Vec<bool>,
         max_result_bytes: Option<usize>,
@@ -216,9 +213,6 @@ enum SearchModelProjection {
 impl SearchModelProjection {
     fn capture(call: &ToolCall) -> Self {
         match call {
-            ToolCall::SearchProjectText { timeout_secs, .. } => Self::Single {
-                default_timeout: caller_uses_default_search_timeout(timeout_secs),
-            },
             ToolCall::SearchProjectTexts {
                 queries,
                 max_result_bytes,
@@ -252,10 +246,10 @@ pub(super) struct ModelFacingProjectionPlan {
 impl ModelFacingProjectionPlan {
     pub(super) fn capture(call: &ToolCall) -> Self {
         let projection = match call {
-            ToolCall::ReadFile { .. } | ToolCall::ReadFiles { .. } => {
+            ToolCall::ReadFiles { .. } => {
                 ModelFacingProjection::Read(super::read_files::ReadModelProjection::capture(call))
             }
-            ToolCall::SearchProjectText { .. } | ToolCall::SearchProjectTexts { .. } => {
+            ToolCall::SearchProjectTexts { .. } => {
                 ModelFacingProjection::Search(SearchModelProjection::capture(call))
             }
             _ => ModelFacingProjection::None,
@@ -276,23 +270,20 @@ impl ModelFacingProjectionPlan {
         match self.projection {
             ModelFacingProjection::None => {}
             ModelFacingProjection::Read(projection) => {
-                let tool_name = match &projection {
-                    super::read_files::ReadModelProjection::Single { .. } => "read_file",
-                    super::read_files::ReadModelProjection::Batch {
-                        max_result_bytes, ..
-                    } => {
-                        super::read_files::apply_model_facing_output_budget(
-                            result,
-                            *max_result_bytes,
-                            &projection,
-                        );
-                        super::read_files::enforce_final_model_facing_hard_cap(result, &projection);
-                        "read_files"
-                    }
-                    super::read_files::ReadModelProjection::None => return,
+                let super::read_files::ReadModelProjection::Batch {
+                    max_result_bytes, ..
+                } = &projection
+                else {
+                    return;
                 };
+                super::read_files::apply_model_facing_output_budget(
+                    result,
+                    *max_result_bytes,
+                    &projection,
+                );
+                super::read_files::enforce_final_model_facing_hard_cap(result, &projection);
                 super::read_files::add_actionable_read_continuations(&projection, result);
-                sparsify_complete_read_success(tool_name, result);
+                sparsify_complete_read_success("read_files", result);
             }
             ModelFacingProjection::Search(projection) => {
                 if let SearchModelProjection::Batch {
@@ -498,9 +489,6 @@ fn sparsify_search_success_for_model(projection: &SearchModelProjection, result:
         return;
     };
     match projection {
-        SearchModelProjection::Single { default_timeout } => {
-            sparsify_search_output_for_model(output, *default_timeout, false);
-        }
         SearchModelProjection::Batch {
             default_timeouts, ..
         } => {
@@ -658,16 +646,12 @@ pub(crate) fn sparsify_complete_file_read_output(
 }
 
 pub(crate) fn sparsify_complete_read_success(tool_name: &str, result: &mut ToolResult) {
-    if !result.success || !matches!(tool_name, "read_file" | "read_files") {
+    if !result.success || tool_name != "read_files" {
         return;
     }
     let Some(output) = result.output.as_object_mut() else {
         return;
     };
-    if tool_name == "read_file" {
-        sparsify_complete_file_read_output(output, None);
-        return;
-    }
 
     let complete_batch = output
         .get("items")
@@ -1043,7 +1027,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
         mut recorder_metadata: sessions::ToolCallRecorderMetadata,
-        _window: Option<&crate::client_window::ClientWindow>,
+        window: Option<&crate::client_window::ClientWindow>,
         inner_model_facing_recording: bool,
         context_request: Vec<String>,
         material_capabilities: super::context_projection::ContextMaterialCapabilities,
@@ -1436,6 +1420,7 @@ impl ToolRuntime {
                 call,
                 auth,
                 transport,
+                window,
                 ssh_resource.as_deref(),
                 validation_assertion_name,
                 project_resolution,
@@ -1519,6 +1504,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
         ssh_resource: Option<&str>,
         validation_assertion_name: Option<&str>,
         project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
@@ -1569,14 +1555,17 @@ impl ToolRuntime {
             }
 
             call @ (ToolCall::WorkOnProject { .. } | ToolCall::FinishCodingTask { .. }) => {
-                self.dispatch_coding_task_tool(
+                // Startup/closeout aggregation retains relatively large typed workflow state.
+                // Keep that future off the shared dispatch future so unrelated tool calls do
+                // not inherit its stack cost as the coding startup contract evolves.
+                Box::pin(self.dispatch_coding_task_tool(
                     call,
                     auth,
                     transport,
                     trusted_recording_session_id,
                     trusted_recording_session_project,
                     correlation,
-                )
+                ))
                 .await
             }
 
@@ -1584,6 +1573,7 @@ impl ToolRuntime {
                 self.dispatch_handoff_tool(call, auth).await
             }
 
+            #[cfg(feature = "workspace-checkpoints")]
             call @ (ToolCall::WorkspaceCheckpointCreate { .. }
             | ToolCall::WorkspaceCheckpointList { .. }
             | ToolCall::WorkspaceCheckpointShow { .. }
@@ -1811,6 +1801,58 @@ impl ToolRuntime {
                 .await
             }
 
+            ToolCall::CreateGoal {
+                title,
+                objective,
+                idempotency_key,
+            } => self.create_goal(auth, title, objective, idempotency_key),
+
+            ToolCall::GetGoal { goal_id } => self.get_goal(auth, goal_id),
+
+            ToolCall::PresentGoalPlan { goal_id } => self.present_goal_plan(auth, goal_id),
+
+            ToolCall::GoalPlanState { goal_id } => self.goal_plan_state(auth, goal_id),
+
+            ToolCall::ListGoals {
+                lifecycle,
+                offset,
+                limit,
+            } => self.list_goals(auth, lifecycle, offset, limit),
+
+            ToolCall::UpdateGoal {
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            } => self.update_goal(
+                auth,
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            ),
+
+            ToolCall::AssociateGoalAgentTask {
+                goal_id,
+                task_id,
+                idempotency_key,
+            } => self.associate_goal_agent_task(auth, goal_id, task_id, idempotency_key),
+
+            ToolCall::AssociateGoalWorkflowSession {
+                goal_id,
+                session_id,
+                idempotency_key,
+            } => {
+                self.associate_goal_workflow_session(auth, goal_id, session_id, idempotency_key)
+                    .await
+            }
+
             ToolCall::CreateAgentTask {
                 title,
                 instruction,
@@ -1958,7 +2000,13 @@ impl ToolRuntime {
                 specialty_labels,
             ),
 
-            ToolCall::AttachAgentEndpoint {
+            ToolCall::RotateAgentContinuationEndpoint {
+                agent_id,
+                host,
+                client_attachment_id,
+                idempotency_key,
+            }
+            | ToolCall::AttachAgentEndpoint {
                 agent_id,
                 host,
                 client_attachment_id,
@@ -1969,6 +2017,125 @@ impl ToolRuntime {
                 host,
                 client_attachment_id,
                 idempotency_key,
+            ),
+
+            ToolCall::PresentAgentContinuation {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+            } => self.present_agent_continuation(
+                auth,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+            ),
+
+            ToolCall::AgentContinuationBind {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            } => self.agent_continuation_bind_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            ),
+
+            ToolCall::AgentContinuationRecoverEndpoint {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            } => self.agent_continuation_recover_endpoint_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            ),
+
+            ToolCall::AgentContinuationState {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            } => self.agent_continuation_state_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            ),
+
+            ToolCall::AgentContinuationWakeAcquire {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            } => self.agent_continuation_wake_acquire_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            ),
+
+            ToolCall::AgentContinuationWakePrepare {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+                wake_id,
+                attempt_id,
+            } => self.agent_continuation_wake_prepare_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+                wake_id,
+                attempt_id,
+            ),
+
+            ToolCall::AgentContinuationWakeFinish {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+                wake_id,
+                attempt_id,
+                outcome,
+            } => self.agent_continuation_wake_finish_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+                wake_id,
+                attempt_id,
+                outcome,
+            ),
+
+            ToolCall::AgentContinuationUnbind {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
+            } => self.agent_continuation_unbind_for_window(
+                auth,
+                window,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                binding_id,
             ),
 
             ToolCall::DetachAgentEndpoint { endpoint_id } => {
@@ -2194,12 +2361,10 @@ impl ToolRuntime {
             }
 
             call @ (ToolCall::DeleteProjectFiles { .. }
-            | ToolCall::ReadFile { .. }
             | ToolCall::ReadFiles { .. }
             | ToolCall::ListProjectFiles { .. }
             | ToolCall::ListProjectTrackedFiles { .. }
             | ToolCall::ProjectOverview { .. }
-            | ToolCall::SearchProjectText { .. }
             | ToolCall::SearchProjectTexts { .. }
             | ToolCall::WriteProjectFile { .. }
             | ToolCall::SaveProjectArtifact { .. }
@@ -2219,11 +2384,9 @@ impl ToolRuntime {
             | ToolCall::DiscardUntracked { .. }
             | ToolCall::GitCommitPaths { .. }
             | ToolCall::GitStatus { .. }
-            | ToolCall::GitDiff { .. }
             | ToolCall::GitDiffHunks { .. }
             | ToolCall::GitReviewSummary { .. }
             | ToolCall::GitLog { .. }
-            | ToolCall::GitDiffSummary { .. }
             | ToolCall::ShowChanges { .. }) => self.dispatch_git_tool(call).await,
 
             call @ (ToolCall::CargoFmt { .. }
@@ -2233,8 +2396,6 @@ impl ToolRuntime {
 
             call @ (ToolCall::RunJob { .. }
             | ToolCall::StopJob { .. }
-            | ToolCall::JobStatus { .. }
-            | ToolCall::JobLog { .. }
             | ToolCall::ObserveJobs { .. }
             | ToolCall::ListJobs { .. }
             | ToolCall::JobTail { .. }) => self.dispatch_job_tool(call, auth, ssh_resource).await,

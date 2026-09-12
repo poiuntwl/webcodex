@@ -2,15 +2,6 @@ use serde_json::{json, Value};
 
 use super::common::{object_schema, with_optional_session_id};
 
-pub fn git_diff_summary_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![(
-        "project",
-        "string",
-        "Runner-registered project id.",
-        true,
-    )]))
-}
-
 pub fn git_review_summary_input_schema() -> Value {
     let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Runner-registered project id.", true),
@@ -65,7 +56,7 @@ pub fn show_changes_input_schema() -> Value {
         (
             "session_event_limit",
             "integer",
-            "Maximum recent session events to include (clamped).",
+            "Optional recent session-event diagnostic projection (clamped). Omit or use 0 for the compact default, which keeps review signals and changed paths without event history.",
             false,
         ),
     ]))
@@ -117,13 +108,6 @@ pub fn git_commit_paths_input_schema() -> Value {
     schema
 }
 
-pub fn git_diff_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![
-        ("project", "string", "Configured project id.", true),
-        ("args", "array", "Optional path list.", false),
-    ]))
-}
-
 pub fn git_diff_hunks_input_schema() -> Value {
     let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Runner-registered project id.", true),
@@ -143,6 +127,12 @@ pub fn git_diff_hunks_input_schema() -> Value {
             "max_hunk_lines",
             "integer",
             "Maximum lines per hunk (clamped).",
+            false,
+        ),
+        (
+            "max_page_bytes",
+            "integer",
+            "Raw producer page budget in bytes, independent of the final serialized model result. Defaults to 64 KiB and is bounded to 16..192 KiB so ordinary Runner result retention retains framing headroom.",
             false,
         ),
         (
@@ -166,10 +156,16 @@ pub fn git_diff_hunks_input_schema() -> Value {
         (
             "continuation",
             "string",
-            "Opaque continuation returned by a previous git_diff_hunks page. When continuing, repeat the exact original diff scope and paging inputs unchanged (base_commit/head_commit for committed mode, cached/worktree mode, paths, max_hunks, and max_hunk_lines); the token is scope-bound and does not reconstruct omitted request fields.",
+            "Opaque continuation returned by a previous git_diff_hunks page. When continuing, repeat the exact original diff scope and paging inputs unchanged (base_commit/head_commit for committed mode, cached/worktree mode, paths, max_hunks, max_hunk_lines, and max_page_bytes); the token is scope-bound and does not reconstruct omitted request fields. Continuation recovers later records, never lines omitted from the current hunk.",
             false,
         ),
     ]));
+    schema["properties"]["max_page_bytes"]["minimum"] =
+        Value::from(webcodex_core::runtime_contract::MIN_GIT_DIFF_HUNKS_PAGE_BYTES);
+    schema["properties"]["max_page_bytes"]["maximum"] =
+        Value::from(webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES);
+    schema["properties"]["max_page_bytes"]["default"] =
+        Value::from(webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES);
     for field in ["base_commit", "head_commit"] {
         schema["properties"][field]["minLength"] = Value::from(40);
         schema["properties"][field]["maxLength"] = Value::from(40);

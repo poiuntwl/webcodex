@@ -12,19 +12,43 @@ fn main() {
     let head_path = git_metadata_path(&repo_root, "HEAD")
         .unwrap_or_else(|| repo_root.join(".git").join("HEAD"));
     println!("cargo:rerun-if-changed={}", head_path.display());
-    if let Some(head_ref) = current_head_ref(&repo_root) {
-        let head_ref_path = git_metadata_path(&repo_root, &head_ref)
-            .unwrap_or_else(|| repo_root.join(".git").join(&head_ref));
-        println!("cargo:rerun-if-changed={}", head_ref_path.display());
+    // A symbolic branch may be stored only in packed-refs. Emitting a Cargo
+    // dependency on the corresponding missing loose-ref path makes the build
+    // script permanently dirty in managed worktrees. Watch an existing ancestor
+    // while the loose ref is absent, so its creation refreshes build identity
+    // even when reflogs are disabled. The next run watches the loose ref itself.
+    if let Some(head_log) = git_metadata_path(&repo_root, "logs/HEAD").filter(|path| path.exists())
+    {
+        println!("cargo:rerun-if-changed={}", head_log.display());
     }
-    if let Some(packed_refs) = git_metadata_path(&repo_root, "packed-refs") {
+    if let Some(head_ref) = current_head_ref(&repo_root) {
+        if let Some(head_ref_path) = git_metadata_path(&repo_root, &head_ref) {
+            if let Some(existing_path) = head_ref_path.ancestors().find(|path| path.exists()) {
+                println!("cargo:rerun-if-changed={}", existing_path.display());
+            }
+        }
+    }
+    if let Some(packed_refs) =
+        git_metadata_path(&repo_root, "packed-refs").filter(|path| path.exists())
+    {
         println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
+
+    // Git metadata does not change for ordinary unstaged worktree edits. When
+    // dirty state is derived locally, make those tracked files explicit Cargo
+    // inputs so a same-HEAD rebuild cannot reuse stale build-script output.
+    // CI/release callers that pin WEBCODEX_GIT_DIRTY intentionally skip these
+    // worktree dependencies and keep their deterministic identity contract.
+    let git_dirty_override = env_value("WEBCODEX_GIT_DIRTY");
+    let git_dirty = git_dirty_override
+        .clone()
+        .unwrap_or_else(|| git_dirty_from_git(&repo_root));
+    if git_dirty_override.is_none() {
+        watch_git_dirty_inputs(&repo_root, &git_dirty);
     }
 
     let git_commit =
         env_value("WEBCODEX_GIT_COMMIT").unwrap_or_else(|| git_commit_from_git(&repo_root));
-    let git_dirty =
-        env_value("WEBCODEX_GIT_DIRTY").unwrap_or_else(|| git_dirty_from_git(&repo_root));
     // Release workflows pin WEBCODEX_BUILT_AT explicitly. For ordinary Git
     // worktrees, prefer stable inputs so the same commit does not invalidate
     // compiler caches merely because it was built at a different wall-clock
@@ -81,10 +105,55 @@ fn git_metadata_path(repo_root: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
+fn watch_git_dirty_inputs(repo_root: &Path, git_dirty: &str) {
+    if let Some(index_path) = git_metadata_path(repo_root, "index").filter(|path| path.exists()) {
+        println!("cargo:rerun-if-changed={}", index_path.display());
+    }
+
+    let mut command = Command::new("git");
+    command.current_dir(repo_root);
+    if git_dirty == "true" {
+        // Once already dirty, only the paths keeping us dirty need watching.
+        // Newly dirtied files cannot change the boolean identity; if a watched
+        // dirty path becomes clean, the next run re-evaluates and rotates this set.
+        command.args(["diff-index", "--name-only", "-z", "HEAD", "--"]);
+    } else {
+        // A clean tree can become dirty through any tracked worktree path.
+        command.args(["ls-files", "-z"]);
+    }
+    let Ok(output) = command.output() else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let mut watched_paths = std::collections::HashSet::new();
+    for path in output.stdout.split(|byte| *byte == 0) {
+        if path.is_empty() || path.contains(&b'\n') || path.contains(&b'\r') {
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let path = repo_root.join(path);
+        // Deleted tracked files are valid dirty inputs, but a missing
+        // rerun-if-changed path makes Cargo rerun the build script forever.
+        // Watch the nearest existing ancestor instead; recreating the missing
+        // entry changes that directory and refreshes dirty state without
+        // sacrificing no-op caching while the deletion remains.
+        let Some(existing_path) = path.ancestors().find(|candidate| candidate.exists()) else {
+            continue;
+        };
+        if watched_paths.insert(existing_path.to_path_buf()) {
+            println!("cargo:rerun-if-changed={}", existing_path.display());
+        }
+    }
+}
+
 fn git_dirty_from_git(repo_root: &Path) -> String {
     match Command::new("git")
         .current_dir(repo_root)
-        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .args(["diff", "--no-ext-diff", "--quiet", "HEAD", "--"])
         .status()
     {
         Ok(status) if status.success() => "false".to_string(),

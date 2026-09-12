@@ -60,6 +60,24 @@ injected by the pinned verified OpenAI `tunnel-client`.
 
 For a regular independent Windows Server + Runner reached through OpenAI Tunnel, or to troubleshoot a case where local `/readyz` is healthy but ChatGPT Connector creation still fails, see the [Windows + OpenAI Secure MCP Tunnel deep dive](WINDOWS_OPENAI_TUNNEL.md). It is advanced setup/troubleshooting material, not required reading for a first-time user.
 
+## Result cards
+
+On operator surfaces, clients advertising MCP Apps HTML support can display a
+small set of read-only milestone cards for `list_jobs`, `validation_summary`, and
+`git_review_summary`. The Job card shows only active or attention-requiring Jobs;
+routine successful terminal Jobs stay out of the foreground. Aggregate validation
+and committed-range review cards remain bounded and do not embed raw logs, diffs,
+or hunks.
+
+High-frequency calls such as `observe_jobs`, `cargo_check`, `cargo_test`, `go_test`,
+and `show_changes` intentionally keep the Host's native tool presentation instead
+of creating an extra custom App card for every call. Cards do not poll, retry, or
+invoke tools; the canonical tool result remains available independently.
+`WEBCODEX_MCP_APPS_ENABLED=false` disables App metadata and resources without
+disabling the underlying tools.
+
+The current Result App is intentionally static. September 2026 Host experiments proved that a separately designed MCP App controller can poll server-owned state and request later ChatGPT model turns, including a bounded foreground autonomous multi-turn loop, but background-tab model-turn scheduling is not an immediate guarantee. Those findings and the production design constraints are recorded in [`agent/mcp-app-continuation-experiments.md`](agent/mcp-app-continuation-experiments.md); they do not change the current Result App contract.
+
 ## Existing Server
 
 For an existing hosted Server intentionally configured for shared-key clients,
@@ -311,13 +329,13 @@ No project discovery or runtime identifier belongs in this prompt.
 
 ## Read and search bounds
 
-- `read_file` is a bounded streaming range reader: `start_line` (default 1),
-  `limit` (default 2000, max 2000), returns the range plus the complete-file
-  SHA-256 and line metadata, and a `next_start_line` to continue.
-- `read_files` batches up to 8 single-file reads with independent item
-  results.
-- `search_project_text` is the default search tool (ripgrep first, bounded in
-  work and bytes); `search_project_texts` batches up to 8 queries.
+- `read_files` is the canonical bounded range reader for one to eight files. A
+  one-item batch is the single-range path. Each successful item returns the
+  complete-file SHA-256 and bounded line metadata; partial items carry a
+  positional one-item `read_files` continuation and are not snapshot-stable.
+- `search_project_texts` is the canonical bounded search surface for one to
+  eight independent queries (ripgrep first with the existing bounded fallback).
+  A one-query batch is the single-query path.
 
 An empty search result is affirmative no-match evidence only after a recognized
 backend reports a successful completed/no-match status. Missing or malformed

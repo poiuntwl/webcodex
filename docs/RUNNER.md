@@ -190,13 +190,13 @@ env_from_env = { GITHUB_TOKEN = "GITHUB_TOKEN", PATH = "PATH", HOME = "HOME" }
 timeout_secs = 30
 ```
 
-`executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` is restart-required configuration; changing a provider does not hot-reload it.
+`executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` participates in the normal generation-fenced Runner config reload transaction: unchanged providers keep their exact provider identity and live connection, changed providers receive a fresh provider identity, and added/removed providers update routing without restarting the Runner. Old exact provider identities fail closed and are never retargeted.
 
-Provider processes do not inherit the Runner environment wholesale. `env_from_env` copies only explicitly named variables, and WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start.
+Provider processes do not inherit the Runner environment wholesale. `env_from_env` copies only explicitly named variables, and WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start. On Windows, the Runner additionally supplies only the non-secret `SYSTEMROOT` OS bootstrap after clearing the environment, unless that destination is explicitly mapped; `PATH`, user-profile state, proxies, and credentials are still not inherited.
 
 Mapping a credential delegates that credential to the configured provider process. The provider can use it according to its own implementation and can choose to return derived or raw values through normal tool results; WebCodex does not attempt to redact arbitrary provider output. Treat configured providers as credential recipients, use least-privilege provider credentials, and remember that any caller authorized for `mcp:local` can exercise the provider capabilities that those credentials enable.
 
-A provider starts on first real interaction and is then reused. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, or Runner credential. `mcp_tool(action=list)` reports whether a provider id can be routed; `list(server=...)` and `describe` interact with the provider.
+A provider connection starts on first real interaction and is reused while healthy. A fatal stdio/protocol failure retires only that connection; WebCodex never replays the failed request. A later explicit request may start a fresh connection under the same logical provider identity, and an effectful `tools/call` re-lists and checks the bound tool schema before dispatch. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, or Runner credential. `mcp_tool(action=list)` reports only routing resolvability. `mcp_tool(action=status, server=...)` is a passive Runner-side lifecycle observation that never starts, initializes, or pings a provider; it reports only `never_started`, `healthy`, `connection_retired`, or `busy`. Here `healthy` means the retained connection's child process is still running, not that an end-to-end MCP health probe was performed. `list(server=...)` and `describe` interact with the provider.
 
 ### Provider-side gateway V1 compatibility
 
@@ -420,6 +420,21 @@ its fenced execution identity remain live, a replacement Runner can reconstruct
 the same logical detached Job and route observation or stop through its durable
 control state. This does not make ordinary process execution detachable, and it
 does not promise survival across a machine reboot.
+
+Completed caller-visible ordinary Jobs have a separate Server-owned SQLite
+receipt. Within the original 15-minute terminal retention window, up to 64
+receipts per logical Runner survive a coordinated Server/Runner restart and
+remain available through `list_jobs`, `observe_jobs`, and bounded log reads.
+Receipts preserve the Job id, terminal result, retained log cursors and tails,
+and original authorization partition/owner; Runner registration is not required
+to observe them. Restarts and receipt replay do not renew their deadlines.
+Storage failure degrades restart observability without changing execution success.
+
+These receipts are read-only evidence. They contain no command input, stdin,
+environment, validation argv, replay intent, process handle, or execution lease.
+Active ordinary Jobs remain process-owned; only `run_detached_process` has an
+explicit durable execution ownership handoff. Hidden synchronous results and
+detached ownership state are excluded from ordinary receipt persistence.
 
 The Server distinguishes the stable Runner `client_id` from the current live process lease. A stale or replacement process cannot keep submitting results under the old lease, and ordinary child-process Jobs are not adopted by a replacement Runner. The exact lease identifier is an internal wire detail.
 

@@ -59,7 +59,10 @@ this concrete Agent/Conversation model. Standing rules are:
 - the planned asynchronous work object is an independent **Agent Task** with an
   exact fenced **Agent TaskAttempt**. It is not the existing Connector Task and is
   not inferred merely because a Conversation Message exists;
-- references among Conversation, Agent Task, Workflow Session, Job, CodingAgentRun,
+- **Goal** is an independent `wc_goal_*` high-level durable intent/control domain. It is not an Agent Task, Workflow Session, Job, Project selector, execution primitive, or scheduler; Goal identity/status/revision/correlation is never a bearer credential;
+- Goal selection is exact durable identity or explicit creation only. Never infer the current Goal from Project, ClientWindow, credential, MCP/OpenAI session data, Conversation membership, Workflow Session, or shared timing;
+- Goal lifecycle is currently closed to `active | completed | cancelled`. `finish_coding_task`, AgentTask/TaskAttempt completion, Job terminal state, or validation evidence do not automatically transition a Goal;
+- references among Goal, Conversation, Agent Task, Workflow Session, Job, CodingAgentRun,
   commit, PR, or Artifact provide correlation only. Dereferencing always re-runs
   the referenced object's normal authorization;
 - automatic worker spawning, runnable-frontier scheduling, capacity management,
@@ -313,7 +316,7 @@ it never infers readiness from configuration.
 | Explicit Workflow targeting | Full-runtime Workflow Sessions have no process-local or durable window binding. `runtime_status` exposes no Workflow binding layer. Ordinary project tools without an explicit business Session or authorized wrapper recorder execute unlinked to Workflow Session state. This remains separate from Connector-owned window/project/task continuity |
 | Full-runtime start/continue | `work_on_project(session_id=<id>)` continues exactly that authorized Active same-project Session; omission creates a fresh Workflow Session. Stable window or credential identity never selects a Workflow Session. `work_on_project` calls the shared coding workflow engine directly; there is no second internal ToolCall identity |
 | Canonical model coding bootstrap | `work_on_project` is the external runtime coding bootstrap. `registered_tool_specs` defines the canonical model-visible runtime universe used by discovery and generic ToolCall admission. A startup-selected model surface may project that universe more narrowly: `local_coding` lists its focused typed set, `adaptive_runtime` lists a smaller typed core plus one generic gateway for long-tail targets and fallback dispatch of otherwise-admitted direct targets, and `full_operator_runtime` expands the runtime universe. Retired wire names such as `start_coding_task` fail closed before dispatch and never contribute selector names or flattened model fields |
-| Runtime exposure selection | The Server owns one top-level `RuntimeExposure`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects `ProjectConnector`, exposed publicly as `project_connector`; ProjectConnector is a project-bound ConnectorTask capability contract, not a `ModelSurface`. Without Connector configuration, exposure is `Runtime(ModelSurface)`: an unset `WEBCODEX_MCP_MODEL_SURFACE` selects `local_coding`, while `local-coding-v1`, `adaptive-runtime-v1`, and `full-operator-v1` select `local_coding`, `adaptive_runtime`, and `full_operator_runtime` explicitly. `adaptive_runtime` direct admission/order is statically declared by canonical `ToolDefinition`s; ordinary model-visible runtime tools default to the bounded long-tail gateway unless explicitly promoted to direct. Direct availability is preferred exposure rather than exclusive execution authority: an otherwise-admitted direct target may fall back through the same generic gateway. Gateway dispatch preserves the target tool's existing scope, authority, permission, argument, capability, effect, and Session/ACK semantics. A Connector + `WEBCODEX_MCP_MODEL_SURFACE` conflict, an unsupported value, or partial Connector configuration fails startup. MCP GET/initialize/discovery, `runtime_status.runtime_exposure`, and the startup log report the same flattened exposure name |
+| Runtime exposure selection | The Server owns one top-level `RuntimeExposure`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects `ProjectConnector`, exposed publicly as `project_connector`; ProjectConnector is a project-bound ConnectorTask capability contract, not a `ModelSurface`. Without Connector configuration, exposure is `Runtime(ModelSurface)`: an unset `WEBCODEX_MCP_MODEL_SURFACE` selects `adaptive_runtime`, while `local-coding-v1`, `adaptive-runtime-v1`, and `full-operator-v1` select `local_coding`, `adaptive_runtime`, and `full_operator_runtime` explicitly. `local-coding-v1` remains the fixed typed compatibility surface; fresh/default model exposure uses Adaptive discovery rather than deleting those runtime capabilities. `adaptive_runtime` direct admission/order is statically declared by canonical `ToolDefinition`s; ordinary model-visible runtime tools default to the bounded long-tail gateway unless explicitly promoted to direct. Direct availability is preferred exposure rather than exclusive execution authority: an otherwise-admitted direct target may fall back through the same generic gateway. Gateway dispatch preserves the target tool's existing scope, authority, permission, argument, capability, effect, and Session/ACK semantics. MCP `tools/list` schema projection is exposure-aware: unset `WEBCODEX_MCP_COMPACT_SCHEMAS` defaults Adaptive Runtime to compact discovery (omitting only `outputSchema`), while Local Coding, Full Operator, and ProjectConnector retain full-schema compatibility defaults; explicit true/false always overrides that projection without changing ToolSpec ownership or invocation/result semantics. A Connector + `WEBCODEX_MCP_MODEL_SURFACE` conflict, an unsupported value, or partial Connector configuration fails startup. MCP GET/initialize/discovery, `runtime_status.runtime_exposure`, and the startup log report the same flattened exposure name |
 | Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_runners`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
 | Independence | Layers degrade independently; `not_observed` on one layer must not be collapsed into a global offline verdict |
 
@@ -372,20 +375,26 @@ The standing direction for model-facing execution is defined in
 3. **One execution may outlive one tool/model turn.** When work exceeds a short
    synchronous grace window, the same execution should continue as a durable Job;
    handoff must not be implemented as cancel-and-retry.
-4. **Job/observation is the continuation API.** Durable Job identity, lifecycle,
-   bounded logs, observation token, cancellation, ownership, and recovery/lost
-   semantics remain OS-, transport-, and presentation-neutral. Batch observation
-   should reuse this model rather than create a second scheduler or revision
-   system.
+4. **Job/observation is the execution continuation and observation API.** Durable
+   Job identity, lifecycle, bounded logs, observation token, cancellation,
+   ownership, and recovery/lost semantics remain OS-, transport-, and
+   presentation-neutral. This does not itself mean model/Host continuation; batch
+   observation should reuse this model rather than create a second scheduler or
+   revision system.
 5. **Optional host UI is an adapter, not an owner.** MCP Apps or another host may
    observe Jobs and later resume a model, but core execution cannot depend on
-   Apps, MCP Tasks, MRTR, elicitation, progress extensions, or iframe state. If
-   automatic model resume is provided, exactly one durable continuation domain
-   owns each logical resume event; independent Job Views, cards, or Host views do
-   not race to resume the model. For Agent-bound continuation, the Agent Wake /
-   Wake Delivery Attempt domain owns that logical continuation; Host/controller
-   state is adapter-local delivery state rather than a second WebCodex
-   continuation truth.
+   Apps, MCP Tasks, MRTR, elicitation, progress extensions, or iframe state. MCP
+   App presentation is a Server-level optional adapter: `WEBCODEX_MCP_APPS_ENABLED`
+   defaults on and may disable App capability advertisement, descriptor linkage,
+   presentation metadata, and static App resources without disabling canonical
+   MCP tools/results or non-App resource delivery. If automatic model resume is
+   provided, exactly one durable continuation domain owns each logical resume
+   event; independent Job Views, cards, or Host views do not race to resume the
+   model. A long build/watch reaching terminal state may be an explicit input to
+   Goal/AgentTask orchestration, but the card is never the trigger or continuation
+   owner. For Agent-bound continuation, the Agent Wake / Wake Delivery Attempt
+   domain owns that logical continuation; Host/controller state is adapter-local
+   delivery state rather than a second WebCodex continuation truth.
 6. **Transport fallback must preserve execution semantics.** Polling, WebSocket,
    and QUIC may differ in delivery behavior, but none may silently duplicate a
    command or turn a transport stall into a false pre-start rejection.

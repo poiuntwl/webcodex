@@ -22,7 +22,7 @@ use super::{
 };
 use crate::DetachedInitiatorIdentity;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 use webcodex_core::runner_operation::{
@@ -1082,6 +1082,7 @@ impl RunnerRegistry {
         }
         let runner_instance_id = runner.runner_instance_id.clone();
         let auth_group = runner.auth_group.clone();
+        let owner_at_admission = runner.owner.clone();
         if let Some(intent) = detached_intent.as_ref() {
             if let Some(existing) = inner.jobs_by_id.get(&job_id) {
                 if existing.kind != "run_detached_process" {
@@ -1118,6 +1119,7 @@ impl RunnerRegistry {
             request_id: Some(request_id.clone()),
             client_id: client_id.clone(),
             auth_group,
+            owner_at_admission,
             runner_instance_id,
             kind: job_kind.to_string(),
             project_id: metadata.project_id,
@@ -1149,7 +1151,10 @@ impl RunnerRegistry {
             visibility: metadata.visibility,
 
             recovery: JobRecoveryState::default(),
-            observation: JobObservationState::new(self.observation_epoch.clone()),
+            observation: JobObservationState {
+                receipt_candidates: self.inner.capture_candidates(),
+                ..JobObservationState::new(self.observation_epoch.clone())
+            },
         };
         inner.request_to_job.insert(request_id, job_id.clone());
         inner.jobs_by_id.insert(job_id.clone(), job);
@@ -1518,27 +1523,52 @@ impl RunnerRegistry {
         jobs
     }
 
-    /// Count active jobs for one exact runtime project without applying the
-    /// display-list pagination limit. Jobs without a runtime project id are
-    /// intentionally excluded.
+    /// Count caller-visible active Jobs for the requested exact Projects in one
+    /// registry snapshot. Refresh lifecycle once, then aggregate once: O(P + J),
+    /// with output bounded by requested Projects, not the complete Job inventory.
+    /// Private, projectless, terminal and unauthorized Jobs never contribute.
+    pub async fn count_active_jobs_for_projects(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        runtime_project_ids: &[&str],
+    ) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = runtime_project_ids
+            .iter()
+            .map(|id| ((*id).to_string(), 0))
+            .collect();
+        if counts.is_empty() {
+            return counts;
+        }
+        let mut inner = self.inner.lock().await;
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.project_job_scan_count.fetch_add(1, Ordering::Relaxed);
+        let job_ids = inner.jobs_by_id.keys().cloned().collect::<Vec<_>>();
+        for job_id in job_ids {
+            refresh_job_status_locked(&mut inner, &job_id);
+        }
+        for job in inner.jobs_by_id.values().filter(|job| {
+            job.visibility == ShellJobVisibility::Public
+                && job.lifecycle.is_active()
+                && shell_job_visible_to_auth(auth, &inner, job)
+        }) {
+            if let Some(count) = job.project_id.as_deref().and_then(|id| counts.get_mut(id)) {
+                *count += 1;
+            }
+        }
+        counts
+    }
+
+    /// Single-Project observation shares the same unpaginated, authorized path.
     pub async fn count_active_jobs_for_project(
         &self,
         auth: Option<&crate::RunnerAccess>,
         runtime_project_id: &str,
     ) -> usize {
-        let mut inner = self.inner.lock().await;
-        let job_ids = inner.jobs_by_id.keys().cloned().collect::<Vec<_>>();
-        for job_id in job_ids {
-            refresh_job_status_locked(&mut inner, &job_id);
-        }
-        inner
-            .jobs_by_id
-            .values()
-            .filter(|job| job.visibility == ShellJobVisibility::Public)
-            .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
-            .filter(|job| job.project_id.as_deref() == Some(runtime_project_id))
-            .filter(|job| job.lifecycle.is_active())
-            .count()
+        self.count_active_jobs_for_projects(auth, &[runtime_project_id])
+            .await
+            .get(runtime_project_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Atomically fence new job starts and count all currently active jobs for

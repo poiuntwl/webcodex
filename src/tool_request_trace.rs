@@ -1560,10 +1560,27 @@ pub struct ToolRequestLifecycle {
     method: String,
     tool_name: Option<String>,
     client_window: Option<ClientWindow>,
+    app_call_id: Option<String>,
     suppress_payload_capture: bool,
     request_observed_at_ms: i64,
     started: Instant,
     completed: AtomicBool,
+}
+
+fn tool_suppresses_payload_capture(tool_name: Option<&str>) -> bool {
+    matches!(
+        tool_name,
+        Some(
+            "read_tool_trace"
+                | "agent_continuation_bind"
+                | "agent_continuation_recover_endpoint"
+                | "agent_continuation_state"
+                | "agent_continuation_wake_acquire"
+                | "agent_continuation_wake_prepare"
+                | "agent_continuation_wake_finish"
+                | "agent_continuation_unbind"
+        )
+    )
 }
 
 impl ToolRequestLifecycle {
@@ -1574,7 +1591,7 @@ impl ToolRequestLifecycle {
         method: impl Into<String>,
         tool_name: Option<String>,
     ) -> Self {
-        let suppress_payload_capture = tool_name.as_deref() == Some("read_tool_trace");
+        let suppress_payload_capture = tool_suppresses_payload_capture(tool_name.as_deref());
         let request_observed_at_ms = chrono::Utc::now().timestamp_millis();
         Self {
             prefix,
@@ -1584,6 +1601,7 @@ impl ToolRequestLifecycle {
             method: method.into(),
             tool_name,
             client_window: None,
+            app_call_id: None,
             suppress_payload_capture,
             request_observed_at_ms,
             started: Instant::now(),
@@ -1621,7 +1639,7 @@ impl ToolRequestLifecycle {
     }
 
     pub fn set_tool_name(&mut self, tool_name: Option<String>) {
-        self.suppress_payload_capture = tool_name.as_deref() == Some("read_tool_trace");
+        self.suppress_payload_capture = tool_suppresses_payload_capture(tool_name.as_deref());
         self.tool_name = tool_name;
     }
 
@@ -1634,6 +1652,13 @@ impl ToolRequestLifecycle {
     /// identifier so tracing cannot become another opaque-identity parser.
     pub(crate) fn set_client_window(&mut self, window: Option<&ClientWindow>) {
         self.client_window = window.cloned();
+    }
+
+    /// Attach one bounded App-generated correlation id for diagnostics only.
+    /// The MCP adapter validates and strips this field before ToolRuntime parsing;
+    /// it is never authority and never contains Agent, Endpoint, Wake, or binding ids.
+    pub(crate) fn set_app_call_id(&mut self, app_call_id: Option<String>) {
+        self.app_call_id = app_call_id;
     }
 
     pub fn duration_ms(&self) -> u64 {
@@ -1710,6 +1735,7 @@ impl ToolRequestLifecycle {
             tool_name = self.tool_name.as_deref().unwrap_or("-"),
             client_window_key = self.client_window.as_ref().map(ClientWindow::key).unwrap_or("-"),
             client_window_source = self.client_window.as_ref().map(ClientWindow::source).unwrap_or("-"),
+            app_call_id = self.app_call_id.as_deref().unwrap_or("-"),
             duration_ms,
             estimated_json_bytes = estimated_json_bytes.map(|b| b as i64).unwrap_or(-1),
             http_status = http_status.map(|s| s as i32).unwrap_or(-1),
@@ -1733,6 +1759,7 @@ impl ToolRequestLifecycle {
                     "tool_name": self.tool_name.as_deref(),
                     "client_window_key": self.client_window.as_ref().map(ClientWindow::key),
                     "client_window_source": self.client_window.as_ref().map(ClientWindow::source),
+                    "app_call_id": self.app_call_id.as_deref(),
                     "duration_ms": duration_ms,
                     "estimated_json_bytes": estimated_json_bytes,
                     "http_status": http_status,
@@ -2159,6 +2186,62 @@ mod tests {
     }
 
     #[test]
+    fn agent_continuation_app_lifecycle_never_captures_host_binding_or_resume_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+        env.set(
+            "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+            temp.path().to_string_lossy().as_ref(),
+        );
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+        reset_trace_store_accounting();
+
+        for tool_name in [
+            "agent_continuation_bind",
+            "agent_continuation_recover_endpoint",
+            "agent_continuation_state",
+            "agent_continuation_wake_acquire",
+            "agent_continuation_wake_prepare",
+            "agent_continuation_wake_finish",
+            "agent_continuation_unbind",
+        ] {
+            let trace_id = Uuid::new_v4().to_string();
+            let mut guard = ToolRequestLifecycle::new(
+                "mcp",
+                trace_id.clone(),
+                "none",
+                "tools/call",
+                Some(tool_name.to_string()),
+            );
+            guard.set_app_call_id(Some("wc_app_call_0123456789abcdef_1".to_string()));
+            guard.parsed("ok");
+            guard.capture_payload(
+                "raw_request",
+                &json!({"binding_id": "wc_host_binding_PRIVATE", "consume_token": "PRIVATE"}),
+            );
+            guard.capture_payload(
+                "final_response",
+                &json!({"structuredContent": {"success": true, "output": {
+                    "app_protocol": {"automatic_message": "consume_token=wc_wake_consume_PRIVATE_RESUME_ENVELOPE"}
+                }}}),
+            );
+            drop(guard);
+            flush_full_trace_writer();
+            assert!(
+                payload_files(temp.path(), &trace_id).is_empty(),
+                "{tool_name} must suppress forensic payload capture"
+            );
+            let events = fs::read_to_string(temp.path().join(&trace_id).join("events.jsonl"))
+                .expect("continuation trace metadata");
+            assert!(events.contains("wc_app_call_0123456789abcdef_1"));
+            assert!(events.contains("mcp_tool_request_parsed"));
+            assert!(!events.contains("wc_host_binding_PRIVATE"));
+            assert!(!events.contains("PRIVATE_RESUME_ENVELOPE"));
+        }
+    }
+
+    #[test]
     fn full_mode_capture_does_not_wait_for_trace_io_lock() {
         let temp = tempfile::tempdir().unwrap();
         let mut env = crate::test_support::TestEnvGuard::new();
@@ -2179,7 +2262,7 @@ mod tests {
                 "trace-background-writer".into(),
                 "none",
                 "tools/call",
-                Some("read_file".into()),
+                Some("read_files".into()),
             );
             guard.capture_payload("raw_arguments", &json!({"path": "README.md"}));
             let _ = done_tx.send(());
@@ -2214,7 +2297,7 @@ mod tests {
             "trace-fail-open".into(),
             "-",
             "POST /api/tools/call",
-            Some("read_file".into()),
+            Some("read_files".into()),
         );
         guard.capture_payload("raw_arguments", &json!({"path": "README.md"}));
         drop(guard);

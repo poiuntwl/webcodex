@@ -7,6 +7,7 @@ pub mod activity;
 mod agent_task;
 mod cargo;
 mod cargo_tools;
+#[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
 mod coding_agent;
 mod coding_task;
@@ -30,6 +31,7 @@ pub(crate) use git::{framed_clean_show_changes_test_stdout, framed_show_changes_
 mod git_committed;
 mod git_review;
 mod git_tools;
+mod goal;
 mod handoff;
 mod handoff_brief;
 mod handoff_tools;
@@ -42,6 +44,7 @@ mod job_tools;
 mod jobs;
 pub(crate) mod kernel;
 mod lsp_tools;
+pub(crate) use lsp_tools::runner_local_project_id;
 pub(crate) mod memory;
 pub(crate) mod metadata;
 pub(crate) mod model_ergonomics_telemetry;
@@ -53,6 +56,7 @@ pub(crate) mod permissions;
 mod process;
 pub(crate) mod project_instructions;
 mod project_resolution;
+pub(crate) use project_resolution::ResolvedProject;
 mod project_tools;
 mod projects;
 mod read_files;
@@ -134,11 +138,12 @@ pub(crate) use tool_definition::{
 };
 #[cfg(test)]
 pub use tool_inputs::ApplyFileChangeInput;
+#[cfg(all(test, feature = "workspace-checkpoints"))]
+pub use tool_inputs::CheckpointValidationInput;
 pub use tool_inputs::{default_true, ExecutionPurpose, ExecutionShell, ListToolsOptions};
 #[cfg(test)]
 pub use tool_inputs::{
-    ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, CheckpointValidationInput,
-    SessionMode, StartupDetail,
+    ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, SessionMode, StartupDetail,
 };
 pub use tool_result::ToolResult;
 pub(crate) use tool_result::{RecoveryKind, RecoveryTool, RECOVERY_KIND_VALUES};
@@ -150,8 +155,8 @@ pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverEr
 #[cfg(test)]
 pub(crate) use registry::accepted_flattened_args_for_spec;
 pub(crate) use registry::{
-    generic_tool_call_flattened_args_for_spec, registered_tool_specs,
-    stateless_operator_extension_tool_specs,
+    agent_continuation_app_tool_specs, generic_tool_call_flattened_args_for_spec,
+    goal_plan_app_tool_specs, registered_tool_specs, stateless_operator_extension_tool_specs,
 };
 #[cfg(test)]
 pub(crate) use registry::{

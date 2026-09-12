@@ -5,8 +5,11 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::path::Path;
 use std::time::Duration;
+use webcodex_core::runtime_contract::{
+    DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES, MAX_GIT_DIFF_HUNKS_PAGE_BYTES,
+    MIN_GIT_DIFF_HUNKS_PAGE_BYTES, MODEL_INSPECTION_MAX_RESULT_BYTES,
+};
 use webcodex_workspace::file_read_normalize::MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
-use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
 use super::git_committed::{
     committed_git_discovery_prefix, committed_git_isolated_view_setup, normalize_exact_commit_id,
@@ -22,10 +25,6 @@ use super::ToolRuntime;
 use crate::runner_protocol::{ShellCommandExecutionState, ShellRunRequest};
 use crate::tool_runtime::sessions::{SessionEvent, SessionSummary};
 
-/// Sentinel separating `git status --porcelain` from `git diff --stat` in the
-/// combined `git_diff_summary` command output. Chosen to be extremely unlikely
-/// to appear in real git output.
-pub(crate) const DIFF_SUMMARY_SENTINEL: &str = "@@WEBCODEX_DIFF_SUMMARY_SEP@@";
 #[cfg(test)]
 pub(crate) const SHOW_CHANGES_SENTINEL: &str = "@@WEBCODEX_SHOW_CHANGES_SEP@@";
 const SHOW_CHANGES_BLOCK_TRAILER_BYTES: usize = 30;
@@ -38,7 +37,6 @@ pub(crate) use webcodex_core::runtime_contract::GIT_DIFF_HUNKS_CONTINUATION_MAX_
 const GIT_DIFF_HUNKS_CONTINUATION_PREFIX: &str = "wcdh1.";
 const GIT_DIFF_HUNKS_CONTINUATION_VERSION: u8 = 1;
 const GIT_DIFF_HUNKS_COMMITTED_CONTINUATION_VERSION: u8 = 2;
-pub(crate) const GIT_DIFF_HUNKS_PAGE_BYTES: usize = 32 * 1024;
 const GIT_DIFF_HUNKS_STDERR_BYTES: usize = 8 * 1024;
 const GIT_DIFF_HUNKS_BLOCK_TRAILER_BYTES: usize = 30;
 const GIT_DIFF_HUNKS_BLOCK_MAGIC: &[u8; 6] = b"WCDH1:";
@@ -50,18 +48,22 @@ const GIT_COMMIT_MESSAGE_MAX_CHARS: usize = 1000;
 pub(crate) const GIT_COMMIT_RESULT_PREFIX: &str = "@@WEBCODEX_GIT_COMMIT@@";
 const SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES: usize = 80;
 const SHOW_CHANGES_MAX_HUNK_LINES: usize = 240;
-const SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT: usize = 30;
+// Keep overview context materially below the default per-hunk line ceiling so
+// ordinary small mid-file edits remain decision-complete in show_changes.
+const SHOW_CHANGES_DIFF_CONTEXT_LINES: usize = 20;
+const SHOW_CHANGES_SESSION_SIGNAL_EVENT_LIMIT: usize = 30;
 const SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT: usize = 200;
 /// Maximum number of changed-file records `show_changes` emits on the
 /// production side. The total count stays exact (all entries are counted); only
 /// the returned records are bounded so a multi-thousand-file status never
-/// overflows the transport tail-retention window.
+/// overflows ordinary Runner result-retention headroom.
 pub(crate) const SHOW_CHANGES_MAX_STATUS_FILES: usize = 200;
 /// Production-side stdout budget for the whole `show_changes` command. The
 /// command is constructed so its worst-case raw stdout stays under this value,
-/// which is itself well under the Runner/Shell transport default of 256 KiB
-/// with room for protocol framing and error text. Bounding happens in the
-/// command itself, never by relying on the transport tail.
+/// which is itself below the ordinary Runner per-stream result-retention default
+/// of 256 KiB, with room for protocol framing and error text. That retention
+/// bound is not the polling/WebSocket/QUIC wire ceiling. Bounding happens in the
+/// command itself, never by relying on retained-tail truncation.
 pub(crate) const SHOW_CHANGES_OUTPUT_BUDGET_BYTES: usize = 192 * 1024;
 /// Reserved protocol space inside the output budget. The observation/result
 /// metadata frames and the diff metadata frame must always remain complete even
@@ -97,11 +99,11 @@ const SHOW_CHANGES_UNTRACKED_PREVIEW_MAX_LINES: usize = 40;
 
 // The per-segment byte budgets are each independently bounded in the
 // production script; their sum plus the fixed protocol reserve must fit within
-// the transport output budget, so the script's raw stdout is provably at or
+// the command output budget, so the script's raw stdout is provably at or
 // under `SHOW_CHANGES_OUTPUT_BUDGET_BYTES` whenever every segment's metadata
 // frame is present. This compile-time check pins that invariant: changing any
 // segment budget (or the reserve) without shrinking the sum below the budget
-// fails to build, rather than silently overflowing transport.
+// fails to build, rather than silently overflowing its producer budget.
 const _: () = assert!(
     SHOW_CHANGES_STATUS_BYTES
         + SHOW_CHANGES_HEAD_BYTES
@@ -111,14 +113,10 @@ const _: () = assert!(
         <= SHOW_CHANGES_OUTPUT_BUDGET_BYTES
 );
 
-/// Build the read-only `git_diff_summary` command. Runs `git status
-/// --porcelain` and `git diff --stat` separated by a unique sentinel. No
-/// mutating git subcommand is emitted.
-pub(crate) fn git_diff_summary_command() -> String {
-    format!(
-        "git status --porcelain; printf '\\n{sentinel}\\n'; git diff --stat",
-        sentinel = DIFF_SUMMARY_SENTINEL,
-    )
+fn normalize_git_diff_hunks_page_bytes(max_page_bytes: Option<usize>) -> usize {
+    max_page_bytes
+        .unwrap_or(DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES)
+        .clamp(MIN_GIT_DIFF_HUNKS_PAGE_BYTES, MAX_GIT_DIFF_HUNKS_PAGE_BYTES)
 }
 
 pub(crate) fn normalize_git_log_limit(limit: Option<usize>) -> usize {
@@ -130,6 +128,18 @@ pub(crate) fn normalize_git_log_limit(limit: Option<usize>) -> usize {
 
 pub(crate) fn normalize_git_log_skip(skip: Option<usize>) -> usize {
     skip.unwrap_or(0).min(MAX_GIT_LOG_SKIP)
+}
+
+pub(crate) fn git_log_next_skip(
+    skip: usize,
+    returned_count: usize,
+    truncated: bool,
+) -> Option<usize> {
+    if !truncated || returned_count == 0 {
+        return None;
+    }
+    skip.checked_add(returned_count)
+        .filter(|next| *next > skip && *next <= MAX_GIT_LOG_SKIP)
 }
 
 pub(crate) fn git_log_command(limit: usize, skip: usize) -> String {
@@ -157,7 +167,19 @@ fn parse_git_log_refs(decorations: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn parse_git_log_commits(stdout: &str, limit: usize) -> (Vec<Value>, bool) {
+pub(crate) fn parse_git_log_commits(
+    stdout: &str,
+    limit: usize,
+) -> Result<(Vec<Value>, bool), &'static str> {
+    // Offset continuation counts source records, so silently skipping a partial
+    // record (including a retained-tail prefix) would invent a page boundary.
+    if !stdout.trim_end_matches(['\n', '\r']).is_empty()
+        && !stdout
+            .trim_end_matches(['\n', '\r'])
+            .ends_with(GIT_LOG_RECORD_SEP)
+    {
+        return Err("git log source ended inside a record; retry with a smaller limit");
+    }
     let mut commits = Vec::new();
     let mut truncated = false;
     for record in stdout.split(GIT_LOG_RECORD_SEP) {
@@ -166,8 +188,8 @@ pub(crate) fn parse_git_log_commits(stdout: &str, limit: usize) -> (Vec<Value>, 
             continue;
         }
         let fields: Vec<&str> = record.splitn(7, GIT_LOG_UNIT_SEP).collect();
-        if fields.len() != 7 {
-            continue;
+        if fields.len() != 7 || !is_git_object_hex(fields[0]) {
+            return Err("git log source is incomplete or malformed; retry with a smaller limit");
         }
         if commits.len() >= limit {
             truncated = true;
@@ -183,7 +205,7 @@ pub(crate) fn parse_git_log_commits(stdout: &str, limit: usize) -> (Vec<Value>, 
             "refs": parse_git_log_refs(fields[2]),
         }));
     }
-    (commits, truncated)
+    Ok((commits, truncated))
 }
 
 fn git_log_empty_repo(stderr: &str) -> bool {
@@ -451,9 +473,9 @@ fn non_git_show_changes_payload_with_observation(
 /// (`modified/added/deleted/renamed/copied/untracked/conflicted/staged/unstaged`).
 ///
 /// When `include_diff` is set, the `git diff` is likewise bounded in the command
-/// by `max_hunks` hunks and `max_hunk_lines` lines per hunk before it ever
-/// reaches the transport, so transport tail-retention cannot drop the first
-/// selected hunks. A trailing diff metadata frame reports the returned count,
+/// by `max_hunks` hunks and `max_hunk_lines` lines per hunk before it leaves the
+/// producer, so ordinary Runner/Server result retention does not need to drop
+/// the first selected hunks. A trailing diff metadata frame reports the returned count,
 /// emitted bytes, and independent count/line/byte truncation flags.
 ///
 /// The shell script is held in a raw string with literal placeholders and
@@ -470,7 +492,7 @@ pub(crate) fn show_changes_command(
     let status_files_limit = SHOW_CHANGES_MAX_STATUS_FILES;
     let diff_part = if include_diff {
         r#"; {
-               git diff --unified=80; printf 'diff_exit=%s\n' "$?";
+               git diff --unified=__DIFF_CONTEXT_LINES__; printf 'diff_exit=%s\n' "$?";
              } | {
                hc=0; in_hunk=0; lc=0; diff_exit_raw=; diff_bytes=0; file_buf=; stop_emit=0;
                trunc_count=0; trunc_lines=0; trunc_bytes=0; trunc_bytes_in_hunk=0; have=0; pending=;
@@ -522,6 +544,10 @@ pub(crate) fn show_changes_command(
              }"#
         .replace("__HUNK_LIMIT__", &max_hunks.to_string())
         .replace("__LINE_LIMIT__", &max_hunk_lines.to_string())
+        .replace(
+            "__DIFF_CONTEXT_LINES__",
+            &SHOW_CHANGES_DIFF_CONTEXT_LINES.to_string(),
+        )
         .replace("__DIFF_BYTE_BUDGET__", &SHOW_CHANGES_DIFF_BYTES.to_string())
     } else {
         String::new()
@@ -1897,6 +1923,7 @@ pub(crate) fn apply_show_changes_session(
     output: &mut Value,
     session_id: Option<&str>,
     summary: Option<SessionSummary>,
+    recent_events_limit: Option<usize>,
 ) {
     let Some(session_id) = session_id else {
         output["session"] = Value::Null;
@@ -1906,11 +1933,13 @@ pub(crate) fn apply_show_changes_session(
     let session_signals = match summary {
         Some(summary) => {
             let changed_paths = session_changed_paths(&summary.events);
-            let recent_events: Vec<Value> = summary
-                .events
-                .iter()
-                .map(show_changes_session_event)
-                .collect();
+            let recent_events = recent_events_limit.filter(|limit| *limit > 0).map(|limit| {
+                let start = summary.events.len().saturating_sub(limit);
+                summary.events[start..]
+                    .iter()
+                    .map(show_changes_session_event)
+                    .collect::<Vec<_>>()
+            });
             let signals = SessionActionSignals {
                 failed: summary.counts.failed > 0,
                 write_like: summary.counts.write_like > 0,
@@ -1925,8 +1954,15 @@ pub(crate) fn apply_show_changes_session(
                 "updated_at": summary.updated_at,
                 "counts": summary.counts,
                 "changed_paths": changed_paths,
-                "recent_events": recent_events,
+                "signals": {
+                    "failed": signals.failed,
+                    "write_like": signals.write_like,
+                    "shell_like": signals.shell_like,
+                },
             });
+            if let Some(recent_events) = recent_events {
+                output["session"]["recent_events"] = json!(recent_events);
+            }
             Some(signals)
         }
         None => {
@@ -2127,6 +2163,7 @@ fn set_show_changes_verdict(output: &mut Value) {
             "paths": suggested_paths,
             "max_hunks": DEFAULT_MAX_HUNKS,
             "max_hunk_lines": suggested_max_hunk_lines,
+            "max_page_bytes": DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES,
         });
         output["diff_review_handoff"] = json!({
             "tool": "git_diff_hunks",
@@ -2472,23 +2509,6 @@ fn show_changes_session_event(event: &SessionEvent) -> Value {
     })
 }
 
-/// Split the combined `git_diff_summary` stdout into the porcelain section and
-/// the `diff --stat` section. If the sentinel is absent, everything is treated
-/// as porcelain (defensive; should not happen in practice).
-pub(crate) fn split_diff_summary(stdout: &str) -> (String, String) {
-    if let Some((before, after)) = stdout.split_once(DIFF_SUMMARY_SENTINEL) {
-        (
-            before.trim_end_matches(['\n', '\r']).to_string(),
-            after
-                .trim_start_matches(['\n', '\r'])
-                .trim_end()
-                .to_string(),
-        )
-    } else {
-        (stdout.trim_end().to_string(), String::new())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct GitDiffHunksContinuationV1 {
@@ -2519,11 +2539,18 @@ fn is_git_object_hex(value: &str) -> bool {
     is_lower_hex(value, 40) || is_lower_hex(value, 64)
 }
 
-fn git_diff_hunks_scope_digest(resolved_project: &str, paths: &[String], cached: bool) -> String {
+fn git_diff_hunks_scope_digest(
+    resolved_project: &str,
+    paths: &[String],
+    cached: bool,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+    max_page_bytes: usize,
+) -> String {
     let mut normalized_paths = paths.to_vec();
     normalized_paths.sort();
     let mut hasher = Sha256::new();
-    hasher.update(b"webcodex.git-diff-hunks.scope.v1\0");
+    hasher.update(b"webcodex.git-diff-hunks.scope.v2\0");
     hasher.update(resolved_project.as_bytes());
     hasher.update([0]);
     if cached {
@@ -2531,6 +2558,9 @@ fn git_diff_hunks_scope_digest(resolved_project: &str, paths: &[String], cached:
     } else {
         hasher.update(b"worktree");
     }
+    hasher.update((max_hunks as u64).to_be_bytes());
+    hasher.update((max_hunk_lines as u64).to_be_bytes());
+    hasher.update((max_page_bytes as u64).to_be_bytes());
     for path in normalized_paths {
         hasher.update([0]);
         hasher.update((path.len() as u64).to_be_bytes());
@@ -2545,11 +2575,12 @@ fn git_diff_hunks_committed_scope_digest(
     scope: &CommittedGitScope,
     max_hunks: usize,
     max_hunk_lines: usize,
+    max_page_bytes: usize,
 ) -> String {
     let mut normalized_paths = paths.to_vec();
     normalized_paths.sort();
     let mut hasher = Sha256::new();
-    hasher.update(b"webcodex.git-diff-hunks.scope.committed.v1\0");
+    hasher.update(b"webcodex.git-diff-hunks.scope.committed.v2\0");
     for value in [
         resolved_project,
         scope.requested_base.as_str(),
@@ -2562,7 +2593,7 @@ fn git_diff_hunks_committed_scope_digest(
     }
     hasher.update((max_hunks as u64).to_be_bytes());
     hasher.update((max_hunk_lines as u64).to_be_bytes());
-    hasher.update((GIT_DIFF_HUNKS_PAGE_BYTES as u64).to_be_bytes());
+    hasher.update((max_page_bytes as u64).to_be_bytes());
     for path in normalized_paths {
         hasher.update((path.len() as u64).to_be_bytes());
         hasher.update(path.as_bytes());
@@ -2768,6 +2799,7 @@ fn git_diff_hunks_call_arguments(
     committed_scope: Option<&CommittedGitScope>,
     max_hunks: usize,
     max_hunk_lines: usize,
+    max_page_bytes: usize,
     continuation: Option<&str>,
 ) -> Value {
     let mut arguments = serde_json::Map::new();
@@ -2775,6 +2807,7 @@ fn git_diff_hunks_call_arguments(
     arguments.insert("paths".to_string(), json!(paths));
     arguments.insert("max_hunks".to_string(), json!(max_hunks));
     arguments.insert("max_hunk_lines".to_string(), json!(max_hunk_lines));
+    arguments.insert("max_page_bytes".to_string(), json!(max_page_bytes));
     if let Some(scope) = committed_scope {
         arguments.insert("base_commit".to_string(), json!(scope.requested_base));
         arguments.insert("head_commit".to_string(), json!(scope.requested_head));
@@ -2829,6 +2862,7 @@ fn git_diff_hunks_recovery_value(
     committed_scope: Option<&CommittedGitScope>,
     max_hunks: usize,
     max_hunk_lines: usize,
+    max_page_bytes: usize,
     files: &[Value],
     page_hunk_limit: bool,
     hunk_line_limit: bool,
@@ -2860,6 +2894,7 @@ fn git_diff_hunks_recovery_value(
                 committed_scope,
                 max_hunks,
                 max_hunk_lines,
+                max_page_bytes,
                 Some(continuation),
             ),
         })
@@ -2876,8 +2911,8 @@ fn git_diff_hunks_recovery_value(
     // The producer drains each returned hunk to its boundary even when its
     // model-facing body is line-bounded. These bounded index lists therefore
     // prove whether *all* omitted returned hunks fit both the 400-line ceiling
-    // and a fresh path-scoped 32 KiB page. Never infer future byte fit from the
-    // already-emitted prefix alone.
+    // and a fresh path-scoped page using the same producer byte budget. Never
+    // infer future byte fit from the already-emitted prefix alone.
     let omitted_lines_fit_line_ceiling = !truncated_hunks.is_empty()
         && truncated_hunks
             .iter()
@@ -2922,6 +2957,7 @@ fn git_diff_hunks_recovery_value(
                 committed_scope,
                 max_hunks,
                 MAX_MAX_HUNK_LINES,
+                max_page_bytes,
                 None,
             ),
         })
@@ -3109,6 +3145,7 @@ fn git_diff_hunks_page_command(
     start_position: usize,
     max_hunks: usize,
     max_hunk_lines: usize,
+    max_page_bytes: usize,
     expected_fence: Option<&str>,
     committed_scope: Option<&CommittedGitScope>,
 ) -> Result<String, String> {
@@ -3285,7 +3322,7 @@ exit 1
 "#;
     Ok(script
         .replace("__PRELUDE__", &prelude)
-        .replace("__PAGE_BUDGET__", &GIT_DIFF_HUNKS_PAGE_BYTES.to_string())
+        .replace("__PAGE_BUDGET__", &max_page_bytes.to_string())
         .replace("__MAX_HUNKS__", &max_hunks.to_string())
         .replace("__MAX_HUNK_LINES__", &max_hunk_lines.to_string())
         .replace(
@@ -3370,7 +3407,10 @@ fn parse_hunk_indices(meta: &str, key: &str, returned_hunks: usize) -> Option<Ve
     Some(indices)
 }
 
-fn parse_framed_git_diff_hunks_stdout(stdout: &str) -> Option<GitDiffHunksPageWire> {
+fn parse_framed_git_diff_hunks_stdout(
+    stdout: &str,
+    max_page_bytes: usize,
+) -> Option<GitDiffHunksPageWire> {
     let mut cursor = stdout.len();
     let (obs_data, obs_meta, start) = parse_git_diff_hunks_wire_block(stdout, cursor, b'O')?;
     if !obs_data.is_empty() {
@@ -3378,7 +3418,7 @@ fn parse_framed_git_diff_hunks_stdout(stdout: &str) -> Option<GitDiffHunksPageWi
     }
     cursor = start;
     let (diff, page_meta, start) = parse_git_diff_hunks_wire_block(stdout, cursor, b'P')?;
-    if start != 0 || diff.len() > GIT_DIFF_HUNKS_PAGE_BYTES {
+    if start != 0 || diff.len() > max_page_bytes {
         return None;
     }
     let obs_meta = strip_wire_lf(obs_meta)?;
@@ -3645,45 +3685,6 @@ pub(crate) fn parse_git_diff_hunks(
         &mut hunk_lines,
     );
     (files, hunk_count, truncated)
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PorcelainSummary {
-    pub(crate) changed_files: Vec<String>,
-    pub(crate) tracked_changed_files: Vec<String>,
-    pub(crate) untracked_files: Vec<String>,
-    pub(crate) ignored_files: Vec<String>,
-    pub(crate) changed_files_count: usize,
-}
-
-/// Parse `git status --porcelain` output into tracked/untracked buckets.
-/// Handles renames (`R  old -> new` -> `new`) and quoted paths.
-pub(crate) fn parse_porcelain_summary(porcelain: &str) -> PorcelainSummary {
-    let mut summary = PorcelainSummary::default();
-    for line in porcelain.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let status = &line[..2];
-        let path_part = &line[3..];
-        let path = if let Some((_, dst)) = path_part.split_once(" -> ") {
-            dst
-        } else {
-            path_part
-        };
-        let path = path.trim().trim_matches('"');
-        if path.is_empty() {
-            continue;
-        }
-        match status {
-            "??" => summary.untracked_files.push(path.to_string()),
-            "!!" => summary.ignored_files.push(path.to_string()),
-            _ => summary.tracked_changed_files.push(path.to_string()),
-        }
-        summary.changed_files.push(path.to_string());
-    }
-    summary.changed_files_count = summary.changed_files.len();
-    summary
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3985,55 +3986,6 @@ impl ToolRuntime {
         }
     }
 
-    pub(crate) async fn git_diff(&self, project: String, args: Option<Vec<String>>) -> ToolResult {
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        let diff_args = args.unwrap_or_default();
-        let cmd = if diff_args.is_empty() {
-            "git diff".to_string()
-        } else {
-            // `args` is the existing pathspec list contract. Keep the `--`
-            // fence and POSIX word quoting exactly as before, but execute the
-            // generated command through the typed internal POSIX path so the
-            // quoting can never be parsed by the user's configured shell.
-            let escaped: Vec<String> = diff_args.iter().map(|a| shell_escape_simple(a)).collect();
-            format!("git diff -- {}", escaped.join(" "))
-        };
-        let client_id = proj.client_id.clone();
-        let (req_id, rx) = match self
-            .runner_registry
-            .enqueue_internal_posix_script(
-                client_id,
-                Some(proj.path.clone()),
-                cmd,
-                30,
-                32,
-                "tool_runtime".to_string(),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return ToolResult::err(e),
-        };
-        match tokio::time::timeout(Duration::from_secs(34), rx).await {
-            Ok(Ok(resp)) => ToolResult::ok(json!({
-                "stdout": resp.stdout,
-                "stderr": resp.stderr,
-                "exit_code": resp.exit_code,
-            })),
-            Ok(Err(_)) => {
-                self.runner_registry.cancel_request(&req_id).await;
-                ToolResult::err("request dropped")
-            }
-            Err(_) => {
-                self.runner_registry.cancel_request(&req_id).await;
-                ToolResult::err("timed out")
-            }
-        }
-    }
-
     #[cfg(test)]
     pub(crate) async fn git_diff_hunks(
         &self,
@@ -4070,12 +4022,39 @@ impl ToolRuntime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn git_diff_hunks_continued_with_range(
         &self,
         project: String,
         paths: Option<Vec<String>>,
         max_hunks: Option<usize>,
         max_hunk_lines: Option<usize>,
+        cached: Option<bool>,
+        base_commit: Option<String>,
+        head_commit: Option<String>,
+        continuation: Option<String>,
+    ) -> ToolResult {
+        self.git_diff_hunks_continued_with_range_and_page_bytes(
+            project,
+            paths,
+            max_hunks,
+            max_hunk_lines,
+            None,
+            cached,
+            base_commit,
+            head_commit,
+            continuation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_diff_hunks_continued_with_range_and_page_bytes(
+        &self,
+        project: String,
+        paths: Option<Vec<String>>,
+        max_hunks: Option<usize>,
+        max_hunk_lines: Option<usize>,
+        max_page_bytes: Option<usize>,
         cached: Option<bool>,
         base_commit: Option<String>,
         head_commit: Option<String>,
@@ -4121,6 +4100,7 @@ impl ToolRuntime {
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_HUNK_LINES)
             .min(MAX_MAX_HUNK_LINES);
+        let max_page_bytes = normalize_git_diff_hunks_page_bytes(max_page_bytes);
         let cached = cached.unwrap_or(false);
         if continuation
             .as_ref()
@@ -4166,8 +4146,16 @@ impl ToolRuntime {
                 committed_scope,
                 max_hunks,
                 max_hunk_lines,
+                max_page_bytes,
             ),
-            None => git_diff_hunks_scope_digest(&resolved.resolved_id, &paths, cached),
+            None => git_diff_hunks_scope_digest(
+                &resolved.resolved_id,
+                &paths,
+                cached,
+                max_hunks,
+                max_hunk_lines,
+                max_page_bytes,
+            ),
         };
         let mut command_paths = paths.clone();
         command_paths.sort();
@@ -4216,6 +4204,7 @@ impl ToolRuntime {
             start_position,
             max_hunks,
             max_hunk_lines,
+            max_page_bytes,
             expected_fence,
             committed_scope.as_ref(),
         ) {
@@ -4248,7 +4237,7 @@ impl ToolRuntime {
             }
         };
         let stderr = bounded_git_diff_hunks_stderr(&output.stderr);
-        let Some(wire) = parse_framed_git_diff_hunks_stdout(&output.stdout) else {
+        let Some(wire) = parse_framed_git_diff_hunks_stdout(&output.stdout, max_page_bytes) else {
             return git_diff_hunks_failure(
                 &project,
                 &paths,
@@ -4313,7 +4302,7 @@ impl ToolRuntime {
         if output.error.is_some()
             || output.exit_code != Some(0)
             || wire.page_filter_exit != 0
-            || wire.page_bytes > GIT_DIFF_HUNKS_PAGE_BYTES
+            || wire.page_bytes > max_page_bytes
         {
             return git_diff_hunks_failure(
                 &project,
@@ -4429,6 +4418,7 @@ impl ToolRuntime {
             committed_scope.as_ref(),
             max_hunks,
             max_hunk_lines,
+            max_page_bytes,
             &files,
             wire.page_hunk_limit,
             wire.hunk_line_limit,
@@ -4442,6 +4432,7 @@ impl ToolRuntime {
             "project": project,
             "paths": paths,
             "cached": cached,
+            "max_page_bytes": max_page_bytes,
             "files": files,
             "hunk_count": parsed_hunks,
             "truncated": !truncation_reasons.is_empty(),
@@ -4466,7 +4457,7 @@ impl ToolRuntime {
         if serde_json::to_vec(&result)
             .map(|bytes| {
                 bytes.len()
-                    <= MAX_SERIALIZED_OUTPUT_BYTES
+                    <= MODEL_INSPECTION_MAX_RESULT_BYTES
                         .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
             })
             .unwrap_or(false)
@@ -4500,13 +4491,27 @@ impl ToolRuntime {
             Ok(output) => output,
             Err(e) => return ToolResult::err(e),
         };
-        let (commits, truncated) = parse_git_log_commits(&output.stdout, limit);
+        let (commits, truncated) = match parse_git_log_commits(&output.stdout, limit) {
+            Ok(page) => page,
+            Err(error) => {
+                return ToolResult::err_with_output(
+                    error,
+                    json!({
+                        "project": project,
+                        "error_kind": "source_incomplete",
+                        "state_changed": false,
+                    }),
+                );
+            }
+        };
+        let next_skip = git_log_next_skip(skip, commits.len(), truncated);
         let payload = json!({
             "project": project,
             "limit": limit,
             "skip": skip,
             "count": commits.len(),
             "truncated": truncated,
+            "next_skip": next_skip,
             "commits": commits,
         });
         if output.exit_code == Some(0) || git_log_empty_repo(&output.stderr) {
@@ -4520,6 +4525,7 @@ impl ToolRuntime {
                     "skip": payload["skip"],
                     "count": payload["count"],
                     "truncated": payload["truncated"],
+                    "next_skip": payload["next_skip"],
                     "commits": payload["commits"],
                     "exit_code": output.exit_code,
                     "stderr": output.stderr,
@@ -4692,55 +4698,6 @@ impl ToolRuntime {
         }
     }
 
-    pub(crate) async fn git_diff_summary(&self, project: String) -> ToolResult {
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        let cmd = git_diff_summary_command();
-        let client_id = proj.client_id.clone();
-        let (req_id, rx) = match self
-            .runner_registry
-            .enqueue_internal_posix_script(
-                client_id,
-                Some(proj.path.clone()),
-                cmd,
-                30,
-                32,
-                "tool_runtime".to_string(),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return ToolResult::err(e),
-        };
-        match tokio::time::timeout(Duration::from_secs(34), rx).await {
-            Ok(Ok(resp)) => {
-                let stdout = resp.stdout.unwrap_or_default();
-                let (porcelain, diff_stat) = split_diff_summary(&stdout);
-                let porcelain_summary = parse_porcelain_summary(&porcelain);
-                ToolResult::ok(json!({
-                    "porcelain": porcelain,
-                    "diff_stat": diff_stat,
-                    "changed_files": porcelain_summary.changed_files,
-                    "changed_files_count": porcelain_summary.changed_files_count,
-                    "tracked_changed_files": porcelain_summary.tracked_changed_files,
-                    "untracked_files": porcelain_summary.untracked_files,
-                    "ignored_files": porcelain_summary.ignored_files,
-                    "exit_code": resp.exit_code,
-                }))
-            }
-            Ok(Err(_)) => {
-                self.runner_registry.cancel_request(&req_id).await;
-                ToolResult::err("request dropped")
-            }
-            Err(_) => {
-                self.runner_registry.cancel_request(&req_id).await;
-                ToolResult::err("timed out")
-            }
-        }
-    }
-
     pub(crate) async fn show_changes(
         &self,
         project: String,
@@ -4759,9 +4716,11 @@ impl ToolRuntime {
             .filter(|n| *n > 0)
             .unwrap_or(SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES)
             .min(SHOW_CHANGES_MAX_HUNK_LINES);
-        let session_event_limit = session_event_limit
-            .filter(|n| *n > 0)
-            .unwrap_or(SHOW_CHANGES_DEFAULT_SESSION_EVENT_LIMIT)
+        let recent_events_limit = session_event_limit
+            .unwrap_or(0)
+            .min(SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT);
+        let session_summary_limit = recent_events_limit
+            .max(SHOW_CHANGES_SESSION_SIGNAL_EVENT_LIMIT)
             .min(SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT);
         let command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
         let output = match self
@@ -4793,8 +4752,13 @@ impl ToolRuntime {
             );
             let session_summary = session_id
                 .as_deref()
-                .and_then(|id| self.sessions.summary(id, Some(session_event_limit)));
-            apply_show_changes_session(&mut payload, session_id.as_deref(), session_summary);
+                .and_then(|id| self.sessions.summary(id, Some(session_summary_limit)));
+            apply_show_changes_session(
+                &mut payload,
+                session_id.as_deref(),
+                session_summary,
+                (recent_events_limit > 0).then_some(recent_events_limit),
+            );
             return ToolResult::ok(payload);
         }
         let status_observed = status_observation.status_observed();
@@ -4821,16 +4785,22 @@ impl ToolRuntime {
         }
         let session_summary = session_id
             .as_deref()
-            .and_then(|id| self.sessions.summary(id, Some(session_event_limit)));
-        apply_show_changes_session(&mut payload, session_id.as_deref(), session_summary);
+            .and_then(|id| self.sessions.summary(id, Some(session_summary_limit)));
+        apply_show_changes_session(
+            &mut payload,
+            session_id.as_deref(),
+            session_summary,
+            (recent_events_limit > 0).then_some(recent_events_limit),
+        );
         // Success requires the command/result envelope, status, diff-stat, and
         // (when requested) full diff inspections all to be proven successful.
-        // `transport_safe` only describes bounded transport integrity and must
-        // never mask an observed or unavailable inspection failure.
+        // `transport_safe` is a legacy field name: it describes bounded
+        // command/result-envelope integrity, not polling/WebSocket/QUIC wire
+        // capacity, and must never mask an observed or unavailable inspection failure.
         let diff_stat_ok = frames.diff_stat_exit == Some(0);
         let diff_ok = if include_diff {
             // `diff_exit == None` means the exit code could not be captured
-            // (e.g. legacy/transport-truncated stdout); treat as not proven-ok.
+            // (e.g. legacy/result-retention-truncated stdout); treat as not proven-ok.
             frames.diff_exit == Some(0)
         } else {
             true

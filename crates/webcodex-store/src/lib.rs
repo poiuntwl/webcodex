@@ -15,6 +15,8 @@ mod audit;
 mod communication;
 mod execution_model;
 mod executions;
+mod goal;
+mod job_receipts;
 mod memory;
 pub mod models;
 mod oauth;
@@ -47,9 +49,10 @@ pub use self::communication::{
     CommunicationStoreError, ConversationAccess, ConversationDetailRecord, ConversationLifecycle,
     ConversationMessageMutation, ConversationMessageRecord, ConversationMutation, ConversationPage,
     ConversationParticipantRecord, ConversationSummaryRecord, DeliveryConsumeResult,
-    DurableAgentIdentity, MessageAuthorRecord, MessageDeliveryRecord, MessageDeliveryState,
-    NewAgentEndpoint, NewAgentIdentity, NewConversation, NewConversationMessage,
-    COMMUNICATION_PRINCIPAL_DIGEST_PREFIX, MAX_DURABLE_AGENTS,
+    DurableAgentIdentity, McpAppEndpointRecovery, MessageAuthorRecord, MessageDeliveryRecord,
+    MessageDeliveryState, NewAgentEndpoint, NewAgentIdentity, NewConversation,
+    NewConversationMessage, COMMUNICATION_PRINCIPAL_DIGEST_PREFIX, MAX_COMMUNICATION_LIST_LIMIT,
+    MAX_DURABLE_AGENTS,
 };
 pub use self::execution_model::{
     ConnectorExecution, ConnectorExecutionFailure, ConnectorExecutionKind,
@@ -59,6 +62,12 @@ pub use self::execution_model::{
 #[cfg(any(test, feature = "root-test-support"))]
 pub use self::execution_model::{
     ConnectorExecutionContinuationIntent, ConnectorTerminalContinuationClaim,
+};
+pub use self::goal::{
+    GoalCorrelation, GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalMutation, GoalPage,
+    GoalPatch, GoalStoreError, GoalSummary, NewGoal, GOAL_ID_PREFIX, MAX_GOAL_CORRELATIONS,
+    MAX_GOAL_LIST_LIMIT, MAX_GOAL_OBJECTIVE_BYTES, MAX_GOAL_TERMINAL_REASON_BYTES,
+    MAX_GOAL_TITLE_CHARS, WORKFLOW_SESSION_ID_PREFIX,
 };
 #[allow(unused_imports)]
 pub use self::memory::{
@@ -139,4 +148,9 @@ mod db_tests;
 #[cfg(test)]
 mod execution_intent_tests;
 #[cfg(test)]
+mod goal_tests;
+#[cfg(test)]
 mod memory_tests;
+
+#[cfg(test)]
+mod job_receipts_tests;

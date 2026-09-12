@@ -106,6 +106,13 @@ pub(crate) struct ToolProtocolCapabilities {
     /// Protocol-surface support for privileged forensic trace retrieval. Caller
     /// authority is still derived only from the canonical ToolDefinition.
     pub(crate) trace_diagnostics: bool,
+    /// Protocol-surface support for the ModelHidden Goal Plan App polling read.
+    /// This never replaces canonical communication/Goal authorization.
+    pub(crate) goal_plan_app: bool,
+    /// Protocol-surface support for ModelHidden MCP App Host-continuation
+    /// coordination. Canonical communication authorization and exact
+    /// process-local Host binding validation remain mandatory in the runtime.
+    pub(crate) agent_continuation_app: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +280,8 @@ impl ToolRuntime {
                 skill_management: false,
                 memory_surface: false,
                 trace_diagnostics: false,
+                goal_plan_app: false,
+                agent_continuation_app: false,
             },
         )
         .await
@@ -341,6 +350,42 @@ impl ToolRuntime {
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
                     message: "Tool trace diagnostics are available only on Stateless MCP 2026 operator surfaces"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if request.tool_name == "goal_plan_state" && !capabilities.goal_plan_app {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Goal Plan App state is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if matches!(
+            request.tool_name.as_str(),
+            "agent_continuation_bind"
+                | "agent_continuation_recover_endpoint"
+                | "agent_continuation_state"
+                | "agent_continuation_wake_acquire"
+                | "agent_continuation_wake_prepare"
+                | "agent_continuation_wake_finish"
+                | "agent_continuation_unbind"
+        ) && !capabilities.agent_continuation_app
+        {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Agent continuation App coordination is available only on Stateless MCP 2026 App-enabled operator surfaces"
                         .to_string(),
                 }),
                 project: None,
@@ -1163,7 +1208,7 @@ mod tests {
         let outcome = runtime
             .call_tool_with_context(
                 ToolCallRequest {
-                    tool_name: "read_file".to_string(),
+                    tool_name: "read_files".to_string(),
                     arguments: json!({"project": "demo"}),
                 },
                 ToolCallContext {
@@ -1237,13 +1282,13 @@ mod tests {
             .unwrap();
         let arguments = json!({
             "project": "demo",
-            "path": "README.md"
+            "items": [{"path": "README.md"}]
         });
 
         let outcome = runtime
             .call_tool_with_invocation_metadata(
                 ToolCallRequest {
-                    tool_name: "read_file".to_string(),
+                    tool_name: "read_files".to_string(),
                     arguments,
                 },
                 ToolCallContext {
@@ -1296,7 +1341,7 @@ mod tests {
     fn session_message_resolution_reuses_dedicated_resolve_scope() {
         let project_read_only = oauth(&["project:read"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&project_read_only), "read_file"),
+            check_runtime_tool_scope(Some(&project_read_only), "read_files"),
             Ok(()),
             "main project read authority must remain independent"
         );
@@ -1705,7 +1750,7 @@ mod tests {
         let mut pat = AuthContext::new(crate::auth::AuthKind::ApiToken);
         pat.scopes = vec![crate::auth::SCOPE_RUNTIME_READ.to_string()];
         assert_eq!(
-            check_runtime_tool_scope(Some(&pat), "read_file"),
+            check_runtime_tool_scope(Some(&pat), "read_files"),
             Err(ToolCallErrorStatus::InsufficientScope {
                 required_scope: Some(crate::auth::SCOPE_PROJECT_READ),
                 description: "missing required scope: project:read".to_string(),
@@ -1717,7 +1762,10 @@ mod tests {
         );
 
         let shared = crate::auth::shared_key_context("kernel-scope-matrix");
-        assert_eq!(check_runtime_tool_scope(Some(&shared), "read_file"), Ok(()));
+        assert_eq!(
+            check_runtime_tool_scope(Some(&shared), "read_files"),
+            Ok(())
+        );
         assert_eq!(
             check_runtime_tool_scope(Some(&shared), "computer_snapshot"),
             Ok(())
@@ -1735,8 +1783,8 @@ mod tests {
         let outcome = runtime
             .call_tool_with_context(
                 ToolCallRequest {
-                    tool_name: "read_file".to_string(),
-                    arguments: json!({"project": "demo", "path": "README.md"}),
+                    tool_name: "read_files".to_string(),
+                    arguments: json!({"project": "demo", "items": [{"path": "README.md"}]}),
                 },
                 ToolCallContext {
                     transport: ToolTransport::Api,

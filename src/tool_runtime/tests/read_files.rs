@@ -63,7 +63,7 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
     );
     assert_eq!(
         schema["properties"]["max_result_bytes"]["maximum"],
-        256 * 1024
+        512 * 1024
     );
     assert!(schema["properties"]["max_result_bytes"]["description"]
         .as_str()
@@ -77,7 +77,7 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
     assert!(!validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
-        "max_result_bytes": 256 * 1024 + 1
+        "max_result_bytes": 512 * 1024 + 1
     })));
     assert!(!validates(&json!({
         "project": "demo",
@@ -121,14 +121,6 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
     ] {
         assert!(ToolCall::from_tool_name("read_files", invalid).is_err());
     }
-
-    let read_file = spec_named(&specs, "read_file");
-    assert!(read_file.input_schema["properties"].get("items").is_none());
-    assert_eq!(
-        read_file.input_schema["required"],
-        json!(["project", "path"]),
-        "read_file remains the single-path contract"
-    );
 }
 
 #[tokio::test]
@@ -223,13 +215,16 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -242,13 +237,14 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "one\ntwo");
-    assert_eq!(result.output["path"], "src/lib.rs");
+    let item = &result.output["items"][0];
+    assert_eq!(item["output"]["text"], "one\ntwo");
+    assert_eq!(item["path"], "src/lib.rs");
     assert_eq!(
-        result.output["sha256"],
+        item["output"]["sha256"],
         format!("{:x}", Sha256::digest(content.as_bytes()))
     );
-    assert_eq!(result.output["total_lines"], 2);
+    assert_eq!(item["output"]["total_lines"], 2);
     for omitted in [
         "format",
         "start_line",
@@ -260,22 +256,23 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
         "continuation",
     ] {
         assert!(
-            result.output.get(omitted).is_none(),
-            "complete full-file read field {omitted} should be omitted: {}",
-            result.output
+            item["output"].get(omitted).is_none(),
+            "complete full-file read item field {omitted} should be omitted: {item}"
         );
     }
     let sparse_bytes = serde_json::to_vec(&result.output).unwrap().len();
     assert!(
-        sparse_bytes <= 400,
-        "complete sparse read_file regressed above model-facing budget: {sparse_bytes} bytes"
+        sparse_bytes <= 600,
+        "complete sparse one-item read_files regressed above model-facing budget: {sparse_bytes} bytes"
     );
-    eprintln!("read_file_sparse_complete_bytes={sparse_bytes}");
+    eprintln!("read_files_sparse_complete_one_item_bytes={sparse_bytes}");
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
-        .unwrap_or_else(|error| panic!("sparse read_file success must match schema: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("sparse one-item read_files success must match schema: {error}")
+        });
 
     let summary = runtime
         .sessions
@@ -285,8 +282,8 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
         .events
         .iter()
         .rev()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "read_file")
-        .expect("recorded read_file completion");
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "read_files")
+        .expect("recorded read_files completion");
     assert!(
         finished
             .observed_paths
@@ -318,13 +315,16 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(2),
+                            limit: Some(1),
+                        }],
                         session_id: Some(session_id),
-                        start_line: Some(2),
-                        limit: Some(1),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -336,17 +336,18 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "two");
-    assert_eq!(result.output["format"], "plain");
-    assert_eq!(result.output["path"], "src/lib.rs");
-    assert_eq!(result.output["start_line"], 2);
-    assert_eq!(result.output["limit"], 1);
-    assert_eq!(result.output["total_lines"], 3);
-    assert_eq!(result.output["returned_lines"], 1);
-    assert_eq!(result.output["end_line"], 2);
-    assert_eq!(result.output["has_more"], true);
-    assert_eq!(result.output["next_start_line"], 3);
-    let continuation = &result.output["continuation"];
+    let item = &result.output["items"][0];
+    assert_eq!(item["output"]["text"], "two");
+    assert_eq!(item["output"]["format"], "plain");
+    assert_eq!(item["path"], "src/lib.rs");
+    assert_eq!(item["output"]["start_line"], 2);
+    assert_eq!(item["output"]["limit"], 1);
+    assert_eq!(item["output"]["total_lines"], 3);
+    assert_eq!(item["output"]["returned_lines"], 1);
+    assert_eq!(item["output"]["end_line"], 2);
+    assert_eq!(item["output"]["has_more"], true);
+    assert_eq!(item["output"]["next_start_line"], 3);
+    let continuation = &item["continuation"];
     assert_eq!(continuation["kind"], "read_range");
     assert_eq!(continuation["safe_cursor"], true);
     assert_eq!(continuation["snapshot_stable"], false);
@@ -354,7 +355,7 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
         continuation["source_sha256"],
         format!("{:x}", Sha256::digest(content.as_bytes()))
     );
-    assert_eq!(continuation["suggested_call"]["tool"], "read_file");
+    assert_eq!(continuation["suggested_call"]["tool"], "read_files");
     assert_eq!(
         continuation["suggested_call"]["arguments"]["session_id"],
         session_id
@@ -363,29 +364,33 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
         continuation["suggested_call"]["tool"].as_str().unwrap(),
         continuation["suggested_call"]["arguments"].clone(),
     )
-    .expect("read_file continuation suggested_call must parse");
+    .expect("read_files continuation suggested_call must parse");
     assert!(matches!(
         next_call,
-        ToolCall::ReadFile {
+        ToolCall::ReadFiles {
             project: ref next_project,
-            path: ref next_path,
+            ref items,
             session_id: Some(ref next_session_id),
-            start_line: Some(3),
-            limit: Some(1),
-            ..
+            with_line_numbers: None,
+            max_result_bytes: None,
         } if next_project == &project
-            && next_path == "src/lib.rs"
+            && items.len() == 1
+            && items[0].path == "src/lib.rs"
+            && items[0].start_line == Some(3)
+            && items[0].limit == Some(1)
             && next_session_id == &session_id
     ));
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
-        .unwrap_or_else(|error| panic!("partial read_file success must match schema: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("partial one-item read_files success must match schema: {error}")
+        });
 }
 
 #[tokio::test]
-async fn read_file_continuation_is_positional_not_snapshot_stable() {
+async fn read_files_continuation_is_positional_not_snapshot_stable() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-source-change";
@@ -400,13 +405,16 @@ async fn read_file_continuation_is_positional_not_snapshot_stable() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(1),
+                            limit: Some(1),
+                        }],
                         session_id: None,
-                        start_line: Some(1),
-                        limit: Some(1),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -416,8 +424,9 @@ async fn read_file_continuation_is_positional_not_snapshot_stable() {
     let request = next_read_request(&runtime, client_id).await;
     complete_read(&runtime, client_id, &request, first_content).await;
     let first = first.await.unwrap();
-    let first_sha = first.output["sha256"].as_str().unwrap().to_string();
-    let suggested = &first.output["continuation"]["suggested_call"];
+    let first_item = &first.output["items"][0];
+    let first_sha = first_item["output"]["sha256"].as_str().unwrap().to_string();
+    let suggested = &first_item["continuation"]["suggested_call"];
     let next_call = ToolCall::from_tool_name(
         suggested["tool"].as_str().unwrap(),
         suggested["arguments"].clone(),
@@ -438,10 +447,11 @@ async fn read_file_continuation_is_positional_not_snapshot_stable() {
     complete_read(&runtime, client_id, &request, changed_content).await;
     let second = second.await.unwrap();
     assert!(second.success, "{:?}", second.error);
-    assert_eq!(second.output["text"], "one");
-    assert_ne!(second.output["sha256"], first_sha);
-    assert_eq!(first.output["continuation"]["source_sha256"], first_sha);
-    assert_eq!(first.output["continuation"]["snapshot_stable"], false);
+    let second_item = &second.output["items"][0];
+    assert_eq!(second_item["output"]["text"], "one");
+    assert_ne!(second_item["output"]["sha256"], first_sha);
+    assert_eq!(first_item["continuation"]["source_sha256"], first_sha);
+    assert_eq!(first_item["continuation"]["snapshot_stable"], false);
 }
 
 #[tokio::test]
@@ -460,13 +470,16 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(1),
+                            limit: Some(2),
+                        }],
                         session_id: None,
-                        start_line: Some(1),
-                        limit: Some(2),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -478,23 +491,24 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "one\ntwo");
-    assert_eq!(result.output["format"], "plain");
-    assert_eq!(result.output["path"], "src/lib.rs");
-    assert_eq!(result.output["start_line"], 1);
-    assert_eq!(result.output["limit"], 2);
-    assert_eq!(result.output["total_lines"], 2);
-    assert_eq!(result.output["returned_lines"], 2);
-    assert_eq!(result.output["end_line"], 2);
-    assert_eq!(result.output["has_more"], false);
-    assert!(result.output["next_start_line"].is_null());
-    assert!(result.output.get("continuation").is_none());
+    let item = &result.output["items"][0];
+    assert_eq!(item["output"]["text"], "one\ntwo");
+    assert_eq!(item["output"]["format"], "plain");
+    assert_eq!(item["path"], "src/lib.rs");
+    assert_eq!(item["output"]["start_line"], 1);
+    assert_eq!(item["output"]["limit"], 2);
+    assert_eq!(item["output"]["total_lines"], 2);
+    assert_eq!(item["output"]["returned_lines"], 2);
+    assert_eq!(item["output"]["end_line"], 2);
+    assert_eq!(item["output"]["has_more"], false);
+    assert!(item["output"]["next_start_line"].is_null());
+    assert!(item.get("continuation").is_none());
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
         .unwrap_or_else(|error| {
-            panic!("explicit-range read_file success must match schema: {error}")
+            panic!("explicit-range one-item read_files success must match schema: {error}")
         });
 }
 
@@ -658,16 +672,17 @@ async fn read_files_partial_item_has_actionable_item_continuation() {
     .expect("item continuation must parse");
     assert!(matches!(
         next_call,
-        ToolCall::ReadFile {
+        ToolCall::ReadFiles {
             project: ref next_project,
-            path: ref next_path,
+            ref items,
             session_id: Some(ref next_session_id),
-            start_line: Some(3),
-            limit: Some(1),
             with_line_numbers: Some(true),
-            ..
+            max_result_bytes: None,
         } if next_project == &project
-            && next_path == "src/lib.rs"
+            && items.len() == 1
+            && items[0].path == "src/lib.rs"
+            && items[0].start_line == Some(3)
+            && items[0].limit == Some(1)
             && next_session_id == &session_id
     ));
     assert!(items[1].get("continuation").is_none());
@@ -1052,7 +1067,7 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
     use crate::tool_runtime::sessions::{
         SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
     };
-    use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
+    use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -1077,7 +1092,12 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
                 .dispatch_with_auth_transport_options_and_metadata(
                     ToolCall::ReadFiles {
                         project,
-                        items: vec![item("a.rs", None, None), item("b.rs", None, None)],
+                        items: vec![
+                            item("a.rs", None, None),
+                            item("b.rs", None, None),
+                            item("c.rs", None, None),
+                            item("d.rs", None, None),
+                        ],
                         session_id: Some(session_id),
                         with_line_numbers: None,
                         max_result_bytes: Some(MAX_SERIALIZED_OUTPUT_BYTES),
@@ -1092,8 +1112,8 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
                 .await
         }
     });
-    let content = "x".repeat(122 * 1024);
-    for _ in 0..2 {
+    let content = "x".repeat(150 * 1024);
+    for _ in 0..4 {
         let request = next_read_request(&runtime, client_id).await;
         complete_read(&runtime, client_id, &request, &content).await;
     }
@@ -1113,7 +1133,7 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
-        "direct Session overlays pushed read_files final response above the 256 KiB hard cap: {serialized_len} bytes"
+        "direct Session overlays pushed read_files final response above the 512 KiB inspection hard cap: {serialized_len} bytes"
     );
 }
 
@@ -1539,7 +1559,7 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
         ToolProtocolCapabilities, ToolTransport,
     };
     use crate::tool_runtime::sessions::SessionContextRevisionAck;
-    use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
+    use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -1556,7 +1576,12 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
     let auth = auth_context(None, true);
     let arguments = json!({
         "project": project,
-        "items": [{"path": "a.rs"}, {"path": "b.rs"}],
+        "items": [
+            {"path": "a.rs"},
+            {"path": "b.rs"},
+            {"path": "c.rs"},
+            {"path": "d.rs"}
+        ],
         "max_result_bytes": MAX_SERIALIZED_OUTPUT_BYTES
     });
 
@@ -1592,8 +1617,8 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
                 .await
         }
     });
-    let content = "x".repeat(122 * 1024);
-    for _ in 0..2 {
+    let content = "x".repeat(150 * 1024);
+    for _ in 0..4 {
         let request = next_read_request(&runtime, client_id).await;
         complete_read(&runtime, client_id, &request, &content).await;
     }
@@ -1612,11 +1637,13 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
     );
     assert_eq!(result.output["output_truncated"], true);
     assert_eq!(result.output["truncation_reason"], "hard_result_cap");
-    assert_eq!(result.output["returned_count"], 1);
-    assert_eq!(result.output["next_index"], 1);
+    let returned_count = result.output["returned_count"].as_u64().unwrap();
+    let next_index = result.output["next_index"].as_u64().unwrap();
+    assert!(returned_count < 4);
+    assert_eq!(next_index, returned_count);
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
-        "outer Session overlays pushed read_files final response above the 256 KiB hard cap: {serialized_len} bytes"
+        "outer Session overlays pushed read_files final response above the 512 KiB inspection hard cap: {serialized_len} bytes"
     );
 }

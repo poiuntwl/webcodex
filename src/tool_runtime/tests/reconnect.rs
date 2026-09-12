@@ -883,6 +883,7 @@ fn coding_start_call(project: &str, instruction: &str) -> ToolCall {
         session_id: None,
         include_project_instructions: true,
         include_workflow_guidance: true,
+        include_extension_catalog: false,
     }
 }
 
@@ -897,6 +898,7 @@ fn coding_resume_call(project: &str, instruction: &str, session_id: &str) -> Too
         session_id: Some(session_id.to_string()),
         include_project_instructions: true,
         include_workflow_guidance: true,
+        include_extension_catalog: false,
     }
 }
 
@@ -1153,13 +1155,16 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
     let read = dispatch_coding_call_in_window(
         &runtime,
         "oauth-client",
-        ToolCall::ReadFile {
+        ToolCall::ReadFiles {
             project: project.clone(),
-            path: "src/inspect.rs".to_string(),
+            items: vec![crate::tool_runtime::ReadFilesItem {
+                path: "src/inspect.rs".to_string(),
+                start_line: None,
+                limit: None,
+            }],
             session_id: Some(session_id.clone()),
-            start_line: None,
-            limit: None,
             with_line_numbers: None,
+            max_result_bytes: None,
         },
         Some(&read_auth),
         "upgrade-window",
@@ -1225,7 +1230,7 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
             .iter()
             .filter(|event| {
                 event.kind == "tool_call_finished"
-                    && event.tool_name == "read_file"
+                    && event.tool_name == "read_files"
                     && event.status.as_deref() == Some("succeeded")
             })
             .count(),

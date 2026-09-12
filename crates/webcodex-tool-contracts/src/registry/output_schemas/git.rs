@@ -14,12 +14,17 @@ fn git_diff_hunks_recovery_arguments_schema() -> Value {
             "paths": {"type": "array", "items": {"type": "string"}},
             "max_hunks": {"type": "integer"},
             "max_hunk_lines": {"type": "integer"},
+            "max_page_bytes": {
+                "type": "integer",
+                "minimum": webcodex_core::runtime_contract::MIN_GIT_DIFF_HUNKS_PAGE_BYTES,
+                "maximum": webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES
+            },
             "cached": {"type": "boolean"},
             "base_commit": {"type": "string"},
             "head_commit": {"type": "string"},
             "continuation": {"type": "string"}
         },
-        "required": ["project", "paths", "max_hunks", "max_hunk_lines"]
+        "required": ["project", "paths", "max_hunks", "max_hunk_lines", "max_page_bytes"]
     })
 }
 
@@ -114,9 +119,13 @@ fn show_changes_handoff_arguments_schema() -> Value {
             "cached": {"type": "boolean", "const": false},
             "paths": {"type": "array", "items": {"type": "string"}},
             "max_hunks": {"type": "integer"},
-            "max_hunk_lines": {"type": "integer"}
+            "max_hunk_lines": {"type": "integer"},
+            "max_page_bytes": {
+                "type": "integer",
+                "const": webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
+            }
         },
-        "required": ["project", "cached", "paths", "max_hunks", "max_hunk_lines"]
+        "required": ["project", "cached", "paths", "max_hunks", "max_hunk_lines", "max_page_bytes"]
     })
 }
 
@@ -140,30 +149,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("failure_kind", nullable_schema("string", "Stable bounded commit rejection/failure kind.")),
             ("hook_policy", schema_type("string", "Always bypassed_exact_tree: commit-tree is used so hooks cannot add unrelated paths.")),
         ])),
-        "git_status" | "git_diff" => Some(wrapped_output_schema(vec![
+        "git_status" => Some(wrapped_output_schema(vec![
             (
                 "exit_code",
                 nullable_schema("integer", "Git command exit code."),
             ),
             ("stdout", schema_type("string", "Git command stdout.")),
             ("stderr", schema_type("string", "Git command stderr.")),
-        ])),
-        "git_diff_summary" => Some(wrapped_output_schema(vec![
-            (
-                "status",
-                schema_type("string", "Porcelain git status output."),
-            ),
-            (
-                "diff_stat",
-                schema_type("string", "Git diff --stat output."),
-            ),
-            (
-                "changed_files",
-                array_schema(
-                    open_object_schema("Changed file summary."),
-                    "Changed files.",
-                ),
-            ),
         ])),
         "git_review_summary" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Runtime project input.")),
@@ -219,6 +211,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             ("cached", schema_type("boolean", "Whether the staged diff is inspected.")),
+            (
+                "max_page_bytes",
+                schema_type("integer", "Effective raw producer-page byte budget. This is not the final serialized model-facing result budget."),
+            ),
             (
                 "scope",
                 json!({
@@ -285,6 +281,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "truncated",
                 schema_type("boolean", "Whether more commits were available."),
+            ),
+            (
+                "next_skip",
+                nullable_schema(
+                    "integer",
+                    "Exact skip value for the next page when another parser-ready page exists inside the bounded skip domain; null on the final page or when the 10000 skip ceiling prevents a safe forward page.",
+                ),
             ),
             (
                 "commits",

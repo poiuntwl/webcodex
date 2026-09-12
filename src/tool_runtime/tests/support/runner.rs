@@ -1,3 +1,4 @@
+#[cfg(feature = "workspace-checkpoints")]
 use super::auth::auth_context;
 use super::runtime::test_runtime;
 use crate::runner_http::RunnerRegistry;
@@ -6,7 +7,10 @@ use crate::runner_protocol::{
     RunnerProjectSummary, RunnerRegisterRequest, RunnerRequest, RunnerResultRequest,
     ShellProfileSummaryEntry, EXTERNAL_SEARCH_REQUEST_PREFIX,
 };
-use crate::tool_runtime::{RuntimeInfo, ToolCall, ToolResult, ToolRuntime};
+#[cfg(feature = "workspace-checkpoints")]
+use crate::tool_runtime::ToolResult;
+use crate::tool_runtime::{RuntimeInfo, ToolCall, ToolRuntime};
+#[cfg(feature = "workspace-checkpoints")]
 use crate::workspace_checkpoint::{create_workspace_checkpoint, restore_workspace_checkpoint};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -44,6 +48,51 @@ pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path(
                 internal_posix_script: true,
                 ..Default::default()
             }),
+            policy: None,
+        })
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        "inst",
+        vec![named_registered_project(
+            client_id,
+            project_id,
+            project_id,
+            &project_path,
+            1,
+        )],
+    )
+    .await;
+    crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
+}
+
+pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path_with_capabilities(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project_id: &str,
+    root: &Path,
+    capabilities: RunnerCapabilities,
+) -> String {
+    let project_path = root.to_string_lossy().to_string();
+    runtime
+        .runner_registry
+        .register(RunnerRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+            client_id: client_id.to_string(),
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: crate::test_support::current_runner_capabilities(capabilities),
             policy: None,
         })
         .await
@@ -491,6 +540,7 @@ pub(in crate::tool_runtime::tests) async fn complete_project_overview_agent_requ
     .await;
 }
 
+#[cfg(feature = "workspace-checkpoints")]
 pub(in crate::tool_runtime::tests) fn run_runner_checkpoint_request_locally(
     req: &RunnerRequest,
 ) -> (i32, String, String) {
@@ -531,6 +581,7 @@ fn request_root(req: &RunnerRequest) -> PathBuf {
     }
 }
 
+#[cfg(feature = "workspace-checkpoints")]
 pub(in crate::tool_runtime::tests) async fn dispatch_checkpoint_with_local_agent(
     runtime: &ToolRuntime,
     client_id: &str,
