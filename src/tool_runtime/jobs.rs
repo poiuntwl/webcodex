@@ -5,7 +5,7 @@ use super::helpers::{
     command_rejected_message, explicit_shell_dispatch_command, is_safe_job_id,
     project_relative_runner_cwd, resolve_runner_cwd, validate_raw_shell_command_length,
 };
-use super::tool_result::{RecoveryKind, RecoveryTool, ToolResult};
+use super::tool_result::{RecoveryKind, SuggestedToolCall, ToolResult};
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
@@ -646,6 +646,35 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
     })
 }
 
+pub(crate) fn job_observation_continuation_semantics() -> Value {
+    super::ContinuationSemantics::new(
+        super::ContinuationKind::Observe,
+        super::ContinuationCarrier::ObservationToken,
+    )
+    .to_value()
+}
+
+pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&str>) -> Value {
+    let mut item = json!({"job_id": job_id});
+    if let Some(token) = observation_token.filter(|token| !token.is_empty()) {
+        item["after_observation_token"] = json!(token);
+    }
+    super::SuggestedToolCall::new(
+        "observe_jobs",
+        json!({
+            "items": [item],
+            "wait_secs": 60,
+            "wake_on": "terminal",
+        }),
+    )
+    .to_value()
+}
+
+fn list_jobs_recovery_suggested_call(project: Option<&str>) -> Value {
+    let arguments = project.map_or_else(|| json!({}), |project| json!({"project": project}));
+    SuggestedToolCall::new("list_jobs", arguments).to_value()
+}
+
 fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResult {
     ToolResult::err_with_output(
         message,
@@ -666,9 +695,10 @@ fn unknown_job_observation_result(job_id: &str) -> ToolResult {
             "failure_kind": "job_not_found",
             "job_id": job_id,
             "state_changed": false,
+            "suggested_call": list_jobs_recovery_suggested_call(None),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
+    .with_recovery(RecoveryKind::Reobserve, None)
 }
 
 fn agent_job_log_error_result(job_id: &str, error: String) -> ToolResult {
@@ -718,9 +748,10 @@ fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
             "final_status": Value::Null,
             "stop_effect": "not_found",
             "command_started": false,
+            "suggested_call": list_jobs_recovery_suggested_call(Some(project)),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
+    .with_recovery(RecoveryKind::Reobserve, None)
 }
 
 fn job_project_mismatch_result(
@@ -906,6 +937,14 @@ fn active_job_brief(summary: &Value) -> Value {
         "started_at": summary.get("started_at").cloned().unwrap_or(Value::Null),
         "created_at": summary.get("created_at").cloned().unwrap_or(Value::Null),
         "executor": summary.get("executor").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn active_job_continuation_brief(summary: &Value) -> Value {
+    json!({
+        "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
+        "status": summary.get("status").cloned().unwrap_or(Value::Null),
+        "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
     })
 }
 
@@ -1095,7 +1134,12 @@ impl ToolRuntime {
                 )
                 .await
             {
-                Ok(job) => ToolResult::ok(json!({
+                Ok(job) => {
+                    let continuation = observe_job_continuation(
+                        &job.job_id,
+                        job.observation_token.as_deref(),
+                    );
+                    ToolResult::ok(json!({
                     "job_id": job.job_id,
                     "kind": job.kind,
                     "status": job.status,
@@ -1110,6 +1154,7 @@ impl ToolRuntime {
                     "execution_state": "started",
                     "created_at": job.created_at,
                     "observation_token": job.observation_token,
+                    "continuation_semantics": job_observation_continuation_semantics(),
                     "last_update_seq": job.last_update_seq,
                     "stdout_tail": "",
                     "stderr_tail": "",
@@ -1117,7 +1162,9 @@ impl ToolRuntime {
                     "stderr_lines": 0,
                     "stdout_truncated": false,
                     "stderr_truncated": false,
-                })),
+                    "continuation": continuation,
+                }))
+                }
                 Err(e) => ToolResult::err(command_rejected_message(
                     e,
                     "confirm the agent is connected and async jobs are allowed, then retry or use run_shell for short commands.",
@@ -1378,6 +1425,7 @@ impl ToolRuntime {
                         job.recovery_reason_code.as_deref(),
                     ),
                     "observation_token": job.observation_token,
+                    "continuation_semantics": job_observation_continuation_semantics(),
                     "log_delta_status": wait.log_delta_status.as_str(),
                     "stdout_delta_reset": wait.stdout_delta_reset,
                     "stderr_delta_reset": wait.stderr_delta_reset,
@@ -1463,7 +1511,11 @@ impl ToolRuntime {
         // behind unrelated recent Jobs.
         let agent_jobs = self
             .runner_registry
-            .list_all_jobs_for_auth(crate::runner_http::runner_access_from_auth(auth).as_ref())
+            .list_jobs_for_auth_filtered(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                project_filter.as_deref(),
+                session_filter.as_deref(),
+            )
             .await;
         let mut summaries: Vec<Value> = agent_jobs
             .iter()
@@ -1472,14 +1524,6 @@ impl ToolRuntime {
                     .as_ref()
                     .map(|status| status == &job.status)
                     .unwrap_or(true)
-                    && project_filter
-                        .as_deref()
-                        .map(|project| job.project_id.as_deref() == Some(project))
-                        .unwrap_or(true)
-                    && session_filter
-                        .as_deref()
-                        .map(|session_id| job.session_id.as_deref() == Some(session_id))
-                        .unwrap_or(true)
             })
             .map(agent_job_summary_value)
             .collect();
@@ -1723,28 +1767,32 @@ impl ToolRuntime {
     pub(crate) async fn active_jobs_summary(
         &self,
         project: Option<&str>,
+        continuation_session_id: Option<&str>,
         auth: Option<&AuthContext>,
         limit: usize,
     ) -> Value {
         let max = limit.clamp(1, 20);
         let mut active = Vec::new();
+        let mut continuation_candidates = Vec::new();
         for job in self
             .runner_registry
-            .list_jobs_for_auth(
+            .list_jobs_for_auth_filtered(
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                Some(100),
+                project,
+                None,
             )
             .await
         {
             if !webcodex_runner_registry::job_status_is_active(&job.status) {
                 continue;
             }
-            if let Some(project) = project {
-                if job.project_id.as_deref() != Some(project) {
-                    continue;
-                }
+            let summary = agent_job_summary_value(&job);
+            if continuation_session_id.is_some()
+                && job.session_id.as_deref() == continuation_session_id
+            {
+                continuation_candidates.push(active_job_continuation_brief(&summary));
             }
-            active.push(agent_job_summary_value(&job));
+            active.push(summary);
         }
 
         active.sort_by(|a, b| {
@@ -1811,7 +1859,7 @@ impl ToolRuntime {
                 ),
             }));
         }
-        json!({
+        let mut output = json!({
             "active_count": active_count,
             "running_count": running_count,
             "recovering_count": recovering_count,
@@ -1823,7 +1871,11 @@ impl ToolRuntime {
             "recent_limit": max,
             "truncated": active_count > max,
             "warnings": warnings,
-        })
+        });
+        if continuation_candidates.len() == 1 {
+            output["active_job"] = continuation_candidates.pop().unwrap_or(Value::Null);
+        }
+        output
     }
 
     /// Hidden REST compatibility wrapper for stopping a runtime Job by id.
@@ -1955,7 +2007,28 @@ mod recovery_projection_tests {
         let missing = job_not_found_result("agent:special:demo", "job-missing");
         assert_eq!(missing.output["failure_kind"], "job_not_found");
         assert_eq!(missing.output["recovery_kind"], "reobserve");
-        assert_eq!(missing.output["recovery_tool"], "list_jobs");
+        assert!(missing.output.get("recovery_tool").is_none());
+        assert_eq!(
+            missing.output["suggested_call"],
+            json!({"tool": "list_jobs", "arguments": {"project": "agent:special:demo"}})
+        );
+        let suggested = &missing.output["suggested_call"];
+        let parsed = crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .expect("stop_job missing-identity recovery must parse");
+        match parsed {
+            crate::tool_runtime::ToolCall::ListJobs {
+                project,
+                session_id,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("agent:special:demo"));
+                assert!(session_id.is_none());
+            }
+            other => panic!("unexpected recovery call: {}", other.tool_name()),
+        }
 
         let mismatch =
             job_project_mismatch_result("agent:special:demo", "agent:special:other", "job-2");

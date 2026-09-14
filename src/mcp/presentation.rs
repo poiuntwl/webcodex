@@ -5,15 +5,21 @@ pub(super) const MCP_PRESENTATION_META_KEY: &str = "webcodex/presentation";
 pub(super) const MCP_PRESENTATION_VERSION: u64 = 1;
 pub(super) const MAX_MCP_PRESENTATION_ITEMS: usize = 8;
 pub(super) const MAX_MCP_PRESENTATION_TEXT_CHARS: usize = 256;
+pub(super) const MAX_MCP_PRESENTATION_DIFF_HUNKS: usize = MAX_MCP_PRESENTATION_ITEMS;
+pub(super) const MAX_MCP_PRESENTATION_DIFF_LINES: usize = 80;
+pub(super) const MAX_MCP_PRESENTATION_DIFF_CHARS: usize = 12 * 1024;
 
-/// Static MCP App descriptor eligibility only. One advertised App binding creates
-/// one extra Host presentation per tool result, so keep this deliberately sparse:
-/// routine execution/observation stays on the Host's native tool card.
-pub(super) fn tool_supports_result_app(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "list_jobs" | "validation_summary" | "git_review_summary"
-    )
+/// Legacy Result/Changes presentation projections remain readable for cached
+/// descriptors, but ordinary result tools no longer receive new descriptor-level
+/// App admission. ToolResult metadata alone cannot create a Host App post-hoc.
+pub(super) fn tool_supports_result_app(_tool_name: &str) -> bool {
+    false
+}
+
+/// Explicit persistent Work Result presentation entry. Ordinary coding,
+/// validation, review, observation, and closeout tools never create this App.
+pub(super) fn tool_supports_work_result_app(tool_name: &str) -> bool {
+    tool_name == "present_work_result"
 }
 
 /// Dedicated sparse Goal Plan App binding. Only the explicit presentation entry
@@ -28,7 +34,10 @@ pub(super) fn tool_supports_goal_plan_app(tool_name: &str) -> bool {
 /// App-only coordination tools may still declare the same resource association
 /// as a Host compatibility hint without exposing them to the model or granting authority.
 pub(super) fn tool_supports_agent_continuation_app(tool_name: &str) -> bool {
-    tool_name == "present_agent_continuation"
+    matches!(
+        tool_name,
+        "present_agent_continuation" | "wait_for_agent_events"
+    )
 }
 
 /// Bounded presentation projections retained for current milestone cards and for
@@ -360,8 +369,24 @@ fn observed_failure_presentation(item: &Value) -> Option<Value> {
     let job_id = item.get("job_id").and_then(bounded_text)?;
     let mut output = Map::new();
     output.insert("job_id".to_string(), Value::String(job_id));
-    for key in ["error_kind", "recovery_kind", "recovery_tool"] {
+    for key in ["error_kind", "recovery_kind"] {
         copy_bounded_text(item, &mut output, key);
+    }
+    if item
+        .get("suggested_call")
+        .and_then(Value::as_object)
+        .is_some_and(|call| {
+            call.get("tool").and_then(Value::as_str) == Some("list_jobs")
+                && call
+                    .get("arguments")
+                    .and_then(Value::as_object)
+                    .is_some_and(|arguments| arguments.is_empty())
+        })
+    {
+        output.insert(
+            "suggested_call".to_string(),
+            json!({"tool": "list_jobs", "arguments": {}}),
+        );
     }
     if item.get("error_kind").and_then(Value::as_str) == Some("unknown_job") {
         output.insert(
@@ -698,7 +723,7 @@ fn safe_label(value: &Value) -> Option<String> {
     bounded_text(&Value::String(value.to_string()))
 }
 
-fn safe_repo_relative_path(value: &Value) -> Option<String> {
+fn validated_repo_relative_path(value: &Value) -> Option<&str> {
     let path = value.as_str()?;
     if path.is_empty()
         || path.starts_with('/')
@@ -719,6 +744,11 @@ fn safe_repo_relative_path(value: &Value) -> Option<String> {
     {
         return None;
     }
+    Some(path)
+}
+
+fn safe_repo_relative_path(value: &Value) -> Option<String> {
+    validated_repo_relative_path(value)?;
     bounded_text(value)
 }
 
@@ -753,22 +783,106 @@ fn bounded_safe_labels(source: &Value) -> (Vec<Value>, bool) {
     )
 }
 
-fn show_changes_file_presentation(file: &Value) -> Option<Value> {
+fn bounded_diff_text(value: &Value) -> Option<(String, bool)> {
+    let value = value.as_str()?;
+    if value
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let source_lines = value.lines().collect::<Vec<_>>();
+    let mut truncated = source_lines.len() > MAX_MCP_PRESENTATION_DIFF_LINES;
+    let line_bounded = source_lines
+        .into_iter()
+        .take(MAX_MCP_PRESENTATION_DIFF_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut chars = line_bounded.chars();
+    let bounded = chars
+        .by_ref()
+        .take(MAX_MCP_PRESENTATION_DIFF_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        truncated = true;
+    }
+    Some((bounded, truncated))
+}
+
+fn show_changes_diff_hunks_for_path(
+    output: &Value,
+    raw_path: &str,
+    max_hunks: usize,
+) -> (Vec<Value>, bool) {
+    let Some(files) = output.get("hunks").and_then(Value::as_array) else {
+        return (Vec::new(), false);
+    };
+    let mut result = Vec::new();
+    let mut truncated = false;
+    for file in files {
+        let Some(file_path) = file.get("path").and_then(validated_repo_relative_path) else {
+            continue;
+        };
+        if file_path != raw_path {
+            continue;
+        }
+        let Some(hunks) = file.get("hunks").and_then(Value::as_array) else {
+            continue;
+        };
+        for hunk in hunks {
+            if result.len() == max_hunks {
+                truncated = true;
+                break;
+            }
+            let Some((diff, diff_truncated)) = hunk.get("diff").and_then(bounded_diff_text) else {
+                truncated = true;
+                continue;
+            };
+            let hunk_truncated =
+                diff_truncated || hunk.get("truncated").and_then(Value::as_bool) == Some(true);
+            if hunk_truncated {
+                truncated = true;
+            }
+            let mut projected = Map::new();
+            projected.insert("diff".to_string(), Value::String(diff));
+            projected.insert("truncated".to_string(), Value::Bool(hunk_truncated));
+            result.push(Value::Object(projected));
+        }
+        break;
+    }
+    (result, truncated)
+}
+
+fn show_changes_file_presentation(
+    file: &Value,
+    output: &Value,
+    max_diff_hunks: usize,
+) -> Option<Value> {
     file.as_object()?;
-    let path = file.get("path").and_then(safe_repo_relative_path)?;
+    let path_value = file.get("path")?;
+    let raw_path = validated_repo_relative_path(path_value)?;
+    let path = bounded_text(path_value)?;
     let mut item = Map::new();
-    item.insert("path".to_string(), Value::String(path));
+    item.insert("path".to_string(), Value::String(path.clone()));
     if let Some(status) = file.get("status").and_then(safe_label) {
         item.insert("status".to_string(), Value::String(status));
     }
     if let Some(kind) = file.get("kind").and_then(safe_label) {
         item.insert("kind".to_string(), Value::String(kind));
     }
-    for key in ["staged", "unstaged"] {
+    for key in ["staged", "unstaged", "additions", "deletions"] {
         copy_scalar(file, &mut item, key);
     }
     if let Some(old_path) = file.get("old_path").and_then(safe_repo_relative_path) {
         item.insert("old_path".to_string(), Value::String(old_path));
+    }
+    let (diff_hunks, diff_truncated) =
+        show_changes_diff_hunks_for_path(output, raw_path, max_diff_hunks);
+    if !diff_hunks.is_empty() {
+        item.insert("diff_hunks".to_string(), Value::Array(diff_hunks));
+    }
+    if diff_truncated {
+        item.insert("diff_truncated".to_string(), Value::Bool(true));
     }
     Some(Value::Object(item))
 }
@@ -857,6 +971,43 @@ fn show_changes_presentation(output: &Value) -> Option<Value> {
     }
 
     if let Some(source_files) = output.get("files").and_then(Value::as_array) {
+        let clean = output.get("clean").and_then(Value::as_bool) == Some(true);
+        let mut additions = 0u64;
+        let mut deletions = 0u64;
+        let mut line_stats_observed = false;
+        let mut line_stats_partial = output
+            .get("files_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if clean {
+            presentation.insert("additions".to_string(), Value::from(0));
+            presentation.insert("deletions".to_string(), Value::from(0));
+            presentation.insert("line_stats_partial".to_string(), Value::Bool(false));
+        } else if !source_files.is_empty() {
+            for file in source_files {
+                match (
+                    file.get("additions").and_then(Value::as_u64),
+                    file.get("deletions").and_then(Value::as_u64),
+                ) {
+                    (Some(file_additions), Some(file_deletions)) => {
+                        line_stats_observed = true;
+                        additions = additions.saturating_add(file_additions);
+                        deletions = deletions.saturating_add(file_deletions);
+                    }
+                    _ => line_stats_partial = true,
+                }
+            }
+            if line_stats_observed {
+                presentation.insert("additions".to_string(), Value::from(additions));
+                presentation.insert("deletions".to_string(), Value::from(deletions));
+                presentation.insert(
+                    "line_stats_partial".to_string(),
+                    Value::Bool(line_stats_partial),
+                );
+            }
+        }
+        let presented_source_count = source_files.len().min(MAX_MCP_PRESENTATION_ITEMS).max(1);
+        let max_hunks_per_file = (MAX_MCP_PRESENTATION_DIFF_HUNKS / presented_source_count).max(1);
         let mut files = Vec::new();
         let mut items_truncated = false;
         for file in source_files {
@@ -864,11 +1015,19 @@ fn show_changes_presentation(output: &Value) -> Option<Value> {
                 items_truncated = true;
                 break;
             }
-            if let Some(file) = show_changes_file_presentation(file) {
+            if let Some(file) = show_changes_file_presentation(file, output, max_hunks_per_file) {
                 files.push(file);
             } else {
                 items_truncated = true;
             }
+        }
+        let presentation_diff_truncated = files
+            .iter()
+            .any(|file| file.get("diff_truncated").and_then(Value::as_bool) == Some(true));
+        if output.get("hunks_truncated").and_then(Value::as_bool) == Some(true)
+            || presentation_diff_truncated
+        {
+            presentation.insert("diff_truncated".to_string(), Value::Bool(true));
         }
         presentation.insert("files".to_string(), Value::Array(files));
         presentation.insert(

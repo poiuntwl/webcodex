@@ -30,6 +30,7 @@ pub enum RunnerFeature {
     StructuredValidationArgv,
     StructuredCargoTestCountAssertion,
     StructuredCargoTestExecutionPolicy,
+    StructuredCargoTestLib,
     StructuredGoTestJson,
     StructuredGoTestTool,
     StructuredGoTestPackages,
@@ -45,9 +46,8 @@ pub enum RunnerFeature {
     ProjectLifecycle,
     ProjectPathRegistration,
     ManagedWorktree,
-    ConfiguredSkillRootsRead,
-    SkillStoreRead,
-    SkillStoreManage,
+    SkillRuntime,
+    SkillManagement,
     ComputerObserve,
     ComputerApplicationDiscovery,
     ComputerApplicationLaunch,
@@ -93,6 +93,7 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::StructuredValidationArgv,
     RunnerFeature::StructuredCargoTestCountAssertion,
     RunnerFeature::StructuredCargoTestExecutionPolicy,
+    RunnerFeature::StructuredCargoTestLib,
     RunnerFeature::StructuredGoTestJson,
     RunnerFeature::StructuredGoTestTool,
     RunnerFeature::StructuredGoTestPackages,
@@ -108,9 +109,8 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::ProjectLifecycle,
     RunnerFeature::ProjectPathRegistration,
     RunnerFeature::ManagedWorktree,
-    RunnerFeature::ConfiguredSkillRootsRead,
-    RunnerFeature::SkillStoreRead,
-    RunnerFeature::SkillStoreManage,
+    RunnerFeature::SkillRuntime,
+    RunnerFeature::SkillManagement,
     RunnerFeature::ComputerObserve,
     RunnerFeature::ComputerApplicationDiscovery,
     RunnerFeature::ComputerApplicationLaunch,
@@ -180,6 +180,7 @@ impl RunnerFeature {
             Self::StructuredCargoTestExecutionPolicy => {
                 wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY
             }
+            Self::StructuredCargoTestLib => wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB,
             Self::StructuredGoTestJson => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON,
             Self::StructuredGoTestTool => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
             Self::StructuredGoTestPackages => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
@@ -199,9 +200,8 @@ impl RunnerFeature {
             Self::ProjectLifecycle => wire::RUNNER_CAPABILITY_PROJECT_LIFECYCLE,
             Self::ProjectPathRegistration => wire::RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION,
             Self::ManagedWorktree => wire::RUNNER_CAPABILITY_MANAGED_WORKTREE,
-            Self::ConfiguredSkillRootsRead => wire::RUNNER_CAPABILITY_CONFIGURED_SKILL_ROOTS_READ,
-            Self::SkillStoreRead => wire::RUNNER_CAPABILITY_SKILL_STORE_READ,
-            Self::SkillStoreManage => wire::RUNNER_CAPABILITY_SKILL_STORE_MANAGE,
+            Self::SkillRuntime => wire::RUNNER_CAPABILITY_SKILL_RUNTIME,
+            Self::SkillManagement => wire::RUNNER_CAPABILITY_SKILL_MANAGEMENT,
             Self::ComputerObserve => wire::RUNNER_CAPABILITY_COMPUTER_OBSERVE,
             Self::ComputerApplicationDiscovery => {
                 wire::RUNNER_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY
@@ -259,6 +259,7 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY => {
                 Self::StructuredCargoTestExecutionPolicy
             }
+            wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB => Self::StructuredCargoTestLib,
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON => Self::StructuredGoTestJson,
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL => Self::StructuredGoTestTool,
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES => Self::StructuredGoTestPackages,
@@ -278,9 +279,8 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_PROJECT_LIFECYCLE => Self::ProjectLifecycle,
             wire::RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION => Self::ProjectPathRegistration,
             wire::RUNNER_CAPABILITY_MANAGED_WORKTREE => Self::ManagedWorktree,
-            wire::RUNNER_CAPABILITY_CONFIGURED_SKILL_ROOTS_READ => Self::ConfiguredSkillRootsRead,
-            wire::RUNNER_CAPABILITY_SKILL_STORE_READ => Self::SkillStoreRead,
-            wire::RUNNER_CAPABILITY_SKILL_STORE_MANAGE => Self::SkillStoreManage,
+            wire::RUNNER_CAPABILITY_SKILL_RUNTIME => Self::SkillRuntime,
+            wire::RUNNER_CAPABILITY_SKILL_MANAGEMENT => Self::SkillManagement,
             wire::RUNNER_CAPABILITY_COMPUTER_OBSERVE => Self::ComputerObserve,
             wire::RUNNER_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY => {
                 Self::ComputerApplicationDiscovery
@@ -338,6 +338,7 @@ impl RunnerFeature {
             | Self::StructuredScriptJavascript
             | Self::StructuredScriptTypescript
             | Self::StructuredCargoTestExecutionPolicy
+            | Self::StructuredCargoTestLib
             | Self::ApplyTextEditLineScope
             | Self::ApplyPatch
             | Self::ApplyPatchMatchMetadata
@@ -348,9 +349,8 @@ impl RunnerFeature {
             | Self::SshPersistentShell
             | Self::DetachedProcessJobs
             | Self::ManagedWorktree
-            | Self::ConfiguredSkillRootsRead
-            | Self::SkillStoreRead
-            | Self::SkillStoreManage
+            | Self::SkillRuntime
+            | Self::SkillManagement
             | Self::ComputerObserve
             | Self::ComputerApplicationDiscovery
             | Self::ComputerApplicationLaunch
@@ -404,6 +404,7 @@ impl RunnerFeature {
             Self::StructuredCargoTestExecutionPolicy => {
                 capabilities.structured_cargo_test_execution_policy
             }
+            Self::StructuredCargoTestLib => capabilities.structured_cargo_test_lib,
             Self::StructuredGoTestJson => capabilities.structured_go_test_json,
             Self::StructuredGoTestTool => capabilities.structured_go_test_tool,
             Self::StructuredGoTestPackages => capabilities.structured_go_test_packages,
@@ -419,9 +420,8 @@ impl RunnerFeature {
             Self::ProjectLifecycle => capabilities.project_lifecycle,
             Self::ProjectPathRegistration => capabilities.project_path_registration,
             Self::ManagedWorktree => capabilities.managed_worktree,
-            Self::ConfiguredSkillRootsRead => capabilities.configured_skill_roots_read,
-            Self::SkillStoreRead => capabilities.skill_store_read,
-            Self::SkillStoreManage => capabilities.skill_store_manage,
+            Self::SkillRuntime => capabilities.skill_runtime,
+            Self::SkillManagement => capabilities.skill_management,
             Self::ComputerObserve => capabilities.computer_observe,
             Self::ComputerApplicationDiscovery => capabilities.computer_application_discovery,
             Self::ComputerApplicationLaunch => capabilities.computer_application_launch,

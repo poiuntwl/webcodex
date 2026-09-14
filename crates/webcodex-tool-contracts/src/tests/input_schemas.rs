@@ -123,16 +123,21 @@ fn search_project_texts_query_schema_declares_bounded_advanced_inputs() {
 }
 
 #[test]
-fn batch_inspection_result_budget_schema_uses_explicit_512_kib_ceiling() {
+fn batch_inspection_result_budget_schema_defers_bounds_to_runtime_clamp() {
     let specs = registered_tool_specs();
     for name in ["read_files", "search_project_texts"] {
         let schema = &spec_named(&specs, name).input_schema;
         let budget = &schema["properties"]["max_result_bytes"];
-        assert_eq!(budget["minimum"], 8 * 1024, "{name}");
+        assert_eq!(budget["type"], "integer", "{name}");
         assert_eq!(budget["default"], 64 * 1024, "{name}");
-        assert_eq!(budget["maximum"], 512 * 1024, "{name}");
+        assert_eq!(budget["minimum"], 0, "{name}");
+        assert!(budget.get("maximum").is_none(), "{name}");
+        assert!(budget["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runtime-clamped"));
 
-        let request = |max_result_bytes| match name {
+        let request = |max_result_bytes: Value| match name {
             "read_files" => json!({
                 "project": "demo",
                 "items": [{"path": "src/lib.rs"}],
@@ -144,24 +149,32 @@ fn batch_inspection_result_budget_schema_uses_explicit_512_kib_ceiling() {
                 "max_result_bytes": max_result_bytes
             }),
         };
-        assert!(test_support::validate_schema_instance(&request(256 * 1024), schema).is_ok());
-        assert!(test_support::validate_schema_instance(&request(512 * 1024), schema).is_ok());
-        assert!(test_support::validate_schema_instance(&request(512 * 1024 + 1), schema).is_err());
+        for bytes in [0, 1, 256 * 1024, 512 * 1024, 1024 * 1024] {
+            assert!(
+                test_support::validate_schema_instance(&request(json!(bytes)), schema).is_ok(),
+                "{name}: recognized integer budget should reach runtime normalization"
+            );
+        }
+        assert!(test_support::validate_schema_instance(&request(json!(-1)), schema).is_err());
+        assert!(test_support::validate_schema_instance(&request(json!("65536")), schema).is_err());
+        assert!(test_support::validate_schema_instance(&request(json!(1.5)), schema).is_err());
     }
 }
 
 #[test]
-fn git_diff_hunks_page_budget_schema_is_producer_scoped_and_bounded() {
+fn git_diff_hunks_page_budget_schema_defers_bounds_to_runtime_clamp() {
     let specs = registered_tool_specs();
     let schema = &spec_named(&specs, "git_diff_hunks").input_schema;
     let page = &schema["properties"]["max_page_bytes"];
-    assert_eq!(page["minimum"], 16 * 1024);
+    assert_eq!(page["type"], "integer");
     assert_eq!(page["default"], 64 * 1024);
-    assert_eq!(page["maximum"], 192 * 1024);
+    assert_eq!(page["minimum"], 0);
+    assert!(page.get("maximum").is_none());
     let description = page["description"].as_str().unwrap().to_ascii_lowercase();
     assert!(description.contains("producer page"));
     assert!(description.contains("final serialized model result"));
-    for bytes in [16 * 1024, 64 * 1024, 192 * 1024] {
+    assert!(description.contains("runtime-clamped"));
+    for bytes in [0, 1, 16 * 1024, 64 * 1024, 192 * 1024, 300_000] {
         assert!(test_support::validate_schema_instance(
             &json!({"project":"demo","max_page_bytes":bytes}),
             schema,
@@ -169,7 +182,46 @@ fn git_diff_hunks_page_budget_schema_is_producer_scoped_and_bounded() {
         .is_ok());
     }
     assert!(test_support::validate_schema_instance(
-        &json!({"project":"demo","max_page_bytes":192 * 1024 + 1}),
+        &json!({"project":"demo","max_page_bytes":-1}),
+        schema,
+    )
+    .is_err());
+    for invalid in [json!("65536"), json!(1.5)] {
+        assert!(test_support::validate_schema_instance(
+            &json!({"project":"demo","max_page_bytes":invalid}),
+            schema,
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn git_diff_hunks_committed_cached_false_matches_omission_but_true_conflicts() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "git_diff_hunks").input_schema;
+    let base = "a".repeat(40);
+    let head = "b".repeat(40);
+
+    for request in [
+        json!({"project":"demo","base_commit":base,"head_commit":head}),
+        json!({"project":"demo","base_commit":base,"head_commit":head,"cached":false}),
+        json!({"project":"demo","cached":false}),
+        json!({"project":"demo","cached":true}),
+    ] {
+        assert!(test_support::validate_schema_instance(&request, schema).is_ok());
+    }
+    assert!(test_support::validate_schema_instance(
+        &json!({"project":"demo","base_commit":base,"head_commit":head,"cached":true}),
+        schema,
+    )
+    .is_err());
+    assert!(test_support::validate_schema_instance(
+        &json!({"project":"demo","base_commit":base,"cached":false}),
+        schema,
+    )
+    .is_err());
+    assert!(test_support::validate_schema_instance(
+        &json!({"project":"demo","base_commit":base,"head_commit":head,"unknown":false}),
         schema,
     )
     .is_err());
@@ -280,6 +332,12 @@ fn cargo_test_schema_explains_execution_proof_policy() {
     assert!(filter.contains("cargo test FILTER"), "{filter}");
     assert!(filter.contains("--exact"), "{filter}");
     assert!(filter.contains("full qualified name"), "{filter}");
+    let lib = &properties["lib"];
+    assert_eq!(lib["type"], "boolean");
+    let lib_description = lib["description"].as_str().unwrap_or_default();
+    assert!(lib_description.contains("--lib"), "{lib_description}");
+    assert!(lib_description.contains("Omission"), "{lib_description}");
+    assert!(lib_description.contains("false"), "{lib_description}");
     let require_tests = properties["require_tests"]["description"]
         .as_str()
         .unwrap_or_default();
@@ -309,6 +367,8 @@ fn cargo_test_schema_explains_execution_proof_policy() {
     assert!(spec.description.contains("no_run=true is compile-only"));
     assert!(spec.description.contains("Rust substring"));
     assert!(spec.description.contains("--exact"));
+    assert!(spec.description.contains("lib=true"));
+    assert!(spec.description.contains("--lib"));
     assert!(spec
         .description
         .contains("zero-test results are not validation proof"));
@@ -594,6 +654,116 @@ fn tool_specs_covers_expected_tool_set() {
             names.iter().any(|name| name == expected),
             "missing {expected}"
         );
+    }
+}
+
+#[test]
+fn bootstrap_agent_conversation_activation_key_is_inbox_only_contract() {
+    let specs = registered_tool_specs();
+    let bootstrap = spec_named(&specs, "bootstrap_agent_conversation");
+    let activation = &bootstrap.input_schema["properties"]["activation_idempotency_key"];
+    let description = activation["description"].as_str().unwrap();
+    for required in [
+        "Inbox-style Wake",
+        "OMIT this field",
+        "agent_task_attempt",
+        "attention_event",
+        "Endpoint carrier",
+    ] {
+        assert!(
+            description.contains(required),
+            "missing {required}: {description}"
+        );
+    }
+    assert!(!required_fields(bootstrap)
+        .iter()
+        .any(|field| field == "activation_idempotency_key"));
+    for required in [
+        "Inbox-style Wake",
+        "agent_task_attempt",
+        "attention_event",
+        "omit it",
+        "Endpoint carrier",
+    ] {
+        assert!(
+            bootstrap.description.contains(required),
+            "tool description missing {required}: {}",
+            bootstrap.description
+        );
+    }
+}
+
+#[test]
+fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
+    let specs = registered_tool_specs();
+    let heartbeat = spec_named(&specs, "heartbeat_agent_task_attempt");
+    assert_eq!(heartbeat.input_schema["additionalProperties"], false);
+    let required = required_fields(heartbeat);
+    for field in [
+        "task_id",
+        "attempt_id",
+        "assignee_agent_id",
+        "attempt_fence",
+        "attempt_controller_generation",
+    ] {
+        assert!(
+            required.contains(&field.to_string()),
+            "missing required {field}"
+        );
+    }
+    for optional in ["active_turn_wake_id", "active_turn_consume_token"] {
+        assert!(!required.contains(&optional.to_string()));
+    }
+    assert_eq!(
+        heartbeat.input_schema["properties"]["active_turn_wake_id"]["pattern"],
+        "^wc_wake_[0-9a-f]{32}$"
+    );
+    assert_eq!(
+        heartbeat.input_schema["properties"]["active_turn_consume_token"]["pattern"],
+        "^wc_wake_consume_[0-9a-f]{32}$"
+    );
+    assert_eq!(heartbeat.input_schema["allOf"].as_array().unwrap().len(), 2);
+    let properties = heartbeat.input_schema["properties"].as_object().unwrap();
+    for forbidden in [
+        "lease_ms",
+        "lease_duration_ms",
+        "duration",
+        "duration_ms",
+        "lease_expires_at_unix_ms",
+        "expires_at_unix_ms",
+    ] {
+        assert!(
+            !properties.contains_key(forbidden),
+            "caller-controlled lease field {forbidden}"
+        );
+    }
+
+    let base = json!({
+        "task_id": format!("wc_agent_task_{}", "1".repeat(32)),
+        "attempt_id": format!("wc_agent_task_attempt_{}", "2".repeat(32)),
+        "assignee_agent_id": format!("wc_dagent_{}", "3".repeat(32)),
+        "attempt_fence": format!("wc_agent_task_fence_{}", "4".repeat(32)),
+        "attempt_controller_generation": 7,
+    });
+    assert!(test_support::validate_schema_instance(&base, &heartbeat.input_schema).is_ok());
+
+    let mut wake_only = base.clone();
+    wake_only["active_turn_wake_id"] = json!(format!("wc_wake_{}", "5".repeat(32)));
+    assert!(test_support::validate_schema_instance(&wake_only, &heartbeat.input_schema).is_err());
+
+    let mut token_only = base.clone();
+    token_only["active_turn_consume_token"] = json!(format!("wc_wake_consume_{}", "6".repeat(32)));
+    assert!(test_support::validate_schema_instance(&token_only, &heartbeat.input_schema).is_err());
+
+    let mut paired = base.clone();
+    paired["active_turn_wake_id"] = json!(format!("wc_wake_{}", "5".repeat(32)));
+    paired["active_turn_consume_token"] = json!(format!("wc_wake_consume_{}", "6".repeat(32)));
+    assert!(test_support::validate_schema_instance(&paired, &heartbeat.input_schema).is_ok());
+
+    for forbidden in ["lease_ms", "duration_ms", "expires_at_unix_ms"] {
+        let mut invalid = paired.clone();
+        invalid[forbidden] = json!(30 * 60_000);
+        assert!(test_support::validate_schema_instance(&invalid, &heartbeat.input_schema).is_err());
     }
 }
 

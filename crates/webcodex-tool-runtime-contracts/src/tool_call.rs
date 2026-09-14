@@ -265,6 +265,15 @@ pub struct ObserveJobsItem {
     pub after_observation_token: Option<String>,
 }
 
+/// Which observable changes may end a bounded batch Job wait early.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserveJobsWakeOn {
+    #[default]
+    Change,
+    Terminal,
+}
+
 fn deserialize_non_empty_read_path<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -428,6 +437,13 @@ pub struct ComputerSnapshotRegion {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWaitEventSelectorCall {
+    pub kind: String,
+    pub task_id: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "tool", content = "params", rename_all = "snake_case")]
 pub enum ToolCall {
@@ -507,6 +523,20 @@ pub enum ToolCall {
         include_handoff: Option<bool>,
         #[serde(default)]
         include_validation_summary: Option<bool>,
+    },
+
+    /// Explicitly present the current bounded Work Result for one exact coding Session.
+    PresentWorkResult {
+        project: String,
+        session_id: String,
+    },
+
+    /// App-only exact read of the same bounded Work Result projection. This
+    /// business session identity is deliberately excluded from generic Session
+    /// recording so an explicit App refresh cannot mutate the observed ledger.
+    WorkResultState {
+        project: String,
+        session_id: String,
     },
 
     /// Return a bounded structured summary of recorded session ledger data for
@@ -1012,6 +1042,8 @@ pub enum ToolCall {
         #[serde(default)]
         filter: Option<String>,
         #[serde(default)]
+        lib: Option<bool>,
+        #[serde(default)]
         all_targets: Option<bool>,
         #[serde(default)]
         all_features: Option<bool>,
@@ -1203,6 +1235,31 @@ pub enum ToolCall {
         idempotency_key: String,
     },
 
+    /// Create one explicit durable one-shot interest in future AgentTask terminal facts.
+    WaitForAgentEvents {
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        events: Vec<AgentWaitEventSelectorCall>,
+        idempotency_key: String,
+    },
+
+    /// Read one exact caller-owned durable AgentWait.
+    ReadAgentWait {
+        wait_id: String,
+    },
+
+    /// Cancel one exact AgentWait before the durable Host-dispatch fence.
+    CancelAgentWait {
+        wait_id: String,
+        idempotency_key: String,
+    },
+
+    /// App-only exact read of one caller-owned AgentWait.
+    AgentWaitState {
+        wait_id: String,
+    },
+
     /// Create explicit durable Agent work independent from communication messages and execution backends.
     CreateAgentTask {
         title: String,
@@ -1246,6 +1303,15 @@ pub enum ToolCall {
         idempotency_key: String,
     },
 
+    /// Select the concrete Agent Endpoint continuation backend for one exact live Attempt.
+    StartAgentTaskEndpointContinuation {
+        task_id: String,
+        attempt_id: String,
+        assignee_agent_id: String,
+        attempt_fence: String,
+        attempt_controller_generation: i64,
+    },
+
     /// Explicitly dispatch the exact latest fenced AgentTaskAttempt to one durable CodingAgentRun.
     StartAgentTaskCodingRun {
         project: String,
@@ -1274,6 +1340,10 @@ pub enum ToolCall {
         assignee_agent_id: String,
         attempt_fence: String,
         attempt_controller_generation: i64,
+        #[serde(default)]
+        active_turn_wake_id: Option<String>,
+        #[serde(default)]
+        active_turn_consume_token: Option<String>,
     },
 
     /// Commit exact fenced terminal AgentTaskAttempt truth with independent keyed replay.
@@ -1630,6 +1700,8 @@ pub enum ToolCall {
         tail_lines: usize,
         #[serde(default, deserialize_with = "deserialize_observe_jobs_wait_secs")]
         wait_secs: Option<u64>,
+        #[serde(default)]
+        wake_on: ObserveJobsWakeOn,
     },
 
     /// List files in a Runner-registered project directory (bounded, read-only).
@@ -2432,6 +2504,7 @@ fn reject_unknown_observe_jobs_fields(arguments: &Value) -> Result<(), String> {
         "items",
         "tail_lines",
         "wait_secs",
+        "wake_on",
         // Wrapper/session metadata that transports may leave in params.
         "session_id",
         "recording_session_id",
@@ -2670,7 +2743,25 @@ impl ToolCall {
             );
         }
         let recorder_metadata = ToolCallRecorderMetadata::from_business_arguments(&arguments);
-        let arguments = strip_tool_call_expectation_metadata(arguments);
+        let mut arguments = strip_tool_call_expectation_metadata(arguments);
+        if name == "tool_manifest" {
+            if let Some(object) = arguments.as_object_mut() {
+                if !object.contains_key("include_recommended_flows") {
+                    let exact_lookup = object.contains_key("tool_name");
+                    object.insert(
+                        "include_recommended_flows".to_string(),
+                        Value::Bool(!exact_lookup),
+                    );
+                }
+            }
+        }
+        if name == "cargo_test" {
+            if let Some(object) = arguments.as_object_mut() {
+                if object.get("lib").and_then(Value::as_bool) == Some(false) {
+                    object.remove("lib");
+                }
+            }
+        }
         if name == "read_project_artifact"
             && arguments
                 .as_object()
@@ -2796,6 +2887,8 @@ impl ToolCall {
             Self::StartSession { .. } => "start_session",
             Self::WorkOnProject { .. } => "work_on_project",
             Self::FinishCodingTask { .. } => "finish_coding_task",
+            Self::PresentWorkResult { .. } => "present_work_result",
+            Self::WorkResultState { .. } => "work_result_state",
             Self::SessionSummary { .. } => "session_summary",
             Self::UpdateSessionContext { .. } => "update_session_context",
             Self::CloseSession { .. } => "close_session",
@@ -2858,11 +2951,18 @@ impl ToolCall {
             Self::UpdateGoal { .. } => "update_goal",
             Self::AssociateGoalAgentTask { .. } => "associate_goal_agent_task",
             Self::AssociateGoalWorkflowSession { .. } => "associate_goal_workflow_session",
+            Self::WaitForAgentEvents { .. } => "wait_for_agent_events",
+            Self::ReadAgentWait { .. } => "read_agent_wait",
+            Self::CancelAgentWait { .. } => "cancel_agent_wait",
+            Self::AgentWaitState { .. } => "agent_wait_state",
             Self::CreateAgentTask { .. } => "create_agent_task",
             Self::ListAgentTasks { .. } => "list_agent_tasks",
             Self::ReadAgentTask { .. } => "read_agent_task",
             Self::AssignAgentTask { .. } => "assign_agent_task",
             Self::StartAgentTaskAttempt { .. } => "start_agent_task_attempt",
+            Self::StartAgentTaskEndpointContinuation { .. } => {
+                "start_agent_task_endpoint_continuation"
+            }
             Self::StartAgentTaskCodingRun { .. } => "start_agent_task_coding_run",
             Self::ReconcileAgentTaskCodingRun { .. } => "reconcile_agent_task_coding_run",
             Self::HeartbeatAgentTaskAttempt { .. } => "heartbeat_agent_task_attempt",
@@ -3025,6 +3125,11 @@ impl ToolCall {
             | Self::WorkspaceCheckpointRestore { session_id, .. }
             | Self::WorkspaceCheckpointDelete { session_id, .. } => session_id.as_deref(),
             Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
+            Self::PresentWorkResult { session_id, .. } => Some(session_id.as_str()),
+            // work_result_state intentionally does not expose its business
+            // Session through this generic recorder projection: explicit App
+            // refresh authorizes and reads that exact target inside its runtime method.
+            Self::WorkResultState { .. } => None,
             Self::ImportConversationFilesToProject { session_id, .. } => session_id.as_deref(),
             Self::CallHierarchy { session_id, .. } => session_id.as_deref(),
             Self::WorkOnProject { session_id, .. } => session_id.as_deref(),
@@ -3160,7 +3265,9 @@ impl ToolCall {
             Self::WorkOnProject { project, .. } if !project.trim().is_empty() => {
                 Some(project.as_str())
             }
-            Self::FinishCodingTask { project, .. } => Some(project.as_str()),
+            Self::FinishCodingTask { project, .. }
+            | Self::PresentWorkResult { project, .. }
+            | Self::WorkResultState { project, .. } => Some(project.as_str()),
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),
             Self::SessionHandoffSummary { project, .. } => project.as_deref(),

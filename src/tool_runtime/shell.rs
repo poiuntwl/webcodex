@@ -656,6 +656,10 @@ impl ToolRuntime {
                             &observation.stderr_tail,
                             observation.job.activity.as_ref(),
                         );
+                        let continuation = crate::tool_runtime::jobs::observe_job_continuation(
+                            &observation.job.job_id,
+                            observation.job.observation_token.as_deref(),
+                        );
                         ToolResult::ok(json!({
                         "execution_state": execution_state,
                         "command_started": command_started,
@@ -669,6 +673,7 @@ impl ToolRuntime {
                         "job_id": observation.job.job_id,
                         "job_status": observation.job.status,
                         "observation_token": observation.job.observation_token,
+                        "continuation_semantics": crate::tool_runtime::jobs::job_observation_continuation_semantics(),
                         "activity": observation.job.activity,
                         "effective_timeout_secs": timeout,
                         "sync_wait_secs": STRUCTURED_EXECUTION_SYNC_WAIT_SECS,
@@ -680,6 +685,7 @@ impl ToolRuntime {
                         "stdout_truncated": observation.stdout_truncated,
                         "stderr_truncated": observation.stderr_truncated,
                         "detected_summary": detected_summary,
+                        "continuation": continuation,
                     }))
                     },
                     Err(error) => Self::run_shell_outcome_unknown_result(format!(

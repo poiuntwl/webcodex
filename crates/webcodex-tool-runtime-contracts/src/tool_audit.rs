@@ -143,6 +143,9 @@ fn typed_structured_validation_request_audit(
                     "timeout_secs",
                 ],
             );
+            if obj.get("lib").and_then(Value::as_bool) == Some(true) {
+                out.insert("lib".to_string(), Value::Bool(true));
+            }
             out.insert(
                 "filter_present".to_string(),
                 Value::Bool(
@@ -292,6 +295,7 @@ enum AgentTaskRequestAudit {
     Read,
     Assign,
     StartAttempt,
+    StartEndpointContinuation,
     StartCodingRun,
     ReconcileCodingRun,
     HeartbeatAttempt,
@@ -358,6 +362,22 @@ fn typed_agent_task_request_audit(kind: AgentTaskRequestAudit, arguments: &Value
                 Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
             );
         }
+        AgentTaskRequestAudit::StartEndpointContinuation => {
+            copy_keys(
+                obj,
+                &mut out,
+                &[
+                    "task_id",
+                    "attempt_id",
+                    "assignee_agent_id",
+                    "attempt_controller_generation",
+                ],
+            );
+            out.insert(
+                "attempt_fence_present".to_string(),
+                Value::Bool(obj.get("attempt_fence").and_then(Value::as_str).is_some()),
+            );
+        }
         AgentTaskRequestAudit::StartCodingRun => {
             copy_keys(
                 obj,
@@ -403,6 +423,18 @@ fn typed_agent_task_request_audit(kind: AgentTaskRequestAudit, arguments: &Value
             out.insert(
                 "attempt_fence_present".to_string(),
                 Value::Bool(obj.get("attempt_fence").and_then(Value::as_str).is_some()),
+            );
+            out.insert(
+                "active_turn_proof_present".to_string(),
+                Value::Bool(
+                    obj.get("active_turn_wake_id")
+                        .and_then(Value::as_str)
+                        .is_some()
+                        && obj
+                            .get("active_turn_consume_token")
+                            .and_then(Value::as_str)
+                            .is_some(),
+                ),
             );
         }
         AgentTaskRequestAudit::CompleteAttempt => {
@@ -1171,6 +1203,7 @@ fn canonical_cargo_validation_target(
             let mut all_features = false;
             let mut no_default_features = false;
             let mut no_run = false;
+            let mut lib = false;
             let mut index = 0;
             while index < rest.len() {
                 let arg = &rest[index];
@@ -1189,6 +1222,7 @@ fn canonical_cargo_validation_target(
                         continue;
                     }
                     "--all-targets" if !all_targets => all_targets = true,
+                    "--lib" if is_test && !lib => lib = true,
                     "--all-features" if !all_features => all_features = true,
                     "--no-default-features" if !no_default_features => no_default_features = true,
                     "--no-run" if is_test && !no_run => no_run = true,
@@ -1227,6 +1261,9 @@ fn canonical_cargo_validation_target(
                     None => None,
                 };
                 input.insert("filter".to_string(), serde_json::json!(filter));
+                if lib {
+                    input.insert("lib".to_string(), Value::Bool(true));
+                }
                 input.insert("no_run".to_string(), Value::Bool(no_run));
                 "cargo_test"
             } else {
@@ -1872,6 +1909,54 @@ mod computer_privacy_tests {
         }
         .session_log_arguments();
         assert!(!activation_request.to_string().contains(PRIVATE_KEY));
+    }
+
+    #[test]
+    fn agent_task_active_turn_heartbeat_audit_omits_raw_proof_and_attempt_fence() {
+        const PRIVATE_FENCE: &str = "wc_agent_task_fence_PRIVATE_FENCE_MUST_NOT_PERSIST";
+        const PRIVATE_WAKE: &str = "wc_wake_PRIVATE_WAKE_MUST_NOT_PERSIST";
+        const PRIVATE_TOKEN: &str = "wc_wake_consume_PRIVATE_TOKEN_MUST_NOT_PERSIST";
+        let request = session_log_arguments_for_tool_request(
+            "heartbeat_agent_task_attempt",
+            &json!({
+                "task_id": "wc_agent_task_0123456789abcdef0123456789abcdef",
+                "attempt_id": "wc_agent_task_attempt_0123456789abcdef0123456789abcdef",
+                "assignee_agent_id": "wc_dagent_0123456789abcdef0123456789abcdef",
+                "attempt_fence": PRIVATE_FENCE,
+                "attempt_controller_generation": 9,
+                "active_turn_wake_id": PRIVATE_WAKE,
+                "active_turn_consume_token": PRIVATE_TOKEN,
+            }),
+        );
+        assert_eq!(request["attempt_fence_present"], true);
+        assert_eq!(request["active_turn_proof_present"], true);
+        assert_eq!(request["attempt_controller_generation"], 9);
+        let request_text = request.to_string();
+        for private in [PRIVATE_FENCE, PRIVATE_WAKE, PRIVATE_TOKEN] {
+            assert!(
+                !request_text.contains(private),
+                "heartbeat audit leaked {private}"
+            );
+        }
+
+        let typed = ToolCall::HeartbeatAgentTaskAttempt {
+            task_id: "wc_agent_task_0123456789abcdef0123456789abcdef".to_string(),
+            attempt_id: "wc_agent_task_attempt_0123456789abcdef0123456789abcdef".to_string(),
+            assignee_agent_id: "wc_dagent_0123456789abcdef0123456789abcdef".to_string(),
+            attempt_fence: PRIVATE_FENCE.to_string(),
+            attempt_controller_generation: 9,
+            active_turn_wake_id: Some(PRIVATE_WAKE.to_string()),
+            active_turn_consume_token: Some(PRIVATE_TOKEN.to_string()),
+        }
+        .session_log_arguments();
+        assert_eq!(typed["active_turn_proof_present"], true);
+        let typed_text = typed.to_string();
+        for private in [PRIVATE_FENCE, PRIVATE_WAKE, PRIVATE_TOKEN] {
+            assert!(
+                !typed_text.contains(private),
+                "typed heartbeat audit leaked {private}"
+            );
+        }
     }
 
     #[test]
@@ -3306,6 +3391,7 @@ impl ToolCall {
                 items,
                 tail_lines,
                 wait_secs,
+                wake_on,
             } => serde_json::json!({
                 "item_count": items.len(),
                 "token_count": items
@@ -3318,6 +3404,7 @@ impl ToolCall {
                     .collect::<Vec<_>>(),
                 "tail_lines": tail_lines,
                 "wait_secs": wait_secs,
+                "wake_on": wake_on,
             }),
             Self::ApplyUnifiedDiff {
                 project,
@@ -3461,6 +3548,7 @@ impl ToolCall {
                 project,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -3478,6 +3566,7 @@ impl ToolCall {
                     "project": project,
                     "cwd": cwd,
                     "filter": filter,
+                    "lib": lib,
                     "all_targets": all_targets,
                     "all_features": all_features,
                     "no_default_features": no_default_features,
@@ -3595,6 +3684,29 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::WaitForAgentEvents {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                events,
+                idempotency_key,
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "event_count": events.len(),
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
+            Self::ReadAgentWait { wait_id } | Self::AgentWaitState { wait_id } => {
+                serde_json::json!({"wait_id": wait_id})
+            }
+            Self::CancelAgentWait {
+                wait_id,
+                idempotency_key,
+            } => serde_json::json!({
+                "wait_id": wait_id,
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
             Self::CreateAgentTask {
                 title,
                 instruction,
@@ -3653,6 +3765,22 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::StartAgentTaskEndpointContinuation {
+                task_id,
+                attempt_id,
+                assignee_agent_id,
+                attempt_fence,
+                attempt_controller_generation,
+            } => typed_agent_task_request_audit(
+                AgentTaskRequestAudit::StartEndpointContinuation,
+                &serde_json::json!({
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "assignee_agent_id": assignee_agent_id,
+                    "attempt_fence": attempt_fence,
+                    "attempt_controller_generation": attempt_controller_generation,
+                }),
+            ),
             Self::StartAgentTaskCodingRun {
                 project,
                 task_id,
@@ -3693,6 +3821,8 @@ impl ToolCall {
                 assignee_agent_id,
                 attempt_fence,
                 attempt_controller_generation,
+                active_turn_wake_id,
+                active_turn_consume_token,
             } => typed_agent_task_request_audit(
                 AgentTaskRequestAudit::HeartbeatAttempt,
                 &serde_json::json!({
@@ -3701,6 +3831,8 @@ impl ToolCall {
                     "assignee_agent_id": assignee_agent_id,
                     "attempt_fence": attempt_fence,
                     "attempt_controller_generation": attempt_controller_generation,
+                    "active_turn_wake_id": active_turn_wake_id,
+                    "active_turn_consume_token": active_turn_consume_token,
                 }),
             ),
             Self::CompleteAgentTaskAttempt {
@@ -4707,6 +4839,17 @@ impl ToolCall {
                 "include_hygiene": include_hygiene,
                 "include_handoff": include_handoff,
                 "include_validation_summary": include_validation_summary,
+            }),
+            Self::PresentWorkResult {
+                project,
+                session_id,
+            }
+            | Self::WorkResultState {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
             }),
             Self::ListProjects {
                 client_id,

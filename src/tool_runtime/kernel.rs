@@ -4,6 +4,7 @@ use super::sessions::{
     ToolCallRecorderMetadata, ToolCallSessionMessageResolution,
 };
 use super::tool_audit::{session_log_arguments_for_tool_request, session_log_result_for_tool};
+use super::tool_definition::{runtime_tool_operator_extension_family, ToolOperatorExtensionFamily};
 use super::{session_context, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::scopes::OAuthToolScopePolicy;
 use crate::auth::AuthContext;
@@ -109,6 +110,9 @@ pub(crate) struct ToolProtocolCapabilities {
     /// Protocol-surface support for the ModelHidden Goal Plan App polling read.
     /// This never replaces canonical communication/Goal authorization.
     pub(crate) goal_plan_app: bool,
+    /// Protocol-surface support for the ModelHidden Work Result App explicit
+    /// refresh read. Exact Project + Session authority is still checked per call.
+    pub(crate) work_result_app: bool,
     /// Protocol-surface support for ModelHidden MCP App Host-continuation
     /// coordination. Canonical communication authorization and exact
     /// process-local Host binding validation remain mandatory in the runtime.
@@ -281,6 +285,7 @@ impl ToolRuntime {
                 memory_surface: false,
                 trace_diagnostics: false,
                 goal_plan_app: false,
+                work_result_app: false,
                 agent_continuation_app: false,
             },
         )
@@ -344,7 +349,12 @@ impl ToolRuntime {
         // One trusted identity per real kernel request. The outer recorder and
         // inner business ledger pairs inherit it, but it never affects execution.
         recorder_metadata.assign_logical_invocation();
-        if request.tool_name == "read_tool_trace" && !capabilities.trace_diagnostics {
+        let operator_extension_family = runtime_tool_operator_extension_family(&request.tool_name);
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::TraceDiagnostics)
+        ) && !capabilities.trace_diagnostics
+        {
             return ToolCallOutcome {
                 success: false,
                 result: None,
@@ -370,6 +380,19 @@ impl ToolRuntime {
                 correlation: Default::default(),
             };
         }
+        if request.tool_name == "work_result_state" && !capabilities.work_result_app {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Work Result App state is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
         if matches!(
             request.tool_name.as_str(),
             "agent_continuation_bind"
@@ -379,6 +402,7 @@ impl ToolRuntime {
                 | "agent_continuation_wake_prepare"
                 | "agent_continuation_wake_finish"
                 | "agent_continuation_unbind"
+                | "agent_wait_state"
         ) && !capabilities.agent_continuation_app
         {
             return ToolCallOutcome {
@@ -396,9 +420,13 @@ impl ToolRuntime {
         // Project Memory tools are kernel-known but globally model-hidden. One
         // explicit protocol-surface capability gates all six fixed tools; their
         // canonical ToolDefinition authority decides caller access below.
-        if (super::memory::is_memory_runtime_tool_name(&request.tool_name)
-            || super::memory::is_memory_management_tool_name(&request.tool_name))
-            && !capabilities.memory_surface
+        if matches!(
+            operator_extension_family,
+            Some(
+                ToolOperatorExtensionFamily::MemoryRuntime
+                    | ToolOperatorExtensionFamily::MemoryManagement
+            )
+        ) && !capabilities.memory_surface
         {
             return ToolCallOutcome {
                 success: false,
@@ -416,8 +444,10 @@ impl ToolRuntime {
         // typed, but execution is authoritative-surface-gated. A private tool
         // name from REST, legacy MCP, Local Coding, or Connector cannot enable
         // this runtime.
-        if super::skills::is_skill_runtime_tool_name(&request.tool_name)
-            && !capabilities.skill_runtime
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::SkillRuntime)
+        ) && !capabilities.skill_runtime
         {
             return ToolCallOutcome {
                 success: false,
@@ -432,8 +462,10 @@ impl ToolRuntime {
                 correlation: Default::default(),
             };
         }
-        if super::skills::is_skill_management_tool_name(&request.tool_name)
-            && !capabilities.skill_management
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::SkillManagement)
+        ) && !capabilities.skill_management
         {
             return ToolCallOutcome {
                 success: false,
@@ -448,10 +480,12 @@ impl ToolRuntime {
                 correlation: Default::default(),
             };
         }
-        if super::skills::is_skill_management_tool_name(&request.tool_name)
-            && !context
-                .auth
-                .is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
+        if matches!(
+            operator_extension_family,
+            Some(ToolOperatorExtensionFamily::SkillManagement)
+        ) && !context
+            .auth
+            .is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
         {
             return ToolCallOutcome {
                 success: false,
@@ -642,10 +676,7 @@ impl ToolRuntime {
             );
             super::add_session_hint(&mut result, &self.sessions, session_id);
             if let Some(recorded) = recording.as_ref() {
-                if session_context::add_session_context_continuity(&mut result, recorded) {
-                    self.add_session_history_recovery(&mut result, recorded, context.auth)
-                        .await;
-                }
+                session_context::add_session_context_continuity(&mut result, recorded);
             }
             session_context::add_session_attention_projection(
                 &mut result,
@@ -773,10 +804,7 @@ impl ToolRuntime {
                 );
                 super::add_session_hint(&mut result, &self.sessions, session_id);
                 if let Some(recorded) = recording.as_ref() {
-                    if session_context::add_session_context_continuity(&mut result, recorded) {
-                        self.add_session_history_recovery(&mut result, recorded, context.auth)
-                            .await;
-                    }
+                    session_context::add_session_context_continuity(&mut result, recorded);
                 }
                 session_context::add_session_attention_projection(
                     &mut result,
@@ -872,10 +900,7 @@ impl ToolRuntime {
         if let Some(session_id) = context.session_id {
             super::add_session_hint(&mut result, &self.sessions, session_id);
             if let Some(recorded) = outer_recording.as_ref() {
-                if session_context::add_session_context_continuity(&mut result, recorded) {
-                    self.add_session_history_recovery(&mut result, recorded, context.auth)
-                        .await;
-                }
+                session_context::add_session_context_continuity(&mut result, recorded);
             }
             session_context::add_session_attention_projection(
                 &mut result,
@@ -965,7 +990,8 @@ impl ToolRuntime {
         correlation: &super::window_activity::ToolCallCorrelation,
     ) -> Option<String> {
         if tool_name == "work_on_project"
-            || !super::observations::is_meaningful_activity_tool(tool_name)
+            || !webcodex_tool_contracts::runtime_tool_activity_interaction(tool_name)
+                .is_meaningful()
         {
             return None;
         }

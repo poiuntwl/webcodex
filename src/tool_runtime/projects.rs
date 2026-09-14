@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use super::tool_result::{RecoveryKind, ToolResult};
 use super::{runner_project_runtime_id, ToolRuntime};
-use crate::auth::AuthContext;
+use crate::auth::{AuthContext, SCOPE_PROJECT_READ};
 use crate::runner_http::{RunnerFeature, RunnerSemanticView};
 use crate::runner_protocol::{RunnerProjectSummary, RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION};
 
@@ -160,6 +160,41 @@ impl ToolRuntime {
             .await;
         self.list_projects_from_semantic_clients(auth, &options, query.as_deref(), limit, &clients)
             .await
+    }
+
+    /// Reuse the canonical Runner/project visibility projection for an exact
+    /// Project id without dispatching a model-visible tool. This is an
+    /// observability fence only: it grants no Project authority and callers
+    /// must still hold `project:read` explicitly.
+    pub(crate) async fn exact_project_visible_to_auth(
+        &self,
+        auth: &AuthContext,
+        project: &str,
+    ) -> bool {
+        if !auth.has_scope(SCOPE_PROJECT_READ) {
+            return false;
+        }
+        let result = self
+            .list_projects_with_options(
+                Some(auth),
+                ListProjectsOptions {
+                    project: Some(project.to_string()),
+                    limit: Some(1),
+                    summary_only: true,
+                    ..ListProjectsOptions::default()
+                },
+            )
+            .await;
+        result.success
+            && result
+                .output
+                .get("projects")
+                .and_then(Value::as_array)
+                .is_some_and(|projects| {
+                    projects
+                        .iter()
+                        .any(|value| value.get("id").and_then(Value::as_str) == Some(project))
+                })
     }
 
     #[cfg(test)]
@@ -995,6 +1030,10 @@ fn parse_project_summary_from_result(
         .get("allow_patch")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let lineage = match result.get("lineage") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+    };
     Some(RunnerProjectSummary {
         id: agent_project_id.to_string(),
         name: name.or_else(|| Some(agent_project_id.to_string())),
@@ -1021,6 +1060,11 @@ fn parse_project_summary_from_result(
             .get("revision")
             .and_then(Value::as_str)
             .map(str::to_string),
+        root_fingerprint: result
+            .get("root_fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        lineage,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -1046,6 +1090,8 @@ mod tests {
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -1068,6 +1114,8 @@ mod tests {
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,

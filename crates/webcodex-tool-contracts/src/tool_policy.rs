@@ -4,10 +4,13 @@ use super::metadata::{
     tool_metadata, ToolApprovalPolicy, ToolEffect, ToolMetadata, ToolPathHint, ToolRisk,
 };
 use super::tool_definition::{
-    tool_definitions, RunnerCapabilityRequirement, ToolAuditPolicy, ToolContextContinuityPolicy,
-    ToolDefinition, ToolEffectAnnotations, ToolSessionEvidencePolicy,
-    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
-    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
+    tool_definitions, RunnerCapabilityRequirement, ToolActivityInteraction, ToolActivityKind,
+    ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolContextContinuityPolicy,
+    ToolDefinition, ToolDiffReviewEvidence, ToolEffectAnnotations, ToolExecutionContract,
+    ToolExecutionForm, ToolExplorationEvidence, ToolOperatorExtensionFamily, ToolReviewEvidence,
+    ToolSessionEvidencePolicy, ToolValidationIdentityKind, PERMISSION_RISK_ARTIFACT_WRITE,
+    PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL,
+    PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
 };
 
 impl ToolDefinition {
@@ -73,6 +76,62 @@ impl ToolDefinition {
 
     pub fn session_evidence_policy(self) -> ToolSessionEvidencePolicy {
         self.session_evidence
+    }
+
+    pub fn activity_semantics(self) -> ToolActivitySemantics {
+        let kind = self.activity.kind_override.unwrap_or_else(|| {
+            if self.activity.presentation != ToolActivityPresentation::Work {
+                return ToolActivityKind::None;
+            }
+            match self.session_evidence.exploration {
+                ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {
+                    return ToolActivityKind::Read;
+                }
+                ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
+                    return ToolActivityKind::Search;
+                }
+                ToolExplorationEvidence::Navigation(_) => return ToolActivityKind::Navigate,
+                ToolExplorationEvidence::None => {}
+            }
+            if self.session_evidence.validation_identity != ToolValidationIdentityKind::None
+                || self.policy.captures_validation_output
+                || self.execution.is_some_and(|execution| {
+                    execution.form == ToolExecutionForm::StructuredValidation
+                })
+            {
+                return ToolActivityKind::Test;
+            }
+            if self.metadata.effect == ToolEffect::Mutate
+                && self.metadata.risk == ToolRisk::ProjectWrite
+            {
+                return ToolActivityKind::Edit;
+            }
+            if self.execution.is_some()
+                || (self.category == TOOL_CATEGORY_JOB
+                    && self.session_evidence.persistent_shell.is_some())
+                || self.metadata.effect == ToolEffect::Execute
+                || self.metadata.shell_like
+                || self.metadata.risk == ToolRisk::JobRun
+            {
+                return ToolActivityKind::Run;
+            }
+            if self.session_evidence.review != ToolReviewEvidence::None
+                || self.session_evidence.diff_review != ToolDiffReviewEvidence::None
+                || self.policy.git_like
+                || self.policy.change_summary_like
+            {
+                return ToolActivityKind::Review;
+            }
+            if self.metadata.effect == ToolEffect::Observe {
+                return ToolActivityKind::Read;
+            }
+            ToolActivityKind::None
+        });
+        ToolActivitySemantics {
+            presentation: self.activity.presentation,
+            interaction: self.activity.interaction,
+            kind,
+        }
     }
 
     #[cfg(any(test, feature = "root-test-support"))]
@@ -144,10 +203,40 @@ pub fn lookup_tool_definition(name: &str) -> Option<&'static ToolDefinition> {
     tool_definitions().find(|definition| definition.name == name)
 }
 
+/// Returns the canonical static Stateless Operator extension family for a runtime
+/// tool. Unknown and ordinary tools return `None`, so protocol admission fails
+/// closed unless a ToolDefinition explicitly declares a family.
+pub fn runtime_tool_operator_extension_family(name: &str) -> Option<ToolOperatorExtensionFamily> {
+    lookup_tool_definition(name).and_then(|definition| definition.operator_extension_family)
+}
+
+/// Returns canonical model-selection semantics for ordinary execution tools.
+/// Unknown and non-execution tools return `None`; callers must not infer the
+/// contract from names, descriptions, effects, or Runner capabilities.
+pub fn runtime_tool_execution_contract(name: &str) -> Option<ToolExecutionContract> {
+    lookup_tool_definition(name).and_then(|definition| definition.execution)
+}
+
 pub fn runtime_tool_session_evidence_policy(name: &str) -> ToolSessionEvidencePolicy {
     lookup_tool_definition(name)
         .map(|definition| definition.session_evidence_policy())
         .unwrap_or(ToolSessionEvidencePolicy::NONE)
+}
+
+/// Canonical Activity semantics. Unknown/non-runtime names preserve the legacy
+/// conservative interaction default (Meaningful) without inventing a kind.
+pub fn runtime_tool_activity_semantics(name: &str) -> ToolActivitySemantics {
+    lookup_tool_definition(name)
+        .map(|definition| definition.activity_semantics())
+        .unwrap_or(ToolActivitySemantics {
+            presentation: ToolActivityPresentation::Work,
+            interaction: ToolActivityInteraction::Meaningful,
+            kind: ToolActivityKind::None,
+        })
+}
+
+pub fn runtime_tool_activity_interaction(name: &str) -> ToolActivityInteraction {
+    runtime_tool_activity_semantics(name).interaction
 }
 
 pub fn exploration_tool_names() -> impl Iterator<Item = &'static str> {

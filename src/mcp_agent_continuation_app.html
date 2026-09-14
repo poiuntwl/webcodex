@@ -24,6 +24,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 <main class="card" aria-live="polite">
   <div class="header"><h1 id="agent">Agent</h1><span id="binding" class="badge">Connecting</span></div>
   <div class="summary">Queued work <b id="queued">0</b></div>
+  <div id="waitSummary" class="summary" hidden>Wait <b id="waitState">Waiting</b> · matched <b id="waitMatches">0</b></div>
   <div id="status" class="status">Connecting…</div>
   <div id="diagnostics" class="meta" hidden>
     <span>Endpoint generation <b id="generation">—</b></span>
@@ -42,6 +43,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   const DEBUG_DIAGNOSTICS = false;
   const AGENT_ID = /^wc_dagent_[0-9a-f]{32}$/;
   const ENDPOINT_ID = /^wc_endpoint_[0-9a-f]{32}$/;
+  const WAIT_ID = /^wc_agent_wait_[0-9a-f]{32}$/;
   const WAKE_ID = /^wc_wake_[0-9a-f]{32}$/;
   const ATTEMPT_ID = /^wc_wake_attempt_[0-9a-f]{32}$/;
   const APP_CALL_ID = /^wc_app_call_[0-9a-f]{16}_[1-9][0-9]{0,5}$/;
@@ -59,11 +61,13 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   const MAX_BIND_ATTEMPTS = 3;
   const MAX_RECOVERY_REBINDS = 1;
   const MAX_ENDPOINT_RECOVERY_ATTEMPTS = 2;
+  const MAX_ENDPOINT_SUCCESSOR_HOPS = 8;
   const RESTART_RECOVERY_KIND = "host_binding_missing_in_process";
   const MAX_AUTOMATIC_MESSAGE_CHARS = 4096;
   const VISIBLE_POLL_MS = 3000;
   const HIDDEN_HEARTBEAT_MS = 15000;
   const DISPATCH_STATES = new Set(["dispatch_prepared", "dispatch_accepted", "dispatch_unknown", "continuation_consumed"]);
+  const WAIT_STATES = new Set(["waiting", "triggered", "resumed", "cancelled"]);
   let nextId = 1;
   let nextAppCallSequence = 1;
   let appCallPrefix = null;
@@ -85,6 +89,10 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   let dispatchStarted = null;
   let prepareUncertain = null;
   let pendingFinish = null;
+  let waitId = null;
+  let waitLifecycle = null;
+  let waitRevision = 0;
+  let waitMatchCount = 0;
   const el = id => document.getElementById(id);
   el("diagnostics").hidden = !DEBUG_DIAGNOSTICS;
   el("status").textContent = "Connecting…";
@@ -338,17 +346,22 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     const output = outputOf(result);
     const recovery = output && output.endpoint_recovery;
     const replacement = recovery && recovery.kind === "endpoint_replaced" && recovery.replacement;
-    const projection = validProjection(output && output.agent_continuation);
-    return replacement && typeof replacement === "object" && !Array.isArray(replacement) && projection
-      ? { replacement, projection }
-      : null;
+    if (!replacement || typeof replacement !== "object" || Array.isArray(replacement)
+      || typeof recovery.successor_needs_recovery !== "boolean") return null;
+    if (recovery.successor_needs_recovery) {
+      return output.agent_continuation === null
+        ? { replacement, projection: null, successorNeedsRecovery: true }
+        : null;
+    }
+    const projection = validProjection(output.agent_continuation);
+    return projection ? { replacement, projection, successorNeedsRecovery: false } : null;
   }
 
   function acceptReplacementIdentity(result, stale) {
-    if (tornDown || !snapshotIsCurrent(stale)) return false;
+    if (tornDown || !snapshotIsCurrent(stale)) return null;
     const transition = replacementOf(result);
-    if (!transition) return false;
-    const { replacement, projection } = transition;
+    if (!transition) return null;
+    const { replacement, projection, successorNeedsRecovery } = transition;
     if (replacement.agent_id !== stale.agent_id
       || replacement.from_endpoint_id !== stale.endpoint_id
       || replacement.from_controller_generation !== stale.controller_generation
@@ -356,10 +369,10 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       || typeof replacement.endpoint_id !== "string" || !ENDPOINT_ID.test(replacement.endpoint_id)
       || !Number.isSafeInteger(replacement.controller_generation)
       || replacement.controller_generation !== stale.controller_generation + 1
-      || projection.agent_id !== stale.agent_id
-      || projection.endpoint_id !== replacement.endpoint_id
-      || projection.controller_generation !== replacement.controller_generation) {
-      return false;
+      || (!successorNeedsRecovery && (projection.agent_id !== stale.agent_id
+        || projection.endpoint_id !== replacement.endpoint_id
+        || projection.controller_generation !== replacement.controller_generation))) {
+      return null;
     }
     identity = {
       agent_id: replacement.agent_id,
@@ -380,7 +393,66 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     el("generation").textContent = String(identity.controller_generation);
     el("binding").textContent = "Reconnecting";
     el("status").textContent = "Restoring connection…";
+    return { successorNeedsRecovery };
+  }
+
+  function validWaitProjection(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    if (!WAIT_ID.test(value.wait_id || "") || !AGENT_ID.test(value.target_agent_id || "")) return null;
+    if (!WAIT_STATES.has(value.state) || !Number.isSafeInteger(value.revision) || value.revision < 1) return null;
+    if (!Number.isSafeInteger(value.source_count) || value.source_count < 1 || value.source_count > 8) return null;
+    if (!Number.isSafeInteger(value.match_count) || value.match_count < 0 || value.match_count > 8) return null;
+    return value;
+  }
+
+  function acceptWaitProjection(value) {
+    const wait = validWaitProjection(value);
+    if (!wait || (waitId && waitId !== wait.wait_id)
+      || (identity && wait.target_agent_id !== identity.agent_id)) {
+      teardown();
+      el("binding").textContent = "Unavailable";
+      el("status").textContent = "Invalid or conflicting Wait identity";
+      return false;
+    }
+    waitId = wait.wait_id;
+    if (wait.revision >= waitRevision) {
+      waitRevision = wait.revision;
+      waitLifecycle = wait.state;
+      waitMatchCount = wait.match_count;
+      el("waitSummary").hidden = false;
+      el("waitState").textContent = wait.state === "waiting" ? "Waiting"
+        : wait.state === "triggered" ? "Triggered"
+        : wait.state === "resumed" ? "Resumed" : "Cancelled";
+      el("waitMatches").textContent = String(wait.match_count);
+    }
     return true;
+  }
+
+  function renderWaitStatus(projection) {
+    if (!waitId || !waitLifecycle || !bindingId || tornDown) return;
+    if (waitLifecycle === "waiting") {
+      el("status").textContent = "Waiting for selected event";
+      return;
+    }
+    if (waitLifecycle === "resumed") {
+      el("status").textContent = "Wait resumed";
+      return;
+    }
+    if (waitLifecycle === "cancelled") {
+      el("status").textContent = "Wait cancelled";
+      return;
+    }
+    const ownWake = projection && projection.wake && projection.wake.wait_id === waitId;
+    el("status").textContent = ownWake ? "Triggered · resuming…" : "Triggered · queued for Agent";
+  }
+
+  async function refreshWaitState() {
+    if (!waitId || tornDown) return;
+    const response = await callTool("agent_wait_state", { wait_id: waitId });
+    const output = outputOf(response);
+    if (!toolCallSucceeded(response) || !output || !acceptWaitProjection(output.agent_wait)) {
+      throw new Error("Wait state was not accepted");
+    }
   }
 
   function projectionSemanticFailure(value) {
@@ -395,6 +467,13 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       if (!WAKE_ID.test(value.wake.wake_id || "")) return "projection-wake-id-invalid";
       if (!Number.isSafeInteger(value.wake.revision) || value.wake.revision < 1) return "projection-wake-revision-invalid";
       if (!["pending", "claimed", "prepared", "delivered", "delivery_unknown"].includes(value.wake.state)) return "projection-wake-state-invalid";
+    }
+    if (value.wake !== null) {
+      if (!(value.wake.wait_id === null || value.wake.wait_id === undefined || WAIT_ID.test(value.wake.wait_id))) return "projection-wake-invalid";
+      if (!(value.wake.wait_match_count === null || value.wake.wait_match_count === undefined
+        || (Number.isSafeInteger(value.wake.wait_match_count) && value.wake.wait_match_count >= 1 && value.wake.wait_match_count <= 8))) return "projection-wake-invalid";
+      if (!(value.wake.wait_match_sequence === null || value.wake.wait_match_sequence === undefined
+        || (Number.isSafeInteger(value.wake.wait_match_sequence) && value.wake.wait_match_sequence >= 1 && value.wake.wait_match_sequence <= 8))) return "projection-wake-invalid";
     }
     if (!Object.prototype.hasOwnProperty.call(value, "host_binding")) return "host-binding-missing";
     if (!value.host_binding || typeof value.host_binding !== "object" || Array.isArray(value.host_binding)
@@ -469,12 +548,17 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     if (projection.dispatch_observation === "continuation_consumed") {
       el("status").textContent = "Work resumed successfully";
     } else if (document.hidden) {
-      el("status").textContent = "Connected in background; queued work is preserved";
+      el("status").textContent = projection.wake ? "Continuing queued work in background…" : "Connected in background";
     } else if (projection.wake) {
       el("status").textContent = "Continuing queued work…";
     } else {
       el("status").textContent = "Ready for queued work";
     }
+  }
+
+  function renderWithWait(projection) {
+    render(projection);
+    renderWaitStatus(projection);
   }
 
   function scheduleNext() {
@@ -512,7 +596,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     if (!acceptIdentity(projection)) return false;
     bindingId = viewBindingId;
     markCurrentEndpointHealthy();
-    render(projection);
+    renderWithWait(projection);
     return true;
   }
 
@@ -531,7 +615,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       throw Object.assign(new Error("Process-local Host binding was lost"), { recoverableBindingLoss: true });
     }
     markCurrentEndpointHealthy();
-    render(projection);
+    renderWithWait(projection);
     return projection;
   }
 
@@ -612,13 +696,6 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     }
 
     if (tornDown) return;
-    if (document.hidden) {
-      // Visibility may change while prepare is in flight. The fence already
-      // crossed, so reconcile conservatively without sending a background turn.
-      await finishAttempt(wake, "delivery_unknown");
-      return;
-    }
-
     // This process-local marker is set before the Host call. Reload/loss cannot
     // cause a blind resend: replacement binding reconciles prepared -> unknown.
     dispatchStarted = wake.attempt_id;
@@ -630,7 +707,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       });
       outcome = "dispatch_accepted";
     } catch (_) {
-      // After prepare, rejection/timeout/background loss is conservatively unknown.
+      // After prepare, Host rejection/timeout/response loss is conservatively unknown.
     }
     await finishAttempt(wake, outcome);
   }
@@ -644,36 +721,46 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   }
 
   async function recoverExpiredEndpoint() {
-    const stale = identitySnapshot();
+    let stale = identitySnapshot();
     if (!stale || !viewBindingId || endpointRecoveryProbeEpoch === stale.epoch) return false;
     endpointRecoveryProbeEpoch = stale.epoch;
     el("binding").textContent = "Reconnecting";
     el("status").textContent = "Reconnecting…";
     let lastError = null;
-    for (let attempt = 0; attempt < MAX_ENDPOINT_RECOVERY_ATTEMPTS; attempt++) {
-      try {
-        const response = await callTool("agent_continuation_recover_endpoint", exactArgsFor(stale, {
-          binding_id: viewBindingId,
-        }));
-        if (tornDown || !snapshotIsCurrent(stale)) return false;
-        if (!toolCallSucceeded(response)) throw definitiveFailure();
-        const output = outputOf(response);
-        const recovery = output && output.endpoint_recovery;
-        if (recovery && recovery.kind === "controller_live" && recovery.replacement === null) {
-          const projection = projectionOf(response);
-          if (!projection || !sameIdentity(projection, stale)) throw malformedResult(response);
-          el("binding").textContent = "Unavailable";
-          el("status").textContent = "Connection unavailable. Queued work is preserved.";
-          return false;
+    for (let hop = 0; hop < MAX_ENDPOINT_SUCCESSOR_HOPS; hop++) {
+      let accepted = null;
+      for (let attempt = 0; attempt < MAX_ENDPOINT_RECOVERY_ATTEMPTS; attempt++) {
+        try {
+          const response = await callTool("agent_continuation_recover_endpoint", exactArgsFor(stale, {
+            binding_id: viewBindingId,
+          }));
+          if (tornDown || !snapshotIsCurrent(stale)) return false;
+          if (!toolCallSucceeded(response)) throw definitiveFailure();
+          const output = outputOf(response);
+          const recovery = output && output.endpoint_recovery;
+          if (recovery && recovery.kind === "controller_live" && recovery.replacement === null
+            && recovery.successor_needs_recovery === false) {
+            const projection = projectionOf(response);
+            if (!projection || !sameIdentity(projection, stale)) throw malformedResult(response);
+            el("binding").textContent = "Unavailable";
+            el("status").textContent = "Connection unavailable. Queued work is preserved.";
+            return false;
+          }
+          accepted = acceptReplacementIdentity(response, stale);
+          if (accepted) break;
+          throw malformedResult(response);
+        } catch (error) {
+          lastError = error;
+          if (tornDown || !snapshotIsCurrent(stale) || (error && error.definitive)) break;
         }
-        if (acceptReplacementIdentity(response, stale)) return true;
-        throw malformedResult(response);
-      } catch (error) {
-        lastError = error;
-        if (tornDown || !snapshotIsCurrent(stale) || (error && error.definitive)) break;
       }
+      if (!accepted) break;
+      if (!accepted.successorNeedsRecovery) return true;
+      stale = identitySnapshot();
+      if (!stale) return false;
+      endpointRecoveryProbeEpoch = stale.epoch;
     }
-    if (!tornDown && snapshotIsCurrent(stale)) {
+    if (!tornDown && identity) {
       const diagnostic = hostFailureDiagnostic(lastError);
       el("binding").textContent = "Unavailable";
       el("status").textContent = diagnostic
@@ -690,12 +777,16 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       await retryPendingFinish();
       const projection = await heartbeat();
       if (!projection) return;
+      if (waitId) {
+        try { await refreshWaitState(); } catch (_) {}
+        renderWaitStatus(projection);
+      }
       // Acquiring a successor retires the old Server-side claim. Reconcile its
       // pending ACK first while still renewing the Endpoint on every poll.
-      if (document.hidden || pendingFinish) return;
+      if (pendingFinish) return;
       if (!projection.wake || projection.dispatch_observation === "continuation_consumed") return;
       const wake = await acquire();
-      if (!wake || document.hidden || tornDown) return;
+      if (!wake || tornDown) return;
       if (wake.dispatch_observation === "dispatch_accepted" || wake.dispatch_observation === "dispatch_unknown") return;
       if (wake.dispatch_observation === "dispatch_prepared") {
         // A prepared Attempt without this View's pre-call marker is never resent.
@@ -744,8 +835,11 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   function acceptToolResult(result) {
     const projection = projectionOf(result);
     if (!projection || !acceptIdentity(projection)) return;
+    const output = outputOf(result);
+    if (output && Object.prototype.hasOwnProperty.call(output, "agent_wait")
+      && !acceptWaitProjection(output.agent_wait)) return;
     // A delayed initial result must not overwrite newer bind/heartbeat state.
-    if (!bindingStarted && bindAttempts === 0) render(projection);
+    if (!bindingStarted && bindAttempts === 0) renderWithWait(projection);
     void maybeStartBinding();
   }
 
@@ -847,14 +941,14 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     el("visibility").textContent = document.hidden ? "Background" : "Foreground";
     if (timer !== null) clearTimeout(timer);
     timer = null;
-    if (!document.hidden) void reconcile(); else scheduleNext();
+    void reconcile();
   });
   addEventListener("pagehide", teardown, { once: true });
   addEventListener("beforeunload", teardown, { once: true });
 
   request("ui/initialize", {
     protocolVersion: APP_PROTOCOL,
-    appInfo: { name: "webcodex-agent-continuation-app", title: "WebCodex Agent Continuation", version: "14.0.0" },
+    appInfo: { name: "webcodex-agent-continuation-app", title: "WebCodex Agent Continuation", version: "17.0.0" },
     appCapabilities: {},
   }).then(() => {
     if (tornDown) return;

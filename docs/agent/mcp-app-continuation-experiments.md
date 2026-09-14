@@ -104,6 +104,28 @@ Production state should distinguish at least:
 
 Only exact continuation consumption is proof that the model turn ran. Background-tab scheduling should be treated as eventually available/best effort, not as a real-time execution guarantee.
 
+## Host admission and background-carrier follow-up — 2026-09-13
+
+Two focused ChatGPT Host probes tightened the presentation and scheduling model further.
+
+First, result-time App admission was tested with one tool whose descriptor deliberately had no App binding and one already-registered UI resource. Three otherwise equivalent ToolResults were returned: a plain result, a result with `_meta.ui.resourceUri`, and a result with both `_meta.ui.resourceUri` and the historical `openai/outputTemplate` compatibility alias. None created a custom App card. The practical Host contract is therefore descriptor-time admission: ToolResult metadata can feed an App that the Host already decided to create, but it cannot promote an ordinary native tool result into a new App presentation after execution. A tool such as `show_changes` consequently cannot use `clean -> no card` / `dirty -> result-time card` on one descriptor. Semantic admission needs a separate explicitly App-bound presentation tool, while ordinary work tools remain unbound.
+
+Second, the background continuation boundary was retested with a dedicated mounted-card carrier that intentionally removed the View visibility gate while preserving exact wake acquire/prepare, nonce, consume, and fail-closed delivery semantics. The original ChatGPT tab remained hidden while another window rearmed the same run. For `background-carrier-a`, three consecutive cycles reached the authoritative terminal state with:
+
+- `status=completed`;
+- `wake.state=consumed`;
+- `wake.prepareVisibility=hidden`;
+- `wake.dispatchVisibility=hidden`.
+
+The run was inspected from the other window before foregrounding the carrier tab, so `consumed` cannot be explained by later foreground reconciliation. This is direct evidence that an already-mounted MCP App can remain a background carrier, dispatch `ui/message` while hidden, and have ChatGPT start and complete the resumed model turn without first foregrounding that tab. It supersedes the earlier `multiturn-bg-b` observation as a capability boundary, but not as a scheduling guarantee: Host/browser throttling, suspension, tab discard, or future policy can still delay or stop a carrier. Durable correctness must continue to rely on server-owned pending Wake state and exact consumption, never on timer liveness or a promise of real-time background execution.
+
+These results split the product surface into two intentional patterns:
+
+- result/report cards such as Work Result are sparse and explicitly admitted, render the authoritative `present_work_result` snapshot once, and stay static until the user presses Refresh; they do not need background timers merely because the Host can run them;
+- controller cards such as Durable Agent continuation may deliberately remain live carriers when automatic continuation is a product requirement, but removing a production visibility gate is a separate policy choice and must retain exact Endpoint/generation, lease/fence, `delivery_unknown`, and consume protections.
+
+The capability result therefore supports long-lived Agent carriers without turning every MCP App into a polling surface. Presentation density, refresh cost, and autonomous scheduling remain separate design decisions.
+
 ## Durable wake safety lessons
 
 The probe intentionally reused the same safety shape already explored by the durable Agent controller work:
@@ -137,7 +159,7 @@ A production workflow presentation should therefore prefer:
 
 Do not copy the temporary timer/map implementation into production. Reuse the authoritative Workflow Session, Job lifecycle/observation, ActionAudit/window correlation, and durable Agent continuation primitives that already own persistence, authority, and recovery semantics.
 
-The static Result App follows the same sparsity rule: current tool descriptors bind it only to `list_jobs`, `validation_summary`, and `git_review_summary`. High-frequency observation, validation-run, and worktree-review calls keep native Host presentation; bounded legacy projections remain available only so already-cached older descriptors fail gracefully rather than forcing a compatibility break.
+The coding result surface follows the same sparsity rule, but production Host probing tightened the admission model further: an unbound descriptor does not create an App later merely because its ToolResult contains `ui.resourceUri` or `openai/outputTemplate`. Ordinary tools therefore have no Work App descriptor binding at all, including `show_changes`, Job observation, validation execution/summary, committed-range review, and coding closeout. A model explicitly calls `present_work_result(project, session_id)` only when one persistent user-visible summary is useful; that binds `ui://webcodex/work-result/v1` once and returns the initial authoritative snapshot. The mounted View then remains static: only an explicit user Refresh performs one ModelHidden/app-only `work_result_state(project, session_id)` exact read. Each refresh re-authorizes the exact Session and Project, reads bounded current worktree status/numstat plus existing Session validation/review evidence, requests no diff hunks, runs no validation/review, and deliberately does not append refresh events to the observed Session ledger. There is no Work Result background timer, visibility-triggered read, or retry loop. The old Changes/Result resources and bounded result projections remain hidden-readable compatibility paths for cached descriptors; compatibility does not imply current descriptor-level admission.
 
 The production Durable Goal G2 implementation applies the same presentation findings to a server-owned Goal: one explicit `present_goal_plan(goal_id)` binds `ui://webcodex/goal-plan/v2`, while the existing View uses the ModelHidden/app-only `goal_plan_state(goal_id)` exact read to converge on SQLite Goal revision. G3 does **not** change that contract: Goal still has no Wake, `ui/message`, model resume, dispatch fence, consume token, background model scheduler, Agent owner/controller relation, or automatic Goal/work execution transition.
 
@@ -163,15 +185,15 @@ agent_continuation_wake_finish    # dispatch_accepted | delivery_unknown
 later model turn exact-consumes Wake
 ```
 
-The only card-creating entry is the explicit read `present_agent_continuation(agent_id, endpoint_id, expected_controller_generation)`, bound to the current `ui://webcodex/agent-continuation/v14` resource. Bind/recover/state/acquire/prepare/finish/unbind are globally ModelHidden and are projected only as App-visible tools on eligible Stateless MCP 2026 operator surfaces. They do not bind the resource again, so polling/coordination does not create a stream of custom cards. Ordinary communication and coding tools keep native Host presentation.
+The only card-creating entry is the explicit read `present_agent_continuation(agent_id, endpoint_id, expected_controller_generation)`, bound to the current `ui://webcodex/agent-continuation/v16` resource. Bind/recover/state/acquire/prepare/finish/unbind are globally ModelHidden and are projected only as App-visible tools on eligible Stateless MCP 2026 operator surfaces. They do not bind the resource again, so polling/coordination does not create a stream of custom cards. Ordinary communication and coding tools keep native Host presentation.
 
-The View binding is process-local fencing, not durable authority. Every App-only operation re-authorizes the normal communication principal and exact Agent/Endpoint/controller generation. `binding_id` identifies only the current iframe/process instance. For MCP Apps, the Store retains both the v11 SHA-256 fingerprint of the exact current binding fence and, when the Host supplied valid request-scoped identity, the already-domain-separated SHA-256 `ClientWindow` key. Raw `_meta["openai/session"]` is never persisted. Server takeover clears process-local carriers and durable `wake_capable` but preserves both bounded restart-recovery values. The exact old binding fingerprint remains the fallback when no valid ClientWindow exists. With a canonical ClientWindow, the same authenticated principal + exact Endpoint/generation + same Window may restore or replace a lost iframe fence after restart; refresh unbind clears the iframe fingerprint but preserves that same-Window continuity while the Endpoint remains current. Natural lease expiry clears wake capability and the binding fingerprint but v14 preserves only the hashed Window key as a bounded input to the dedicated expired-Endpoint replacement operation; ordinary bind/state still reject the expired Endpoint. Explicit detach, ordinary Endpoint replacement, or transition to a push carrier clears the continuity value. Push adapters still require a fresh current-process attachment and never inherit Window recovery. On replacement/loss, existing Store reconciliation handles the durable state: pre-fence claim -> revoked Attempt + pending Wake; post-fence prepared/delivered -> `delivery_unknown`.
+The View binding is process-local fencing, not durable authority. Every App-only operation re-authorizes the normal communication principal and exact Agent/Endpoint/controller generation. `binding_id` identifies only the current iframe/process instance. For MCP Apps, the Store retains both the v11 SHA-256 fingerprint of the exact current binding fence and, when the Host supplied valid request-scoped identity, the already-domain-separated SHA-256 `ClientWindow` key. Raw `_meta["openai/session"]` is never persisted. Server takeover clears process-local carriers and durable `wake_capable` but preserves both bounded restart-recovery values. The exact old binding fingerprint remains the fallback when no valid ClientWindow exists. With a canonical ClientWindow, the same authenticated principal + exact Endpoint/generation + same Window may restore or replace a lost iframe fence after restart; refresh unbind clears the iframe fingerprint but preserves that same-Window continuity while the Endpoint remains current. Natural lease expiry clears wake capability and the binding fingerprint; v15 preserves only the hashed Window key as a bounded input to the dedicated expired-Endpoint replacement operation and its exact one-hop replay chain, while ordinary bind/state still reject the expired Endpoint. Explicit detach, ordinary Endpoint replacement, or transition to a push carrier clears the continuity value. Push adapters still require a fresh current-process attachment and never inherit Window recovery. On replacement/loss, existing Store reconciliation handles the durable state: pre-fence claim -> revoked Attempt + pending Wake; post-fence prepared/delivered -> `delivery_unknown`.
 
 The App keeps claim fences entirely Server-side. The bounded automatic message is returned only after prepare and contains exact `agent_id`, `endpoint_id`, `controller_generation`, `wake_id`, and `consume_token`; it contains no Conversation Message body, transcript, Agent private description/specialty labels, credential, principal digest, claim fence, Project authority, or Workflow Session authority. The View generates a stable secure random binding fence and sends it in bind input; same-current-View retries renew without replacing its claim or dispatch phase. The automatic message uses the app-only standard `structuredContent.output.app_protocol` result channel. Neither value enters ordinary model-visible projections, typed audit/session projections, or forensic tool-request payload capture. Continuation correctness does not depend on custom ToolResult `_meta`.
 
 `ui/message` success is recorded only as `dispatch_accepted`. Timeout, reload, View loss, or any post-fence outcome that cannot prove non-delivery becomes `delivery_unknown`; the App never automatically sends a second `ui/message` for that Attempt. If the new model turn starts before the Host ACK is recorded, exact `consume_agent_wake` may win first; the later ACK is idempotent and cannot move the Wake back from `consumed`. Only exact consume is production evidence of `continuation_consumed`.
 
-The production App uses bounded heartbeat/reconciliation. A hidden/background View may renew its exact Endpoint but does not initiate a new automatic `ui/message`; returning to the foreground triggers immediate authoritative reconciliation. Pagehide, beforeunload, and `ui/resource-teardown` stop polling and attempt exact best-effort unbind. Correctness never depends on reliable teardown, browser memory, or localStorage.
+Production v16 applies the already-proven background-carrier policy directly: a hidden/background View keeps the slower bounded heartbeat cadence but may observe, acquire, prepare, send the exact `ui/message`, and finish the Host outcome without waiting for foreground. Visibility transitions themselves do not create `delivery_unknown`; only the existing prepare/Host-response uncertainty, binding loss, or teardown/replacement paths do. Pagehide, beforeunload, and `ui/resource-teardown` still stop polling and attempt exact best-effort unbind. Correctness never depends on reliable teardown, browser memory, timer liveness, or localStorage.
 
 ## Production App bootstrap
 
@@ -191,18 +213,24 @@ works, and a missing ToolResult does not block bind/heartbeat or Goal polling
 once Host initialization succeeds. Unknown Goal lifecycle permits the first
 authoritative read; terminal Goal state still stops polling.
 
-Each card still accepts only one ordinary projected identity. Matching notifications are idempotent; conflicting ordinary identities stop coordination, cancel pending View requests, and leave a bounded error. v14 adds one narrow exception: only a successful `agent_continuation_recover_endpoint` ToolResult carrying a strict Server-authored replacement envelope may transition the card from its exact current stale selector to exactly `generation+1` for the same Agent. The envelope must name the exact old Endpoint/generation and the returned normal projection must name the same new Endpoint/generation. The App then advances a local identity epoch so delayed old bind/state responses and old timer callbacks are inert. An already-bound Agent View attempts only its current exact unbind. Tool input is an exact selector, never authorization: every actual read/mutation still runs the Server's existing principal, scope, and resource checks.
+Each card still accepts only one ordinary projected identity. Matching notifications are idempotent; conflicting ordinary identities stop coordination, cancel pending View requests, and leave a bounded error. v16 keeps the v15/v14 narrow exception: only a successful `agent_continuation_recover_endpoint` ToolResult carrying a strict Server-authored replacement envelope may transition the card from its exact current stale selector to exactly `generation+1` for the same Agent. A live successor must match the returned normal projection; an already-recorded successor that has itself naturally expired is instead returned as `agent_continuation=null` plus `successor_needs_recovery=true`, so the card adopts exactly that one selector and asks for the next edge. At most eight successor hops are accepted. The App advances a local identity epoch after every accepted edge so delayed old bind/state responses and old timer callbacks are inert. An already-bound Agent View attempts only its current exact unbind. Tool input is an exact selector, never authorization: every actual read/mutation still runs the Server's existing principal, scope, and resource checks.
 
 Visible status distinguishes script activity, Host initialization, exact identity
 selection, and live binding/polling, with separate initialization, binding, and
 identity errors. Diagnostics do not display binding ids, claim fences, or consume
 tokens. `tools/list` and `resources/list` advertise only the canonical
-`ui://webcodex/agent-continuation/v14` and `ui://webcodex/goal-plan/v2` resources.
-Agent continuation v1-v13 are hidden read aliases serving the same current template. Reading an alias does not revive an expired Endpoint or bypass exact generation/authorization fencing; the same current template must still complete the explicit Server-authorized replacement transition. The v11 fingerprint-proven restart fallback, v12 strict restart projection, and v13 canonical Host-window refresh fence remain intact; v14 adds expired-Endpoint replacement as a separate transition rather than broadening any of those paths.
+`ui://webcodex/agent-continuation/v16` and `ui://webcodex/goal-plan/v2` resources.
+Agent continuation v1-v15 are hidden read aliases serving the same current template. Reading an alias does not revive an expired Endpoint or bypass exact generation/authorization fencing; the same current template must still complete explicit Server-authorized one-hop replacement transitions. The v11 fingerprint-proven restart fallback, v12 strict restart projection, v13 canonical Host-window refresh fence, v14 expired-Endpoint replacement, and v15 bounded successor replay remain intact; v16 changes only visibility eligibility for automatic dispatch.
+
+## Goal-correlated terminal attention carrier
+
+The production carrier now has one additional durable Wake source without changing its Host correctness state machine. An exact current AgentTaskAttempt terminal transition may atomically persist a narrow `agent_task_terminal` Event and pending `attention_event` Wake for each currently active caller-owned Goal correlation, targeting that Task's explicit assignee Agent. The Event carries only exact semantic identities plus terminal Task state; the Wake carries only `source_event_id`. Neither copies Task result/instruction or Goal objective, and neither grants Task, Goal, Project, Session, Endpoint, or filesystem authority.
+
+This source deliberately does **not** use the A4b `agent_task_attempt` contract: its source Attempt is already terminal, so attention acquire/prepare never depends on Attempt heartbeat/lease/controller liveness. It still reuses exact Agent/Endpoint/generation/binding fences, the durable Wake claim/prepare fence, one-dispatched-Wake-per-Agent bound, `dispatchStarted` anti-resend behavior, Host outcome uncertainty, and exact consume proof. The Server-generated automatic message tells the resumed model to bootstrap the exact Event/Goal/Task/Attempt identities, consume only after actual takeover, independently call normal `get_goal` and `read_agent_task`, and explicitly decide Goal progression. A Goal already completed/cancelled by another turn remains terminal and the attention continuation safely no-ops; there is no automatic Goal completion, reopening, or next-Task generation.
 
 ## Remaining verification boundary
 
-Deterministic tests cover surface isolation, protocol fail-closed behavior, authorization/existence hiding, duplicate-View fencing, live-controller protection, same-Window expired-Endpoint replacement, different-Window rejection, concurrent replacement, response-loss replay, no rollback after a later generation, replacement before/after Server restart, delayed-old-response App guards, pending Wake preservation, pre-fence recovery, post-fence uncertainty, 50-Message burst coalescing, exact consume/token/generation checks, consume-before-ACK ordering, and secret redaction. The remaining environment-specific step is manual ChatGPT dogfood of v14 with a real full tab/window close past the 120-second lease and reopening the original Conversation/card. That dogfood must verify in-place `Reconnecting… -> Host bound`, the same pending Wake/Delivery continuing through E1/g1 -> E2/g2, and no duplicate Host `ui/message`. Host success remains dispatch acceptance only; background model-turn scheduling remains eventually available/best effort, not an immediate guarantee.
+Deterministic tests cover surface isolation, protocol fail-closed behavior, authorization/existence hiding, duplicate-View fencing, live-controller protection, same-Window expired-Endpoint replacement, different-Window rejection, concurrent replacement, response-loss replay, bounded E1 -> E2 -> E3 -> ... successor recovery, no rollback after a later generation, replacement before/after Server restart, delayed-old-response App guards, pending Wake preservation, pre-fence recovery, post-fence uncertainty, 50-Message burst coalescing, exact consume/token/generation checks, consume-before-ACK ordering, secret redaction, hidden heartbeat/acquire/prepare/dispatch, and visible/hidden transitions across prepare and Host dispatch. Production Host evidence has already shown three consecutive hidden prepare -> `ui/message` -> resumed model -> consume cycles. Remaining dogfood should exercise the canonical v16 resource together with natural successor expiry and background terminal-attention Wakes, while continuing to verify no duplicate Host `ui/message`. Host success remains dispatch acceptance only; background model-turn scheduling remains eventually available/best effort, not an immediate guarantee.
 
 ### Production result-channel compatibility follow-up
 
@@ -269,25 +297,27 @@ corrected with focused regressions:
   suppression list. Its binding fence now receives the same trace exclusion as
   the other App coordination tools.
 
-**Open P2: reopening after the recovered successor also expires.** The original
-card's persisted tool input still names E1/g1; its accepted E2/g2 selector lives
-only in the iframe. If E2's lease also elapses before that original card is
-reopened, Store replay correctly finds the same authoritative E2, but
-`agent_continuation_recover_endpoint_for_window` then calls the ordinary live
-`bootstrap_agent_conversation`. This fails `endpoint_expired` before returning
-the replacement envelope, so the card cannot learn E2 and request E2 -> E3.
-Response loss lasting past E2's lease has the same failure.
+**v15 closes the A4b repeated-successor prerequisite without changing one-hop authority.**
+A replay of the E1 recovery operation may return only its uniquely committed E2 successor,
+even if the Agent's current generation is already E3 or later. Replay still rechecks the
+same owner, Agent, exact predecessor generation, durable successor generation, retained
+ClientWindow lineage, detach state, and revocation provenance; it never recreates fresh
+push-registration authority.
 
-This was reproduced locally by setting only the successor's
-`lease_expires_at_unix_ms` to zero immediately before the replay in
-`mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_extra_generation`:
-its expected successful replay instead returned `endpoint_expired`. The
-temporary fault injection was removed after verification; the regular test
-continues to cover replay while the successor is live. Fixing this requires an
-explicit successor-recovery protocol; ordinary live-Endpoint checks and the
-prohibition on retargeting an old replay after a later generation must remain
-intact. Until then, explicitly rotate and present a new Endpoint/card. This
-review does not claim repeated long-close recovery is complete.
+If that exact E2 successor is itself naturally expired, runtime no longer ordinary-
+bootstraps it. Instead the strict successful result carries `agent_continuation=null`, the
+exact E1 -> E2 replacement envelope, and `successor_needs_recovery=true`. The App validates
+same Agent, exact predecessor Endpoint/generation, canonical successor id,
+`new_generation = old_generation + 1`, and `reason=endpoint_expired`, adopts E2, then calls
+the same operation with E2. Every later edge is independently durable/idempotent. The App
+stops after eight accepted edges and reports ordinary connection-unavailable semantics;
+Server code never walks arbitrary Endpoint history. Generic JSON-RPC `-32000` remains
+non-evidence and cannot authorize recovery.
+
+A real Store/runtime regression constructs E1 -> E2 -> E3, expires E2, replays E1, and
+projects the returned intermediate result through the published strict output schema;
+the Host-visible projection must retain the entire exact one-hop proof. The App harness
+covers sequential expired successors through a live tail and the eight-hop cap.
 
 Focused validation passed: 113 App tests, 25 runtime/MCP continuation tests,
 11 Store communication tests, nine continuation contract/parser/privacy tests,

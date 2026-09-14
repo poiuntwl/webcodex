@@ -42,6 +42,7 @@ fn reconciliation_capabilities() -> RunnerCapabilities {
         structured_validation_argv: true,
         structured_cargo_test_count_assertion: true,
         structured_cargo_test_execution_policy: true,
+        structured_cargo_test_lib: true,
         job_state_reconciliation: true,
         coding_agent_runs: false,
         ..Default::default()
@@ -60,6 +61,8 @@ fn project_summary() -> RunnerProjectSummary {
         hooks: Vec::new(),
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: Some("main".to_string()),
         git_head: None,
         git_dirty: None,
@@ -151,6 +154,19 @@ fn cargo_validation_start_metadata(
         visibility: ShellJobVisibility::Public,
         ..Default::default()
     }
+}
+
+fn cargo_lib_validation_start_metadata() -> ShellJobStartMetadata {
+    let mut metadata = cargo_validation_start_metadata(None, None, None);
+    for step in &mut metadata.validation_steps {
+        step.args.push("--lib".to_string());
+    }
+    if let Some(validation) = metadata.validation.as_mut() {
+        for step in &mut validation.steps {
+            step.args.push("--lib".to_string());
+        }
+    }
+    metadata
 }
 
 async fn start_and_take_over(
@@ -536,6 +552,29 @@ async fn old_count_capable_runner_fails_closed_on_explicit_cargo_execution_polic
         );
         assert!(registry.list_jobs(Some(100)).await.is_empty(), "case={label}");
     }
+}
+
+#[tokio::test]
+async fn old_structured_runner_fails_closed_on_cargo_test_lib_selector() {
+    let registry = RunnerRegistry::default();
+    let mut registration = register_request(INSTANCE_A, empty_inventory());
+    registration.capabilities.structured_cargo_test_lib = false;
+    assert!(registration.capabilities.structured_validation_argv);
+    registry.register(registration).await.unwrap();
+
+    let error = registry
+        .start_job_with_metadata(
+            start_request("validation"),
+            "tester".to_string(),
+            cargo_lib_validation_start_metadata(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("structured_cargo_test_lib_unavailable"),
+        "error={error}"
+    );
+    assert!(registry.list_jobs(Some(100)).await.is_empty());
 }
 
 #[tokio::test]
@@ -1794,7 +1833,7 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_mcp_gateway_runner_instance_id: None,
                 expected_ssh_resource_runner_instance_id: None,
                 expected_runner_config_runner_instance_id: None,
-                skill_store_fence: None,
+                skill_fence: None,
                 dispatched: true,
                 expected_mcp_gateway_provider_id: None,
                 expected_mcp_gateway_provider_instance_id: None,
@@ -1816,7 +1855,7 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_mcp_gateway_runner_instance_id: None,
                 expected_ssh_resource_runner_instance_id: None,
                 expected_runner_config_runner_instance_id: None,
-                skill_store_fence: None,
+                skill_fence: None,
                 dispatched: false,
                 expected_mcp_gateway_provider_id: None,
                 expected_mcp_gateway_provider_instance_id: None,

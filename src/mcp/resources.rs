@@ -53,15 +53,21 @@ pub(super) const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
 // Temporary gray-card diagnostic: force the host to re-read the canonical App
 // resource for every card so resource reuse/cache is not an unobserved variable.
 pub(super) const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 0;
-pub(super) const MCP_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/result/v3";
-pub(super) const MCP_RESULT_UI_RESOURCE_LEGACY_URIS: &[&str] =
-    &["ui://webcodex/result/v1", "ui://webcodex/result/v2"];
+pub(super) const MCP_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/changes/v2";
+pub(super) const MCP_RESULT_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
+    "ui://webcodex/changes/v1",
+    "ui://webcodex/result/v1",
+    "ui://webcodex/result/v2",
+    "ui://webcodex/result/v3",
+];
+pub(super) const MCP_WORK_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/work-result/v1";
 pub(super) const MCP_GOAL_PLAN_UI_RESOURCE_URI: &str = "ui://webcodex/goal-plan/v2";
 pub(super) const MCP_AGENT_CONTINUATION_UI_RESOURCE_URI: &str =
-    "ui://webcodex/agent-continuation/v14";
+    "ui://webcodex/agent-continuation/v17";
 pub(super) const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(super) const MCP_COMPUTER_APP_HTML: &str = include_str!("../mcp_computer_app.html");
 pub(super) const MCP_RESULT_APP_HTML: &str = include_str!("../mcp_result_app.html");
+pub(super) const MCP_WORK_RESULT_APP_HTML: &str = include_str!("../mcp_work_result_app.html");
 pub(super) const MCP_GOAL_PLAN_APP_HTML: &str = include_str!("../mcp_goal_plan_app.html");
 pub(super) const MCP_AGENT_CONTINUATION_APP_HTML: &str =
     include_str!("../mcp_agent_continuation_app.html");
@@ -130,11 +136,11 @@ pub(super) fn mcp_app_resources_list(domain: Option<&str>) -> Value {
         .as_array_mut()
         .expect("computer App resource list must be an array")
         .push(json!({
-            "uri": MCP_RESULT_UI_RESOURCE_URI,
-            "name": "WebCodex Result",
-            "description": "Read-only bounded WebCodex milestone presentation for active/attention Job inventory, aggregate validation evidence, and committed-range review summaries. High-frequency execution tools keep native Host presentation; the App never performs tool calls or owns runtime state.",
+            "uri": MCP_WORK_RESULT_UI_RESOURCE_URI,
+            "name": "WebCodex Work",
+            "description": "Persistent read-only coding Work Result for one explicitly presented project-scoped Workflow Session. The initial present_work_result ToolResult is the authoritative snapshot; the mounted App stays static until the user explicitly refreshes, then performs one exact bounded state read. Ordinary work tools keep native Host presentation. Legacy Changes resources remain hidden readable compatibility aliases.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
-            "_meta": mcp_result_app_resource_meta(domain)
+            "_meta": mcp_app_resource_meta(domain)
         }));
     result["resources"]
         .as_array_mut()
@@ -198,6 +204,23 @@ pub(super) fn mcp_result_app_resource_read(uri: &str, domain: Option<&str>) -> O
     })
 }
 
+pub(super) fn is_mcp_work_result_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_WORK_RESULT_UI_RESOURCE_URI
+}
+
+pub(super) fn mcp_work_result_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_work_result_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_WORK_RESULT_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
 pub(super) fn is_mcp_goal_plan_app_resource_uri(uri: &str) -> bool {
     // Hidden read alias for existing cards; discovery advertises only v2.
     uri == MCP_GOAL_PLAN_UI_RESOURCE_URI || uri == "ui://webcodex/goal-plan/v1"
@@ -217,7 +240,7 @@ pub(super) fn mcp_goal_plan_app_resource_read(uri: &str, domain: Option<&str>) -
 }
 
 pub(super) fn is_mcp_agent_continuation_app_resource_uri(uri: &str) -> bool {
-    // Thin hidden read aliases for existing cards; discovery advertises only v14.
+    // Thin hidden read aliases for existing cards; discovery advertises only v17.
     uri == MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
         || matches!(
             uri,
@@ -234,6 +257,9 @@ pub(super) fn is_mcp_agent_continuation_app_resource_uri(uri: &str) -> bool {
                 | "ui://webcodex/agent-continuation/v11"
                 | "ui://webcodex/agent-continuation/v12"
                 | "ui://webcodex/agent-continuation/v13"
+                | "ui://webcodex/agent-continuation/v14"
+                | "ui://webcodex/agent-continuation/v15"
+                | "ui://webcodex/agent-continuation/v16"
         )
 }
 
@@ -255,6 +281,7 @@ pub(super) fn mcp_agent_continuation_app_resource_read(
 
 fn mcp_static_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
     mcp_computer_app_resource_read(uri, domain)
+        .or_else(|| mcp_work_result_app_resource_read(uri, domain))
         .or_else(|| mcp_result_app_resource_read(uri, domain))
         .or_else(|| mcp_goal_plan_app_resource_read(uri, domain))
         .or_else(|| mcp_agent_continuation_app_resource_read(uri, domain))

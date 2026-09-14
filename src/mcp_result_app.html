@@ -1,9 +1,9 @@
-<div id="app" style="font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;border:1px solid var(--color-border-primary,rgba(127,127,127,.35));border-radius:12px;max-width:760px;color:var(--color-text-primary,inherit);background:var(--color-background-primary,transparent)">
+<div id="app" style="font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;border:1px solid color-mix(in srgb,var(--color-border-primary,#8b8b8b) 72%,#d99742 28%);border-radius:14px;max-width:760px;color:var(--color-text-primary,inherit);background:var(--color-background-primary,#fff);background:linear-gradient(145deg,color-mix(in srgb,var(--color-background-primary,#fff) 96%,#d99742 4%),var(--color-background-primary,#fff));box-shadow:0 10px 30px rgba(0,0,0,.055)">
   <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-    <strong id="title" style="font-size:17px">WebCodex Result</strong>
-    <span id="state" style="font-size:12px">HTML loaded</span>
+    <strong id="title" style="font-size:17px;letter-spacing:-.01em">WebCodex Changes</strong>
+    <span id="state" style="display:inline-flex;align-items:center;gap:5px;font-size:12px;font-variant-numeric:tabular-nums;font-weight:600">HTML loaded</span>
   </div>
-  <div id="summary" style="margin-top:8px;font-size:13px">Minimal MCP Apps handshake · waiting for a supported result</div>
+  <div id="summary" style="margin-top:8px;font-size:13px;color:var(--color-text-secondary,inherit)">Waiting for a bounded Changes presentation</div>
   <div id="cards" style="display:grid;gap:10px;margin-top:12px"></div>
 </div>
 <script>
@@ -12,6 +12,10 @@
   const PRESENTATION_KEY = "webcodex/presentation";
   const MAX_ITEMS = 8;
   const MAX_TEXT = 256;
+  const DEFAULT_VISIBLE_FILES = 3;
+  const MAX_DIFF_HUNKS = 8;
+  const MAX_DIFF_LINES = 80;
+  const MAX_DIFF_TEXT = 12 * 1024;
   const stateEl = document.getElementById("state");
   const titleEl = document.getElementById("title");
   const summaryEl = document.getElementById("summary");
@@ -24,6 +28,14 @@
     if (typeof value !== "string") return null;
     const chars = Array.from(value);
     return chars.length <= MAX_TEXT ? value : chars.slice(0, MAX_TEXT - 1).join("") + "…";
+  }
+
+  function boundedDiffString(value) {
+    if (typeof value !== "string" || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) return null;
+    const lines = value.split(/\r?\n/).slice(0, MAX_DIFF_LINES);
+    const lineBounded = lines.join("\n");
+    const chars = Array.from(lineBounded);
+    return chars.length <= MAX_DIFF_TEXT ? lineBounded : chars.slice(0, MAX_DIFF_TEXT).join("");
   }
 
   function request(method, params, timeoutMs = 10000) {
@@ -50,6 +62,10 @@
 
   function clearCards() {
     while (cardsEl.firstChild) cardsEl.removeChild(cardsEl.firstChild);
+    cardsEl.style.maxHeight = "";
+    cardsEl.style.overflowY = "visible";
+    cardsEl.style.paddingRight = "";
+    cardsEl.scrollTop = 0;
   }
 
   function addRow(card, label, value) {
@@ -279,50 +295,267 @@
     body.appendChild(line);
   }
 
-  function renderGitChanges(presentation) {
-    const state = presentation.git_available === false
-      ? (presentation.non_git_project === true ? "Non-Git" : "Git unavailable")
-      : presentation.clean === true
-        ? "Clean"
-        : presentation.clean === false ? "Changes" : "Status unavailable";
-    titleEl.textContent = "Git changes";
-    stateEl.textContent = state;
-    const parts = [];
-    const branch = boundedString(presentation.branch);
-    if (branch) parts.push(branch);
-    if (Number.isInteger(presentation.files_total)) parts.push(String(presentation.files_total) + " changed files");
-    const upstream = boundedString(presentation.upstream_status);
-    if (upstream) parts.push("upstream: " + upstream);
-    if (Number.isInteger(presentation.ahead) && presentation.ahead > 0) parts.push(String(presentation.ahead) + " ahead");
-    if (Number.isInteger(presentation.behind) && presentation.behind > 0) parts.push(String(presentation.behind) + " behind");
-    if (presentation.files_truncated === true || presentation.output_truncated === true || presentation.items_truncated === true) parts.push("bounded view");
-    summaryEl.textContent = parts.length ? parts.join(" · ") : state;
+  function changeKindLabel(item) {
+    const status = boundedString(item && item.status);
+    if (status === "added") return "A";
+    if (status === "deleted") return "D";
+    if (status === "renamed") return "R";
+    if (status === "copied") return "C";
+    if (status === "untracked") return "?";
+    if (status === "conflicted") return "!";
+    if (status === "modified") return "M";
+    return "?";
+  }
 
-    appendDetailsCard((body) => {
-      addRow(body, "Git available", typeof presentation.git_available === "boolean" ? (presentation.git_available ? "yes" : "no") : null);
-      addRow(body, "Non-Git project", typeof presentation.non_git_project === "boolean" ? (presentation.non_git_project ? "yes" : "no") : null);
-      addRow(body, "Branch", branch);
-      addRow(body, "Head", presentation.head && typeof presentation.head === "object" ? boundedString(presentation.head.short) : null);
-      addRow(body, "Upstream", upstream);
-      addRow(body, "Upstream reason", boundedString(presentation.upstream_reason_code));
-      addRow(body, "Ahead", Number.isInteger(presentation.ahead) ? presentation.ahead : null);
-      addRow(body, "Behind", Number.isInteger(presentation.behind) ? presentation.behind : null);
-      const observation = presentation.status_observation && typeof presentation.status_observation === "object" ? presentation.status_observation : null;
-      if (observation) {
-        addRow(body, "Status observation", boundedString(observation.status));
-        addRow(body, "Status reason", boundedString(observation.reason_code));
-      }
-      const counts = presentation.counts && typeof presentation.counts === "object" ? presentation.counts : null;
-      if (counts) {
-        for (const [key, label] of [["modified", "Modified"], ["added", "Added"], ["deleted", "Deleted"], ["renamed", "Renamed"], ["copied", "Copied"], ["untracked", "Untracked"], ["conflicted", "Conflicted"], ["staged", "Staged"], ["unstaged", "Unstaged"]]) {
-          addRow(body, label, Number.isInteger(counts[key]) ? counts[key] : null);
-        }
-      }
-      const files = Array.isArray(presentation.files) ? presentation.files.slice(0, MAX_ITEMS) : [];
-      files.forEach((item) => addGitFile(body, item, false));
-      if (presentation.files_truncated === true || presentation.items_truncated === true) addRow(body, "Changed files", "bounded/truncated");
-      if (presentation.output_truncated === true) addRow(body, "Canonical output", "truncated");
+  function changeTone(item) {
+    const status = boundedString(item && item.status);
+    if (status === "added") {
+      return {
+        foreground: "var(--color-success-text,#2f9e44)",
+        background: "color-mix(in srgb,var(--color-success-text,#2f9e44) 13%,transparent)",
+        border: "color-mix(in srgb,var(--color-success-text,#2f9e44) 28%,transparent)"
+      };
+    }
+    if (status === "deleted" || status === "conflicted") {
+      return {
+        foreground: "var(--color-danger-text,#d9485f)",
+        background: "color-mix(in srgb,var(--color-danger-text,#d9485f) 12%,transparent)",
+        border: "color-mix(in srgb,var(--color-danger-text,#d9485f) 26%,transparent)"
+      };
+    }
+    if (status === "modified" || status === "renamed" || status === "copied") {
+      return {
+        foreground: "var(--color-warning-text,#d99742)",
+        background: "color-mix(in srgb,var(--color-warning-text,#d99742) 13%,transparent)",
+        border: "color-mix(in srgb,var(--color-warning-text,#d99742) 28%,transparent)"
+      };
+    }
+    return {
+      foreground: "var(--color-text-secondary,#6b7280)",
+      background: "color-mix(in srgb,var(--color-text-secondary,#6b7280) 9%,transparent)",
+      border: "color-mix(in srgb,var(--color-text-secondary,#6b7280) 20%,transparent)"
+    };
+  }
+
+  function addChangeStat(stats, prefix, value, color) {
+    if (!Number.isInteger(value) || value < 0) return;
+    const span = document.createElement("span");
+    span.style.color = color;
+    span.style.fontWeight = "650";
+    span.textContent = prefix + String(value);
+    stats.appendChild(span);
+  }
+
+  function appendDiffLine(pre, line) {
+    const span = document.createElement("span");
+    span.style.display = "block";
+    span.style.minHeight = "1.45em";
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      span.style.color = "var(--color-success-text,#2f9e44)";
+      span.style.background = "color-mix(in srgb,var(--color-success-text,#2f9e44) 8%,transparent)";
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      span.style.color = "var(--color-danger-text,#d9485f)";
+      span.style.background = "color-mix(in srgb,var(--color-danger-text,#d9485f) 8%,transparent)";
+    } else if (line.startsWith("@@")) {
+      span.style.color = "var(--color-warning-text,#d99742)";
+      span.style.fontWeight = "600";
+    } else {
+      span.style.color = "var(--color-text-secondary,inherit)";
+    }
+    span.textContent = line || " ";
+    pre.appendChild(span);
+  }
+
+  function appendChangeDiff(card, item) {
+    const hunks = Array.isArray(item.diff_hunks) ? item.diff_hunks.slice(0, MAX_DIFF_HUNKS) : [];
+    if (!hunks.length) return;
+    const details = document.createElement("details");
+    details.style.marginTop = "9px";
+    details.style.borderTop = "1px solid color-mix(in srgb,var(--color-warning-text,#d99742) 18%,var(--color-border-secondary,rgba(127,127,127,.18)))";
+    details.style.paddingTop = "8px";
+    const summary = document.createElement("summary");
+    summary.style.cursor = "pointer";
+    summary.style.fontSize = "12px";
+    summary.style.fontWeight = "650";
+    summary.style.color = "var(--color-warning-text,#d99742)";
+    summary.textContent = "View diff";
+    details.appendChild(summary);
+    details.addEventListener("toggle", () => {
+      summary.textContent = details.open ? "Hide diff" : "View diff";
     });
+    hunks.forEach((hunk) => {
+      if (!hunk || typeof hunk !== "object") return;
+      const diff = boundedDiffString(hunk.diff);
+      if (diff === null) return;
+      const pre = document.createElement("pre");
+      pre.style.margin = "8px 0 0";
+      pre.style.padding = "9px 10px";
+      pre.style.border = "1px solid var(--color-border-secondary,rgba(127,127,127,.16))";
+      pre.style.borderRadius = "8px";
+      pre.style.overflowX = "auto";
+      pre.style.maxHeight = "320px";
+      pre.style.overflowY = "auto";
+      pre.style.fontFamily = "var(--font-mono,ui-monospace,SFMono-Regular,Consolas,monospace)";
+      pre.style.fontSize = "11px";
+      pre.style.lineHeight = "1.45";
+      pre.style.background = "color-mix(in srgb,var(--color-background-secondary,#f5f5f5) 78%,transparent)";
+      diff.split(/\r?\n/).forEach((line) => appendDiffLine(pre, line));
+      details.appendChild(pre);
+    });
+    if (item.diff_truncated === true) {
+      const note = document.createElement("div");
+      note.style.marginTop = "7px";
+      note.style.fontSize = "11px";
+      note.style.color = "var(--color-text-tertiary,var(--color-text-secondary,inherit))";
+      note.textContent = "Bounded diff preview";
+      details.appendChild(note);
+    }
+    if (details.childNodes.length > 1) card.appendChild(details);
+  }
+
+  function changeFileCard(item) {
+    if (!item || typeof item !== "object") return null;
+    const path = boundedString(item.path);
+    if (!path) return null;
+    const tone = changeTone(item);
+    const card = document.createElement("div");
+    card.style.border = "1px solid color-mix(in srgb,var(--color-border-secondary,#b7b7b7) 82%," + tone.foreground + " 18%)";
+    card.style.borderRadius = "10px";
+    card.style.padding = "10px 12px";
+    card.style.background = "color-mix(in srgb,var(--color-background-secondary,#f5f5f5) 62%,transparent)";
+    const row = document.createElement("div");
+    row.style.display = "grid";
+    row.style.gridTemplateColumns = "24px minmax(0,1fr) auto";
+    row.style.alignItems = "center";
+    row.style.gap = "9px";
+    const kind = document.createElement("strong");
+    kind.style.display = "grid";
+    kind.style.width = "22px";
+    kind.style.height = "22px";
+    kind.style.placeItems = "center";
+    kind.style.border = "1px solid " + tone.border;
+    kind.style.borderRadius = "6px";
+    kind.style.background = tone.background;
+    kind.style.color = tone.foreground;
+    kind.style.fontFamily = "var(--font-mono,ui-monospace,SFMono-Regular,Consolas,monospace)";
+    kind.style.fontSize = "11px";
+    kind.style.fontWeight = "750";
+    kind.textContent = changeKindLabel(item);
+    const name = document.createElement("span");
+    name.style.fontFamily = "var(--font-mono,ui-monospace,SFMono-Regular,Consolas,monospace)";
+    name.style.fontSize = "12px";
+    name.style.fontWeight = "600";
+    name.style.overflowWrap = "anywhere";
+    const oldPath = boundedString(item.old_path);
+    name.textContent = path + (oldPath && oldPath !== path ? " ← " + oldPath : "");
+    const stats = document.createElement("span");
+    stats.style.display = "inline-flex";
+    stats.style.gap = "6px";
+    stats.style.fontFamily = "var(--font-mono,ui-monospace,SFMono-Regular,Consolas,monospace)";
+    stats.style.fontSize = "12px";
+    stats.style.fontVariantNumeric = "tabular-nums";
+    stats.style.whiteSpace = "nowrap";
+    addChangeStat(stats, "+", item.additions, "var(--color-success-text,#2f9e44)");
+    addChangeStat(stats, "−", item.deletions, "var(--color-danger-text,#d9485f)");
+    row.appendChild(kind);
+    row.appendChild(name);
+    row.appendChild(stats);
+    card.appendChild(row);
+    appendChangeDiff(card, item);
+    return card;
+  }
+
+  function renderGitChanges(presentation) {
+    const branch = boundedString(presentation.branch);
+    const files = Array.isArray(presentation.files) ? presentation.files.slice(0, MAX_ITEMS) : [];
+    const total = Number.isInteger(presentation.files_total) && presentation.files_total >= 0
+      ? presentation.files_total
+      : files.length;
+    if (presentation.git_available === false) {
+      titleEl.textContent = "Changes unavailable";
+      stateEl.textContent = presentation.non_git_project === true ? "Non-Git" : "Git unavailable";
+      summaryEl.textContent = branch || "No reliable Git worktree presentation is available.";
+      return;
+    }
+    if (presentation.clean === true) {
+      titleEl.textContent = "No changes";
+      stateEl.textContent = "Clean";
+      summaryEl.textContent = branch || "Working tree is clean";
+      return;
+    }
+
+    titleEl.textContent = "Changed " + String(total) + (total === 1 ? " file" : " files");
+    const hasLineStats = Number.isInteger(presentation.additions) && presentation.additions >= 0
+      && Number.isInteger(presentation.deletions) && presentation.deletions >= 0;
+    stateEl.replaceChildren();
+    if (hasLineStats) {
+      addChangeStat(stateEl, "+", presentation.additions, "var(--color-success-text,#2f9e44)");
+      addChangeStat(stateEl, "−", presentation.deletions, "var(--color-danger-text,#d9485f)");
+      if (presentation.line_stats_partial === true) {
+        const partial = document.createElement("span");
+        partial.style.color = "var(--color-text-tertiary,var(--color-text-secondary,inherit))";
+        partial.style.fontWeight = "500";
+        partial.textContent = "partial";
+        stateEl.appendChild(partial);
+      }
+    } else {
+      stateEl.textContent = "Changes";
+    }
+    const parts = [];
+    if (branch) parts.push(branch);
+    if (total > files.length) parts.push(String(files.length) + " of " + String(total) + " files shown");
+    const counts = presentation.counts && typeof presentation.counts === "object" ? presentation.counts : null;
+    if (counts && Number.isInteger(counts.conflicted) && counts.conflicted > 0) {
+      parts.push(String(counts.conflicted) + " conflicts");
+    }
+    if (presentation.files_truncated === true || presentation.output_truncated === true || presentation.items_truncated === true || presentation.diff_truncated === true) {
+      parts.push("bounded view");
+    }
+    summaryEl.textContent = parts.length ? parts.join(" · ") : "Review the changed files below";
+
+    const safeCards = files.map(changeFileCard).filter(Boolean);
+    const initiallyVisible = Math.min(DEFAULT_VISIBLE_FILES, safeCards.length);
+    safeCards.forEach((card, index) => {
+      if (index >= initiallyVisible) card.style.display = "none";
+      cardsEl.appendChild(card);
+    });
+    if (safeCards.length > initiallyVisible) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.style.justifySelf = "stretch";
+      button.style.padding = "7px 11px";
+      button.style.borderRadius = "8px";
+      button.style.border = "1px solid color-mix(in srgb,var(--color-warning-text,#d99742) 28%,var(--color-border-secondary,rgba(127,127,127,.28)))";
+      button.style.background = "color-mix(in srgb,var(--color-warning-text,#d99742) 8%,transparent)";
+      button.style.color = "var(--color-warning-text,#d99742)";
+      button.style.fontWeight = "650";
+      button.style.cursor = "pointer";
+      button.style.textAlign = "left";
+      button.style.position = "sticky";
+      button.style.bottom = "0";
+      button.style.zIndex = "3";
+      let expanded = false;
+      const hiddenCount = safeCards.length - initiallyVisible;
+      const syncExpandedFiles = () => {
+        safeCards.slice(initiallyVisible).forEach((card) => {
+          card.style.display = expanded ? "block" : "none";
+        });
+        button.setAttribute("aria-expanded", expanded ? "true" : "false");
+        cardsEl.style.maxHeight = expanded ? "520px" : "";
+        cardsEl.style.overflowY = expanded ? "auto" : "visible";
+        cardsEl.style.paddingRight = expanded ? "3px" : "";
+        if (!expanded) cardsEl.scrollTop = 0;
+        button.textContent = expanded
+          ? "Show fewer files"
+          : "Show " + String(hiddenCount) + " more files";
+      };
+      syncExpandedFiles();
+      button.addEventListener("click", () => {
+        expanded = !expanded;
+        syncExpandedFiles();
+      });
+      cardsEl.appendChild(button);
+    }
   }
 
   function renderGitReview(presentation) {
@@ -468,7 +701,8 @@
     addRow(body, "stderr lines", Number.isInteger(item.stderr_lines) ? item.stderr_lines : null);
     addRow(body, "Error", boundedString(item.error_kind));
     addRow(body, "Recovery action", boundedString(item.recovery_kind));
-    addRow(body, "Re-observe with", boundedString(item.recovery_tool));
+    const suggestedCall = item.suggested_call && typeof item.suggested_call === "object" ? item.suggested_call : null;
+    addRow(body, "Suggested call", suggestedCall ? boundedString(suggestedCall.tool) : null);
     const progress = item.progress && typeof item.progress === "object" ? item.progress : null;
     if (progress) {
       addRow(body, "Progress state", boundedString(progress.state));
@@ -542,8 +776,8 @@
 
   function renderPresentation(presentation) {
     if (!presentation || typeof presentation !== "object" || presentation.version !== 1) {
-      stateEl.textContent = "result unavailable";
-      summaryEl.textContent = "No bounded WebCodex result presentation metadata was attached.";
+      stateEl.textContent = "changes unavailable";
+      summaryEl.textContent = "No bounded WebCodex presentation metadata was attached.";
       clearCards();
       return;
     }
@@ -640,14 +874,14 @@
     try {
       const result = await request("ui/initialize", {
         protocolVersion: APP_PROTOCOL,
-        appInfo: { name: "webcodex-result-app", title: "WebCodex Result", version: "1.1.0" },
+        appInfo: { name: "webcodex-changes-app", title: "WebCodex Changes", version: "2.1.0" },
         appCapabilities: {}
       });
       const protocol = result && typeof result === "object" ? boundedString(result.protocolVersion) : null;
       notify("ui/notifications/initialized", {});
       if (!receivedToolResult) {
         stateEl.textContent = "initialized";
-        summaryEl.textContent = "MCP Apps initialized" + (protocol ? " · " + protocol : "") + " · waiting for a supported result";
+        summaryEl.textContent = "MCP Apps initialized" + (protocol ? " · " + protocol : "") + " · waiting for bounded Changes";
       }
     } catch (error) {
       if (!receivedToolResult) {

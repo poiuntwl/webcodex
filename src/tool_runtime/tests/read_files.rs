@@ -61,23 +61,36 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
         schema["properties"]["max_result_bytes"]["default"],
         64 * 1024
     );
-    assert_eq!(
-        schema["properties"]["max_result_bytes"]["maximum"],
-        512 * 1024
-    );
-    assert!(schema["properties"]["max_result_bytes"]["description"]
+    assert_eq!(schema["properties"]["max_result_bytes"]["minimum"], 0);
+    assert!(schema["properties"]["max_result_bytes"]
+        .get("maximum")
+        .is_none());
+    let budget_description = schema["properties"]["max_result_bytes"]["description"]
         .as_str()
-        .unwrap()
-        .contains("protocol overlays"));
+        .unwrap();
+    assert!(budget_description.contains("runtime-clamped"));
+    assert!(budget_description.contains("protocol overlays"));
     assert!(validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
         "max_result_bytes": 128 * 1024
     })));
+    for max_result_bytes in [0, 1, 512 * 1024 + 1, 1024 * 1024] {
+        assert!(validates(&json!({
+            "project": "demo",
+            "items": [{"path": "a.rs"}],
+            "max_result_bytes": max_result_bytes
+        })));
+    }
     assert!(!validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
-        "max_result_bytes": 512 * 1024 + 1
+        "max_result_bytes": -1
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "items": [{"path": "a.rs"}],
+        "max_result_bytes": "65536"
     })));
     assert!(!validates(&json!({
         "project": "demo",
@@ -351,6 +364,11 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     assert_eq!(continuation["kind"], "read_range");
     assert_eq!(continuation["safe_cursor"], true);
     assert_eq!(continuation["snapshot_stable"], false);
+    assert_eq!(continuation["continuation_semantics"]["kind"], "page");
+    assert_eq!(
+        continuation["continuation_semantics"]["carrier"],
+        "position"
+    );
     assert_eq!(
         continuation["source_sha256"],
         format!("{:x}", Sha256::digest(content.as_bytes()))
@@ -1120,16 +1138,9 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(
-        result.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
-    assert_eq!(result.output["output_truncated"], true);
-    assert_eq!(result.output["truncation_reason"], "hard_result_cap");
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
@@ -1314,7 +1325,7 @@ async fn read_files_outer_recorder_observes_canonical_batch_before_primary_proje
 }
 
 #[tokio::test]
-async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
+async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
     use crate::tool_runtime::kernel::{
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
         ToolProtocolCapabilities, ToolTransport,
@@ -1470,61 +1481,13 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
 
     let result = task.await.unwrap().result.expect("model-facing result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(result.output["session_recovery"]["truncated"], true);
-    assert!(result.output["session_recovery"]["current_handoff"].is_object());
-    let recovery_validation = &result.output["session_recovery"]["current_handoff"]["validation"];
-    assert_eq!(recovery_validation["unresolved_failures"]["count"], 1);
-    assert_eq!(
-        recovery_validation["unresolved_failures"]["truncated"],
-        false
-    );
-    assert_eq!(recovery_validation["resolved_failures"]["count"], 0);
-    assert!(recovery_validation.get("events").is_none());
-    assert!(recovery_validation.get("latest").is_none());
-    assert!(recovery_validation.get("latest_success").is_none());
-    assert!(recovery_validation.get("latest_failure").is_none());
-    assert!(recovery_validation.get("parser").is_none());
-    let recovery_validation_bytes = serde_json::to_vec(recovery_validation).unwrap().len();
-    assert!(
-        recovery_validation_bytes <= 4096,
-        "current_handoff validation recovery must stay compact: {recovery_validation_bytes} bytes"
-    );
-    let unresolved = &recovery_validation["unresolved_failures"]["events"][0];
-    assert_eq!(unresolved["assertion_name"], assertion_name);
-    assert_eq!(
-        unresolved["identity"],
-        crate::tool_runtime::tool_audit::assertion_validation_identity(assertion_name)
-    );
-    assert!(unresolved.get("stdout_evidence").is_none());
-    assert!(unresolved.get("stderr_evidence").is_none());
-    assert!(unresolved.get("diagnostics").is_none());
-    assert!(
-        result.output["session_recovery"]["current_handoff"]["suggested_next_actions"]
-            .as_array()
-            .is_some_and(|actions| actions.iter().any(|action| {
-                action
-                    .as_str()
-                    .is_some_and(|action| action.contains("reuse the original assertion_name"))
-            }))
-    );
-    let recovery_events = result.output["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap();
-    assert!(recovery_events.len() < 20);
-    assert!(
-        serde_json::to_vec(recovery_events).unwrap().len()
-            <= crate::tool_runtime::session_context::SESSION_CONTINUITY_RECOVERY_EVENT_BYTES
-    );
-    let recovery_changed_paths = result.output["session_recovery"]["current_handoff"]
-        ["changed_paths"]
-        .as_array()
-        .unwrap();
-    assert_eq!(recovery_changed_paths.len(), 40);
-    assert!(recovery_changed_paths
-        .iter()
-        .filter_map(Value::as_str)
-        .all(|path| path.len() <= 512));
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+    ] {
+        assert!(result.output.get(field).is_none(), "{field}");
+    }
     assert_eq!(result.output["session_attention"]["requires_ack"], true);
     let attention_messages = result.output["session_attention"]["messages"]
         .as_array()
@@ -1627,14 +1590,10 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
     assert!(outcome.success);
     let result = outcome.result.expect("model-facing result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(
-        result.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
+
     assert_eq!(result.output["output_truncated"], true);
     assert_eq!(result.output["truncation_reason"], "hard_result_cap");
     let returned_count = result.output["returned_count"].as_u64().unwrap();

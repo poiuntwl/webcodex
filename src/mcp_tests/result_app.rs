@@ -18,13 +18,16 @@ fn presentation<'a>(call_result: &'a Value) -> &'a Value {
     &call_result["_meta"][super::super::presentation::MCP_PRESENTATION_META_KEY]
 }
 
-const RESULT_APP_TOOLS: [&str; 3] = ["list_jobs", "validation_summary", "git_review_summary"];
-const UNBOUND_RESULT_APP_TOOLS: [&str; 14] = [
+const RESULT_APP_TOOLS: [&str; 0] = [];
+const UNBOUND_RESULT_APP_TOOLS: [&str; 17] = [
+    "show_changes",
+    "list_jobs",
     "observe_jobs",
     "cargo_check",
     "cargo_test",
     "go_test",
-    "show_changes",
+    "validation_summary",
+    "git_review_summary",
     "cargo_fmt",
     "run_shell",
     "run_process",
@@ -119,6 +122,19 @@ fn result_tool_app_metadata_is_capability_scoped_compact_safe_and_merge_safe() {
             );
         }
 
+        assert_eq!(
+            tool(&enabled, "present_goal_plan")["_meta"]["ui"]["resourceUri"],
+            MCP_GOAL_PLAN_UI_RESOURCE_URI
+        );
+        assert_eq!(
+            tool(&enabled, "present_agent_continuation")["_meta"]["ui"]["resourceUri"],
+            MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
+        );
+        assert_eq!(
+            tool(&enabled, "present_work_result")["_meta"]["ui"]["resourceUri"],
+            MCP_WORK_RESULT_UI_RESOURCE_URI
+        );
+
         let disabled = mcp_tools_list_payload_with_compact_and_app(
             ModelSurface::FullOperatorRuntime,
             compact,
@@ -150,9 +166,15 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
     const PUBLIC_URL: &str = "https://self-host.example";
     let runtime =
         test_runtime_with_surface_and_public_url(ModelSurface::FullOperatorRuntime, PUBLIC_URL);
-    assert_eq!(MCP_RESULT_UI_RESOURCE_URI, "ui://webcodex/result/v3");
+    assert_eq!(MCP_RESULT_UI_RESOURCE_URI, "ui://webcodex/changes/v2");
+    assert_eq!(
+        MCP_WORK_RESULT_UI_RESOURCE_URI,
+        "ui://webcodex/work-result/v1"
+    );
+    assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/changes/v1"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v1"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v2"));
+    assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v3"));
     assert!(mcp_result_app_resource_meta(None)["ui"]
         .get("domain")
         .is_none());
@@ -169,15 +191,13 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
     let McpOutcome::Ok(ui_tools) = ui_tools else {
         panic!("expected UI-capable tools/list");
     };
-    for name in RESULT_APP_TOOLS {
-        assert_eq!(
-            tool(&ui_tools["result"], name)["_meta"]["ui"]["resourceUri"],
-            MCP_RESULT_UI_RESOURCE_URI
-        );
-        assert!(tool(&ui_tools["result"], name)["_meta"]
-            .get("ui/resourceUri")
-            .is_none());
-    }
+    assert_eq!(
+        tool(&ui_tools["result"], "present_work_result")["_meta"]["ui"]["resourceUri"],
+        MCP_WORK_RESULT_UI_RESOURCE_URI
+    );
+    assert!(tool(&ui_tools["result"], "present_work_result")["_meta"]
+        .get("ui/resourceUri")
+        .is_none());
     for name in UNBOUND_RESULT_APP_TOOLS {
         assert_ne!(
             tool(&ui_tools["result"], name)
@@ -216,14 +236,17 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
     let resources = resources["result"]["resources"].as_array().unwrap();
     assert!(resources
         .iter()
-        .any(|resource| resource["uri"] == MCP_COMPUTER_UI_RESOURCE_URI));
-    let result_resource = resources
+        .all(|resource| resource["uri"] != MCP_RESULT_UI_RESOURCE_URI));
+    assert!(resources
         .iter()
-        .find(|resource| resource["uri"] == MCP_RESULT_UI_RESOURCE_URI)
-        .expect("Result App resource");
-    assert_eq!(result_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
+        .any(|resource| resource["uri"] == MCP_COMPUTER_UI_RESOURCE_URI));
+    let work_resource = resources
+        .iter()
+        .find(|resource| resource["uri"] == MCP_WORK_RESULT_UI_RESOURCE_URI)
+        .expect("Work Result App resource");
+    assert_eq!(work_resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
     assert_eq!(
-        result_resource["_meta"],
+        work_resource["_meta"],
         json!({
             "ui": {
                 "prefersBorder": true,
@@ -365,9 +388,12 @@ async fn server_mcp_apps_setting_disables_only_app_presentation() {
     let McpOutcome::Ok(enabled) = enabled else {
         panic!("enabled MCP Apps tools/list failed");
     };
+    assert!(tool(&enabled["result"], "show_changes")
+        .pointer("/_meta/ui/resourceUri")
+        .is_none());
     assert_eq!(
-        tool(&enabled["result"], "list_jobs")["_meta"]["ui"]["resourceUri"],
-        MCP_RESULT_UI_RESOURCE_URI
+        tool(&enabled["result"], "present_work_result")["_meta"]["ui"]["resourceUri"],
+        MCP_WORK_RESULT_UI_RESOURCE_URI
     );
 
     let discover = handle_with_server_apps_enabled(
@@ -662,7 +688,7 @@ fn observe_presentation_preserves_wait_uncertainty_and_unknown_job_without_log_b
                 "success": false,
                 "error_kind": "unknown_job",
                 "recovery_kind": "reobserve",
-                "recovery_tool": "list_jobs",
+                "suggested_call": {"tool": "list_jobs", "arguments": {}},
                 "error": "unbounded internal error text"
             }
         ],
@@ -684,7 +710,10 @@ fn observe_presentation_preserves_wait_uncertainty_and_unknown_job_without_log_b
         "outcome_unknown"
     );
     assert_eq!(meta["items"][1]["error_kind"], "unknown_job");
-    assert_eq!(meta["items"][1]["recovery_tool"], "list_jobs");
+    assert_eq!(
+        meta["items"][1]["suggested_call"],
+        json!({"tool": "list_jobs", "arguments": {}})
+    );
     let serialized = serde_json::to_string(meta).unwrap();
     for forbidden in [
         "SECRET-STDOUT",
@@ -1110,8 +1139,8 @@ fn git_changes_presentation_preserves_canonical_workspace_states() {
             "clean": false,
             "counts": {"modified": 2, "added": 1, "deleted": 1, "renamed": 1, "copied": 0, "untracked": 1, "conflicted": 1, "staged": 2, "unstaged": 3},
             "files": [
-                {"path": "src/lib.rs", "status": "modified", "staged": true, "unstaged": true, "kind": "tracked"},
-                {"path": "src/new.rs", "old_path": "src/old.rs", "status": "renamed", "staged": true, "unstaged": false, "kind": "tracked"},
+                {"path": "src/lib.rs", "status": "modified", "staged": true, "unstaged": true, "kind": "tracked", "additions": 5, "deletions": 2},
+                {"path": "src/new.rs", "old_path": "src/old.rs", "status": "renamed", "staged": true, "unstaged": false, "kind": "tracked", "additions": 4, "deletions": 4},
                 {"path": "notes.txt", "status": "untracked", "staged": false, "unstaged": false, "kind": "untracked"},
                 {"path": "src/conflict.rs", "status": "conflicted", "staged": false, "unstaged": false, "kind": "conflicted"}
             ],
@@ -1121,7 +1150,9 @@ fn git_changes_presentation_preserves_canonical_workspace_states() {
             "files_limit": 200,
             "transport_safe": true,
             "output_truncated": false,
-            "truncation_reasons": []
+            "truncation_reasons": [],
+            "hunks": [{"path": "src/lib.rs", "hunks": [{"diff": "@@ -1 +1 @@\n-old\n+new", "truncated": false}]}],
+            "hunks_truncated": false
         }),
     );
     let dirty_meta = presentation(&dirty);
@@ -1134,6 +1165,39 @@ fn git_changes_presentation_preserves_canonical_workspace_states() {
     assert_eq!(dirty_meta["counts"]["conflicted"], 1);
     assert_eq!(dirty_meta["counts"]["renamed"], 1);
     assert_eq!(dirty_meta["files"][1]["old_path"], "src/old.rs");
+    assert_eq!(dirty_meta["files"][0]["additions"], 5);
+    assert_eq!(dirty_meta["files"][0]["deletions"], 2);
+    assert_eq!(dirty_meta["additions"], 9);
+    assert_eq!(dirty_meta["deletions"], 6);
+    assert_eq!(dirty_meta["line_stats_partial"], true);
+    assert_eq!(
+        dirty_meta["files"][0]["diff_hunks"][0]["diff"],
+        "@@ -1 +1 @@\n-old\n+new"
+    );
+
+    let stats_unavailable = projected_result(
+        "show_changes",
+        true,
+        json!({
+            "git_available": true,
+            "non_git_project": false,
+            "branch": "feature/no-numstat",
+            "status_observation": {"status": "observed", "reason_code": null, "exit_code": 0},
+            "clean": false,
+            "counts": {"modified": 1, "added": 0, "deleted": 0, "renamed": 0, "copied": 0, "untracked": 0, "conflicted": 0, "staged": 0, "unstaged": 1},
+            "files": [{"path": "src/lib.rs", "status": "modified", "kind": "tracked", "staged": false, "unstaged": true}],
+            "files_total": 1,
+            "files_returned": 1,
+            "files_truncated": false,
+            "files_limit": 200,
+            "transport_safe": true,
+            "output_truncated": false,
+            "truncation_reasons": []
+        }),
+    );
+    let stats_unavailable_meta = presentation(&stats_unavailable);
+    assert!(stats_unavailable_meta.get("additions").is_none());
+    assert!(stats_unavailable_meta.get("deletions").is_none());
 
     let non_git = projected_result(
         "show_changes",
@@ -1281,6 +1345,170 @@ fn git_changes_presentation_bounds_paths_and_excludes_raw_private_fields() {
             "leaked {forbidden}: {serialized}"
         );
     }
+}
+
+#[test]
+fn git_changes_presentation_bounds_diff_hunks_and_text() {
+    let oversized_diff = (0..120)
+        .map(|index| format!("+line-{index}-{}", "x".repeat(220)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hunks = (0..10)
+        .map(|_| json!({"diff": oversized_diff, "truncated": false}))
+        .collect::<Vec<_>>();
+    let framed = projected_result(
+        "show_changes",
+        true,
+        json!({
+            "git_available": true,
+            "non_git_project": false,
+            "branch": "feature/bounded-diff",
+            "status_observation": {"status": "observed", "reason_code": null, "exit_code": 0},
+            "clean": false,
+            "counts": {"modified": 1, "added": 0, "deleted": 0, "renamed": 0, "copied": 0, "untracked": 0, "conflicted": 0, "staged": 0, "unstaged": 1},
+            "files": [{"path": "src/lib.rs", "status": "modified", "kind": "tracked", "staged": false, "unstaged": true, "additions": 120, "deletions": 0}],
+            "files_total": 1,
+            "files_returned": 1,
+            "files_truncated": false,
+            "files_limit": 200,
+            "transport_safe": true,
+            "output_truncated": false,
+            "truncation_reasons": [],
+            "hunks": [{"path": "src/lib.rs", "hunks": hunks}],
+            "hunks_truncated": true
+        }),
+    );
+    let meta = presentation(&framed);
+    let projected_hunks = meta["files"][0]["diff_hunks"].as_array().unwrap();
+    assert!(projected_hunks.len() <= super::super::presentation::MAX_MCP_PRESENTATION_DIFF_HUNKS);
+    assert_eq!(meta["diff_truncated"], true);
+    for hunk in projected_hunks {
+        let diff = hunk["diff"].as_str().unwrap();
+        assert!(
+            diff.lines().count() <= super::super::presentation::MAX_MCP_PRESENTATION_DIFF_LINES
+        );
+        assert!(
+            diff.chars().count() <= super::super::presentation::MAX_MCP_PRESENTATION_DIFF_CHARS
+        );
+        assert_eq!(hunk["truncated"], true);
+    }
+
+    let exact_budget_hunks = (0..super::super::presentation::MAX_MCP_PRESENTATION_DIFF_HUNKS)
+        .map(|index| json!({"diff": format!("@@ -1 +1 @@\n-old-{index}\n+new-{index}"), "truncated": false}))
+        .collect::<Vec<_>>();
+    let exact_budget = projected_result(
+        "show_changes",
+        true,
+        json!({
+            "git_available": true,
+            "non_git_project": false,
+            "clean": false,
+            "files": [{"path": "src/lib.rs", "status": "modified", "kind": "tracked", "additions": 4, "deletions": 4}],
+            "files_total": 1,
+            "files_returned": 1,
+            "files_truncated": false,
+            "hunks": [{"path": "src/lib.rs", "hunks": exact_budget_hunks}],
+            "hunks_truncated": false
+        }),
+    );
+    assert!(presentation(&exact_budget).get("diff_truncated").is_none());
+}
+
+#[test]
+fn git_changes_presentation_distributes_diff_preview_across_presented_files() {
+    let files = (0..6)
+        .map(|index| {
+            json!({
+                "path": format!("src/file-{index}.rs"),
+                "status": "modified",
+                "kind": "tracked",
+                "additions": 1,
+                "deletions": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let hunks = (0..6)
+        .map(|index| {
+            json!({
+                "path": format!("src/file-{index}.rs"),
+                "hunks": [{
+                    "diff": format!("@@ -1 +1 @@\n-old-{index}\n+new-{index}"),
+                    "truncated": false
+                }]
+            })
+        })
+        .collect::<Vec<_>>();
+    let framed = projected_result(
+        "show_changes",
+        true,
+        json!({
+            "git_available": true,
+            "non_git_project": false,
+            "clean": false,
+            "files": files,
+            "files_total": 6,
+            "files_returned": 6,
+            "files_truncated": false,
+            "hunks": hunks,
+            "hunks_truncated": false
+        }),
+    );
+
+    let meta = presentation(&framed);
+    let projected_files = meta["files"].as_array().unwrap();
+    assert_eq!(projected_files.len(), 6);
+    for (index, file) in projected_files.iter().enumerate() {
+        let diff_hunks = file["diff_hunks"].as_array().unwrap();
+        assert_eq!(diff_hunks.len(), 1, "file {index} lost its diff preview");
+        assert!(diff_hunks[0]["diff"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("+new-{index}")));
+    }
+    assert!(meta.get("diff_truncated").is_none());
+}
+
+#[test]
+fn git_changes_presentation_matches_diff_hunks_before_display_path_truncation() {
+    let shared = format!("src/{}", "a".repeat(300));
+    let first_path = format!("{shared}-first.rs");
+    let second_path = format!("{shared}-second.rs");
+    let framed = projected_result(
+        "show_changes",
+        true,
+        json!({
+            "git_available": true,
+            "non_git_project": false,
+            "clean": false,
+            "files": [
+                {"path": first_path, "status": "modified", "kind": "tracked", "additions": 1, "deletions": 0},
+                {"path": second_path, "status": "modified", "kind": "tracked", "additions": 2, "deletions": 0}
+            ],
+            "files_total": 2,
+            "files_returned": 2,
+            "files_truncated": false,
+            "hunks": [{
+                "path": second_path,
+                "hunks": [{"diff": "@@ -1 +1 @@\n-old\n+second", "truncated": false}]
+            }],
+            "hunks_truncated": false
+        }),
+    );
+
+    let meta = presentation(&framed);
+    let files = meta["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["additions"], 1);
+    assert!(files[0].get("diff_hunks").is_none());
+    assert_eq!(files[1]["additions"], 2);
+    assert_eq!(
+        files[1]["diff_hunks"][0]["diff"],
+        "@@ -1 +1 @@\n-old\n+second"
+    );
+    assert_eq!(
+        files[0]["path"], files[1]["path"],
+        "fixture must exercise a display-path collision"
+    );
 }
 
 #[test]
@@ -1500,7 +1728,16 @@ fn result_app_html_is_display_only_and_uses_safe_dom_rendering() {
         "validation_summary",
         "git_changes",
         "git_review",
-        "Git changes",
+        "Changed ",
+        "Show ",
+        "Show fewer files",
+        "setAttribute(\"aria-expanded\"",
+        "520px",
+        "View diff",
+        "Hide diff",
+        "boundedDiffString",
+        "No bounded WebCodex presentation metadata was attached.",
+        "!presentation || typeof presentation !== \"object\" || presentation.version !== 1",
         "Committed review",
         "Cargo Test",
         "jobState",
@@ -1525,6 +1762,7 @@ fn result_app_html_is_display_only_and_uses_safe_dom_rendering() {
         "callServerTool",
         "ui/update-model-context",
         "ui/message",
+        "button.remove()",
         "<button",
     ] {
         assert!(
@@ -1599,6 +1837,8 @@ async fn register_job_runner(runtime: &ToolRuntime, auth: &crate::auth::AuthCont
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -1891,8 +2131,8 @@ async fn mcp_job_presentation_tracks_real_running_to_terminal_transition() {
         "unknown_job"
     );
     assert_eq!(
-        presentation(&unknown)["items"][0]["recovery_tool"],
-        "list_jobs"
+        presentation(&unknown)["items"][0]["suggested_call"],
+        json!({"tool": "list_jobs", "arguments": {}})
     );
 
     assert!(runtime.runner_registry.remove_job_record(&job_id).await);
@@ -2109,6 +2349,7 @@ fn observe_jobs_item_limit_matches_presentation_bound() {
             .collect(),
         tail_lines: 40,
         wait_secs: None,
+        wake_on: Default::default(),
     };
     assert!(matches!(parsed, ToolCall::ObserveJobs { .. }));
 }

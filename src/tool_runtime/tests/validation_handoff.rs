@@ -18,7 +18,7 @@ use crate::runner_protocol::{
 };
 use crate::tool_runtime::sessions::{SessionTransport, DEFAULT_MAX_EVENTS_PER_SESSION};
 use crate::tool_runtime::validation_events::validation_summary_for_session;
-use crate::tool_runtime::{ObserveJobsItem, ToolCall, ToolRuntime};
+use crate::tool_runtime::{ObserveJobsItem, ObserveJobsWakeOn, ToolCall, ToolRuntime};
 use serde_json::json;
 
 /// Fetch the `start_validation_job` request that the agent should have polled
@@ -279,6 +279,9 @@ fn assert_cargo_result_matches_schema(tool_name: &str, result: &crate::tool_runt
     use crate::tool_runtime::registry::output_schema_for_tool;
     use crate::tool_runtime::startup_brief::validate_schema_instance_for_test;
 
+    if result.output["promoted_to_job"] == true {
+        assert_observe_job_continuation(&result.output);
+    }
     let schema = output_schema_for_tool(tool_name);
     let value = serde_json::to_value(result).unwrap();
     assert!(
@@ -622,6 +625,7 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
             }],
             40,
             None,
+            ObserveJobsWakeOn::Change,
             Some(&auth),
         )
         .await;
@@ -853,6 +857,7 @@ async fn long_cargo_check_hands_off_with_immediately_observable_token() {
             }],
             40,
             None,
+            ObserveJobsWakeOn::Change,
             None,
         )
         .await;
@@ -969,6 +974,7 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
             }],
             40,
             None,
+            ObserveJobsWakeOn::Change,
             None,
         )
         .await;
@@ -1015,6 +1021,7 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
             }],
             200,
             None,
+            ObserveJobsWakeOn::Change,
             None,
         )
         .await;
@@ -1053,6 +1060,7 @@ async fn validation_command_starts_exactly_once_across_handoff() {
             runtime
                 .cargo_test_with_context(
                     project,
+                    None,
                     None,
                     None,
                     None,
@@ -1167,6 +1175,7 @@ async fn handoff_job_terminal_success_produces_passed_validation_summary() {
                         session_id: Some(session_id),
                         cwd: None,
                         filter: Some("sum".to_string()),
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -1696,6 +1705,7 @@ async fn partial_agent_status_is_conservative_while_delta_log_uses_frozen_valida
                         session_id: Some(session_id),
                         cwd: None,
                         filter: None,
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -2105,6 +2115,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 session_id: None,
                 cwd: None,
                 filter: None,
+                lib: None,
                 all_targets: None,
                 all_features: None,
                 no_default_features: None,
@@ -2139,6 +2150,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 session_id: None,
                 cwd: None,
                 filter: None,
+                lib: None,
                 all_targets: None,
                 all_features: None,
                 no_default_features: None,
@@ -2158,6 +2170,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 session_id: None,
                 cwd: None,
                 filter: None,
+                lib: None,
                 all_targets: None,
                 all_features: None,
                 no_default_features: None,
@@ -2177,6 +2190,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 session_id: None,
                 cwd: None,
                 filter: None,
+                lib: None,
                 all_targets: None,
                 all_features: None,
                 no_default_features: None,
@@ -2429,6 +2443,7 @@ async fn stop_job_stops_a_handoff_job() {
                         session_id: Some(session_id),
                         cwd: None,
                         filter: None,
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -2771,10 +2786,25 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
             "job_id": "job-123",
             "job_status": "running",
             "observation_token": "observation",
+            "continuation_semantics": {
+                "kind": "observe",
+                "carrier": "observation_token"
+            },
             "activity": {
                 "state": "working",
                 "phase": "validation_test",
                 "source": "validation_plan"
+            },
+            "continuation": {
+                "tool": "observe_jobs",
+                "arguments": {
+                    "items": [{
+                        "job_id": "job-123",
+                        "after_observation_token": "observation"
+                    }],
+                    "wait_secs": 60,
+                    "wake_on": "terminal"
+                }
             },
             "promoted_to_job": true,
             "command_started": true,
@@ -2801,6 +2831,8 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
         ("timeout failure", 5),
         ("missing observation_token", 6),
         ("missing activity", 7),
+        ("missing continuation", 8),
+        ("missing continuation semantics", 9),
     ] {
         let mut invalid = handoff.clone();
         let output = invalid["output"].as_object_mut().unwrap();
@@ -2828,6 +2860,12 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
             }
             7 => {
                 output.remove("activity");
+            }
+            8 => {
+                output.remove("continuation");
+            }
+            9 => {
+                output.remove("continuation_semantics");
             }
             _ => unreachable!(),
         }
@@ -2889,6 +2927,15 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
     let mut unknown_field = terminal.clone();
     unknown_field["output"]["unexpected"] = json!(true);
     assert!(!accepts(&unknown_field));
+    let mut terminal_with_continuation_semantics = terminal.clone();
+    terminal_with_continuation_semantics["output"]["continuation_semantics"] = json!({
+        "kind": "observe",
+        "carrier": "observation_token"
+    });
+    assert!(
+        !accepts(&terminal_with_continuation_semantics),
+        "non-promoted terminal result must not claim Job observation continuation semantics"
+    );
 
     let timeout = json!({
         "success": false,

@@ -213,6 +213,7 @@ fn allowed_tool_definition_categories_for_discovery_group(group: &str) -> &'stat
         "cleanup" => &["checkpoint", "cleanup"],
         "coding_agent" => &["coding_agent"],
         "agent_task" => &["agent_task"],
+        "agent_wait" => &["agent_wait"],
         "communication" => &["communication"],
         "edit" => &["artifact", "edit", "patch"],
         "file_transfer" => &["artifact"],
@@ -1204,6 +1205,8 @@ async fn release_intent_includes_list_jobs_but_not_run_shell_or_run_job() {
 }
 
 fn assert_recommended_flows_subset_of_manifest_tools(manifest: &Value, context: &str) {
+    use crate::tool_runtime::tool_definition::TOOL_RECOMMENDED_FLOWS;
+
     let tool_names: std::collections::BTreeSet<&str> = manifest["tools"]
         .as_array()
         .expect("manifest tools")
@@ -1229,6 +1232,100 @@ fn assert_recommended_flows_subset_of_manifest_tools(manifest: &Value, context: 
                 "{context}: recommended_flows[{flow_name}] references invisible tool {tool}; visible={tool_names:?}"
             );
         }
+
+        let canonical = TOOL_RECOMMENDED_FLOWS
+            .iter()
+            .find(|candidate| candidate.name == flow_name)
+            .unwrap_or_else(|| panic!("{context}: unknown canonical flow {flow_name}"));
+        let omitted = canonical
+            .tools
+            .iter()
+            .copied()
+            .filter(|tool| !tool_names.contains(tool))
+            .collect::<Vec<_>>();
+        if omitted.is_empty() {
+            assert_ne!(
+                flow["partial"], true,
+                "{context}: complete flow {flow_name}"
+            );
+            assert!(
+                flow.get("omitted_tools").is_none(),
+                "{context}: complete flow {flow_name}"
+            );
+            assert_eq!(flow["purpose"], canonical.manifest_purpose);
+        } else {
+            assert_eq!(flow["partial"], true, "{context}: partial flow {flow_name}");
+            assert_eq!(
+                flow["omitted_tools"],
+                json!(omitted),
+                "{context}: {flow_name}"
+            );
+            assert!(
+                flow["purpose"].as_str().is_some_and(
+                    |purpose| purpose.starts_with("Partial projection of the canonical flow")
+                ),
+                "{context}: partial flow purpose must identify projection: {flow}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_manifest_default_flows_follow_exact_vs_discovery_shape_end_to_end() {
+    let runtime = test_runtime();
+
+    let exact = runtime
+        .dispatch(
+            ToolCall::from_tool_name("tool_manifest", json!({"tool_name": "cargo_test"})).unwrap(),
+        )
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert!(exact.output.get("recommended_flows").is_none());
+
+    let exact_true = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "tool_manifest",
+                json!({
+                    "tool_name": "cargo_test",
+                    "include_recommended_flows": true
+                }),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(exact_true.success, "{:?}", exact_true.error);
+    assert!(exact_true.output["recommended_flows"]
+        .as_array()
+        .is_some_and(|flows| !flows.is_empty()));
+
+    let exact_false = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "tool_manifest",
+                json!({
+                    "tool_name": "cargo_test",
+                    "include_recommended_flows": false
+                }),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(exact_false.success, "{:?}", exact_false.error);
+    assert!(exact_false.output.get("recommended_flows").is_none());
+
+    for arguments in [
+        json!({}),
+        json!({"category": "validation"}),
+        json!({"intent": "coding"}),
+    ] {
+        let result = runtime
+            .dispatch(ToolCall::from_tool_name("tool_manifest", arguments).unwrap())
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output["recommended_flows"]
+            .as_array()
+            .is_some_and(|flows| !flows.is_empty()));
     }
 }
 
@@ -1447,6 +1544,99 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert_eq!(result.output["tools"][0]["availability"], "direct");
     assert!(result.output["tools"][0]["gateway_tool"].is_null());
     assert!(result.output["tools"][0].get("input_schema").is_none());
+}
+
+#[tokio::test]
+async fn tool_manifest_projects_canonical_execution_selection_for_exact_and_filtered_views() {
+    let runtime =
+        test_runtime().with_model_surface(crate::model_surface::ModelSurface::AdaptiveRuntime);
+    let expected = json!({
+        "form": "shell_command",
+        "lifetime": "runner",
+        "start": "sync_first",
+        "continuation": "observe_jobs",
+    });
+
+    let exact = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("run_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert_eq!(exact.output["contract"]["execution"], expected);
+    assert_eq!(exact.output["tools"][0]["execution"], expected);
+    assert_eq!(exact.output["contract"]["availability"], "direct");
+
+    let specs = registered_tool_specs();
+    let manifest_spec = spec_named(&specs, "tool_manifest");
+    let output_properties = output_schema_properties(manifest_spec);
+    let execution_schema = &output_properties["execution"];
+    assert_eq!(
+        execution_schema["properties"]["form"]["enum"],
+        json!([
+            "native_argv",
+            "typed_script",
+            "shell_command",
+            "structured_validation",
+            "persistent_shell_command"
+        ])
+    );
+    assert_eq!(
+        execution_schema["properties"]["lifetime"]["enum"],
+        json!(["runner", "supervisor", "session_shell"])
+    );
+    assert_eq!(
+        execution_schema["properties"]["start"]["enum"],
+        json!(["sync_first", "async_immediate", "existing_session"])
+    );
+    assert_eq!(
+        execution_schema["properties"]["continuation"]["enum"],
+        json!(["observe_jobs", "session_shell", "none"])
+    );
+
+    let mut sparse_exact = crate::tool_runtime::ToolResult::ok(exact.output.clone());
+    crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut sparse_exact);
+    assert_eq!(sparse_exact.output["execution"], expected);
+    assert_payload_keys_declared(
+        "tool_manifest sparse exact execution",
+        &sparse_exact.output,
+        output_properties,
+    );
+
+    let filtered = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: None,
+            category: Some("job".to_string()),
+            intent: Some("coding".to_string()),
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(filtered.success, "{:?}", filtered.error);
+    let run_shell = filtered.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "run_shell")
+        .expect("filtered run_shell");
+    assert_eq!(run_shell["execution"], expected);
+
+    let read_files = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("read_files".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(read_files.success, "{:?}", read_files.error);
+    assert!(read_files.output["contract"].get("execution").is_none());
+    assert!(read_files.output["tools"][0].get("execution").is_none());
 }
 
 #[tokio::test]
@@ -1670,6 +1860,16 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
             result.output["tools"][0]["gateway_tool"],
             gateway_tool.map_or(Value::Null, |name| json!(name))
         );
+        if tool_name == "run_script" {
+            let expected = json!({
+                "form": "typed_script",
+                "lifetime": "runner",
+                "start": "sync_first",
+                "continuation": "observe_jobs",
+            });
+            assert_eq!(result.output["contract"]["execution"], expected);
+            assert_eq!(result.output["tools"][0]["execution"], expected);
+        }
     }
 }
 
@@ -1833,10 +2033,12 @@ async fn unfiltered_tool_manifest_keeps_full_recommended_flows() {
         .to_string()
         .to_lowercase();
     assert!(
-        serialized.contains("run_shell")
-            && serialized.contains("shell semantics or one tightly related observation goal")
-            && serialized.contains("do not combine validation, commit, push, deploy, restart"),
-        "unfiltered flows must keep run_shell selection and effect-boundary guidance: {serialized}"
+        serialized.contains("runner-owned sync-first")
+            && serialized.contains("run_job is runner-owned immediate async")
+            && serialized.contains("run_detached_process is supervisor-owned immediate async")
+            && serialized
+                .contains("session_shell_exec continues an existing persistent session shell"),
+        "unfiltered flows must keep the canonical execution selection vocabulary: {serialized}"
     );
 }
 

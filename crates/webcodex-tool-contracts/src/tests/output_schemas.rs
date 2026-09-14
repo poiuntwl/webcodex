@@ -10,7 +10,7 @@ fn structured_execution_output(
     job_id: Option<&str>,
     job_status: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut instance = serde_json::json!({
         "success": promoted_to_job,
         "output": {
             "execution_source": execution_source,
@@ -36,7 +36,135 @@ fn structured_execution_output(
             "async_handoff_available": true
         },
         "error": null
-    })
+    });
+    if promoted_to_job {
+        instance["output"]["continuation"] = serde_json::json!({
+            "tool": "observe_jobs",
+            "arguments": {
+                "items": [{
+                    "job_id": job_id.expect("promoted Job id"),
+                    "after_observation_token": "observation"
+                }],
+                "wait_secs": 60,
+                "wake_on": "terminal"
+            }
+        });
+    }
+    if promoted_to_job {
+        instance["output"]["continuation_semantics"] = serde_json::json!({
+            "kind": "observe",
+            "carrier": "observation_token"
+        });
+    }
+    instance
+}
+
+#[test]
+fn t2_continuation_output_schemas_distinguish_cursor_kinds_and_carriers() {
+    let specs = registered_tool_specs();
+
+    let read_files = spec_named(&specs, "read_files");
+    let read_full = &read_files.output_schema["properties"]["output"]["anyOf"][0]["anyOf"][0];
+    let range_semantics = &read_full["properties"]["items"]["items"]["properties"]["continuation"]
+        ["properties"]["continuation_semantics"]["properties"];
+    assert_eq!(range_semantics["kind"]["const"], "page");
+    assert_eq!(range_semantics["carrier"]["const"], "position");
+
+    let variants = read_full["properties"]["continuation"]["oneOf"]
+        .as_array()
+        .unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for variant in variants {
+        let kind = variant["properties"]["kind"]["const"].as_str().unwrap();
+        let semantics = &variant["properties"]["continuation_semantics"]["properties"];
+        seen.insert((
+            kind.to_string(),
+            semantics["kind"]["const"].as_str().unwrap().to_string(),
+            semantics["carrier"]["const"].as_str().unwrap().to_string(),
+        ));
+    }
+    assert!(seen.contains(&(
+        "batch_items".to_string(),
+        "batch".to_string(),
+        "index".to_string()
+    )));
+    assert!(seen.contains(&(
+        "increase_result_budget".to_string(),
+        "refine".to_string(),
+        "none".to_string()
+    )));
+
+    let coding = spec_named(&specs, "coding_agent_observe");
+    let coding_semantics = &coding.output_schema["properties"]["output"]["properties"]
+        ["continuation_semantics"]["properties"];
+    assert_eq!(coding_semantics["kind"]["const"], "observe");
+    assert_eq!(coding_semantics["carrier"]["const"], "observation_token");
+
+    let session = spec_named(&specs, "observe_session_messages");
+    let session_semantics = &session.output_schema["properties"]["output"]["properties"]
+        ["continuation_semantics"]["properties"];
+    assert_eq!(session_semantics["kind"]["const"], "observe");
+    assert_eq!(session_semantics["carrier"]["const"], "observation_token");
+
+    let git = spec_named(&specs, "git_diff_hunks");
+    let recovery = &git.output_schema["properties"]["output"]["properties"]["recovery"];
+    let page_semantics = &recovery["properties"]["continuation"]["properties"]
+        ["continuation_semantics"]["anyOf"][0]["properties"];
+    assert_eq!(page_semantics["kind"]["const"], "page");
+    assert_eq!(page_semantics["carrier"]["const"], "opaque_token");
+    let refine_semantics = &recovery["properties"]["omitted_lines"]["properties"]
+        ["continuation_semantics"]["anyOf"][0]["properties"];
+    assert_eq!(refine_semantics["kind"]["const"], "refine");
+    assert_eq!(refine_semantics["carrier"]["const"], "none");
+}
+
+#[test]
+fn inspection_truthfulness_schemas_keep_typed_missing_and_canonical_diff_recovery() {
+    let specs = registered_tool_specs();
+
+    let search = spec_named(&specs, "search_project_texts");
+    let search_failure = &search.output_schema["properties"]["output"]["anyOf"][0]["anyOf"][0]
+        ["properties"]["items"]["items"]["properties"]["output"]["anyOf"][1];
+    assert!(search_failure["properties"]["reason_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("not_found")));
+    assert!(search_failure["properties"]["failure_stage"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("path_resolution")));
+    assert!(search_failure["properties"]["detail_code"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("not_found")));
+
+    let show_changes = spec_named(&specs, "show_changes");
+    let properties = &show_changes.output_schema["properties"]["output"]["properties"];
+    assert!(properties["hunks"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("source_completeness"));
+    let file = &properties["hunks"]["items"];
+    assert_eq!(file["additionalProperties"], true);
+    let hunk = &file["properties"]["hunks"]["items"];
+    assert_eq!(hunk["additionalProperties"], true);
+    assert!(hunk["properties"].get("truncated").is_none());
+    assert_eq!(hunk["required"], json!(["source_completeness"]));
+    assert_eq!(
+        hunk["properties"]["source_completeness"]["enum"],
+        json!(["complete", "unknown"])
+    );
+    let handoff = &properties["diff_review_handoff"]["properties"];
+    assert!(handoff.get("tool").is_none());
+    assert!(handoff.get("suggested_call").is_none());
+    assert_eq!(
+        handoff["recovery"]["properties"]["tool"]["const"],
+        "git_diff_hunks"
+    );
+    assert!(handoff["recovery"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Canonical parser-ready"));
 }
 
 fn continuation_feedback_subschema(specs: &[ToolSpec], tool: &str) -> Value {
@@ -105,6 +233,75 @@ fn agent_continuation_projection_schema_requires_strict_nullable_restart_recover
     assert!(recovery_variants
         .iter()
         .any(|variant| variant["type"] == "null"));
+}
+
+#[test]
+fn generic_agent_task_read_schema_never_exposes_attempt_fence_or_active_turn_token() {
+    let schema = output_schema_for_tool("read_agent_task");
+    let latest_attempt = &schema["properties"]["output"]["properties"]["task"]["properties"]
+        ["summary"]["properties"]["latest_attempt"]["anyOf"][0];
+    let properties = latest_attempt["properties"].as_object().unwrap();
+    for forbidden in [
+        "attempt_fence",
+        "consume_token",
+        "active_turn_wake_id",
+        "active_turn_consume_token",
+    ] {
+        assert!(
+            !properties.contains_key(forbidden),
+            "generic Task read leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn goal_plan_activity_schema_is_bounded_soft_and_payload_free() {
+    let schema = output_schema_for_tool("present_goal_plan");
+    let plan = &schema["properties"]["output"]["properties"]["goal_plan"];
+    assert_eq!(plan["properties"]["version"]["const"], 1);
+    assert!(plan["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "activity"));
+    let activity = &plan["properties"]["activity"];
+    assert_eq!(activity["additionalProperties"], false);
+    assert_eq!(
+        activity["properties"]["idle_threshold_ms"]["const"],
+        300_000
+    );
+    assert_eq!(
+        activity["properties"]["state"]["enum"],
+        json!(["active", "attention_needed", "unobserved", "not_applicable"])
+    );
+    let linked = activity["properties"]["linked_window_count"]["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["type"] == "integer")
+        .unwrap();
+    assert_eq!(linked["maximum"], 16);
+    let active = activity["properties"]["active_meaningful_request_count"]["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["type"] == "integer")
+        .unwrap();
+    assert_eq!(active["maximum"], 64);
+    let encoded = activity.to_string();
+    for forbidden in [
+        "client_window_key",
+        "openai/session",
+        "tool_arguments",
+        "tool_outputs",
+        "attempt_fence",
+        "consume_token",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "activity schema leaked {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -377,7 +574,7 @@ fn observe_jobs_failure_item_schema_closes_recovery_metadata() {
                 "output": null,
                 "error_kind": "unknown_job",
                 "recovery_kind": "reobserve",
-                "recovery_tool": "list_jobs",
+                "suggested_call": {"tool": "list_jobs", "arguments": {}},
                 "error": "unknown job"
             }],
             "wait": {
@@ -397,9 +594,18 @@ fn observe_jobs_failure_item_schema_closes_recovery_metadata() {
     invalid_kind["output"]["items"][0]["recovery_kind"] = json!("blind_retry");
     assert!(validate(&invalid_kind).is_err());
 
-    let mut invalid_tool = result;
-    invalid_tool["output"]["items"][0]["recovery_tool"] = json!("computer_list_windows");
+    let mut invalid_tool = result.clone();
+    invalid_tool["output"]["items"][0]["suggested_call"]["tool"] = json!("computer_list_windows");
     assert!(validate(&invalid_tool).is_err());
+
+    let mut inferred_scope = result.clone();
+    inferred_scope["output"]["items"][0]["suggested_call"]["arguments"] =
+        json!({"project": "agent:should-not-be-inferred:demo"});
+    assert!(validate(&inferred_scope).is_err());
+
+    let mut duplicate_alias = result;
+    duplicate_alias["output"]["items"][0]["recovery_tool"] = json!("list_jobs");
+    assert!(validate(&duplicate_alias).is_err());
 }
 
 #[test]
@@ -439,6 +645,10 @@ fn read_continuation_output_schemas_accept_actionable_recovery_shapes() {
                         "safe_cursor": true,
                         "source_sha256": "b".repeat(64),
                         "snapshot_stable": false,
+                        "continuation_semantics": {
+                            "kind": "page",
+                            "carrier": "position"
+                        },
                         "suggested_call": {
                             "tool": "read_files",
                             "arguments": {
@@ -460,6 +670,10 @@ fn read_continuation_output_schemas_accept_actionable_recovery_shapes() {
                     "safe_cursor": true,
                     "next_index": 1,
                     "recommended_order": "after_partial_item",
+                    "continuation_semantics": {
+                        "kind": "batch",
+                        "carrier": "index"
+                    },
                     "suggested_call": {
                         "tool": "read_files",
                         "arguments": {
@@ -497,6 +711,10 @@ fn read_continuation_output_schemas_accept_actionable_recovery_shapes() {
                     "safe_cursor": false,
                     "next_index": 0,
                     "suggested_max_result_bytes": 524288,
+                    "continuation_semantics": {
+                        "kind": "refine",
+                        "carrier": "none"
+                    },
                     "suggested_call": {
                         "tool": "read_files",
                         "arguments": {
@@ -617,6 +835,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "job_status",
         "observation_token",
         "effective_timeout_secs",
+        "continuation",
         "sync_wait_secs",
         "async_handoff_available",
     ] {
@@ -785,6 +1004,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "job_status",
         "observation_token",
         "effective_timeout_secs",
+        "continuation",
         "sync_wait_secs",
         "async_handoff_available",
     ] {
@@ -950,6 +1170,23 @@ fn key_tool_output_schemas_include_expected_fields() {
                     Some("completed"),
                 ),
             ),
+            ("non-promoted execution with continuation semantics", {
+                let mut instance = structured_execution_output(
+                    execution_source,
+                    "completed",
+                    true,
+                    true,
+                    false,
+                    true,
+                    None,
+                    None,
+                );
+                instance["output"]["continuation_semantics"] = serde_json::json!({
+                    "kind": "observe",
+                    "carrier": "observation_token"
+                });
+                instance
+            }),
             (
                 "not_started execution with command_started=true",
                 structured_execution_output(
@@ -1039,6 +1276,33 @@ fn key_tool_output_schemas_include_expected_fields() {
             output_schema_property(&specs, name, "observation_token")["maxLength"],
             webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN
         );
+        let continuation_semantics = output_schema_property(&specs, name, "continuation_semantics");
+        assert_eq!(
+            continuation_semantics["properties"]["kind"]["const"], "observe",
+            "{name} continuation kind"
+        );
+        assert_eq!(
+            continuation_semantics["properties"]["carrier"]["const"], "observation_token",
+            "{name} continuation carrier"
+        );
+        let continuation = output_schema_property(&specs, name, "continuation");
+        assert_eq!(continuation["properties"]["tool"]["const"], "observe_jobs");
+        assert_eq!(
+            continuation["properties"]["arguments"]["properties"]["wait_secs"]["maximum"],
+            60
+        );
+        assert_eq!(
+            continuation["properties"]["arguments"]["properties"]["wait_secs"]["const"],
+            60
+        );
+        assert_eq!(
+            continuation["properties"]["arguments"]["properties"]["wake_on"]["const"],
+            "terminal"
+        );
+        assert!(continuation["properties"]["arguments"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("wake_on")));
         assert!(
             has_output_field(name, "failure_kind"),
             "{name} missing failure_kind"
@@ -1196,6 +1460,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "project",
         "ssh_resource",
         "last_update_seq",
+        "continuation",
     ] {
         assert!(
             has_output_field("run_job", field),

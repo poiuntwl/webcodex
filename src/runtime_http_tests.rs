@@ -298,6 +298,8 @@ async fn register_import_agent_with_capabilities(
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -1481,7 +1483,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
         .iter()
         .find(|event| event["kind"] == "tool_call_finished")
         .expect("recorded REST model-facing result");
-    assert_eq!(finished["context_revision"], 1);
+    assert!(finished.get("context_revision").is_none());
 }
 
 #[tokio::test]
@@ -1670,6 +1672,26 @@ async fn http_tools_call_rejects_arguments_even_when_params_are_present() {
 }
 
 #[tokio::test]
+async fn http_tools_call_rejects_app_only_work_result_state() {
+    let (_tmp, service) = phase2_service();
+    let (status, body) = http_tool_call(
+        &service,
+        json!({
+            "tool": "work_result_state",
+            "params": {
+                "project": "agent:canonical:p",
+                "session_id": format!("wc_sess_{}", "1".repeat(32))
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("Work Result App state")));
+}
+
+#[tokio::test]
 async fn http_tools_call_generic_path_dispatches_representative_project_tools() {
     // One read-side and one write-side tool are sufficient to prove the generic
     // extraction -> ToolCall -> ToolRuntime -> HTTP ToolResult path.
@@ -1756,7 +1778,7 @@ async fn api_show_changes_with_session_id() {
             tokio::task::yield_now().await;
         };
         let stdout = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             crate::tool_runtime::framed_show_changes_test_block(
                 'S',
                 "## main\n?? README.md\n",
@@ -1771,6 +1793,11 @@ async fn api_show_changes_with_session_id() {
                 'T',
                 "",
                 "diff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes=0\n"
+            ),
+            crate::tool_runtime::framed_show_changes_test_block(
+                'N',
+                "",
+                "numstat_exit=0\nnumstat_truncated=0\nnumstat_bytes=0\n"
             )
         );
         registry

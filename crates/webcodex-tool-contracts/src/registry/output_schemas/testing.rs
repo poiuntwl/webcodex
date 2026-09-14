@@ -1,9 +1,11 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    cargo_test_count_assertion_schema, job_activity_schema, nullable_schema, open_object_schema,
+    cargo_test_count_assertion_schema, continuation_semantics_schema, job_activity_schema,
+    nullable_schema, observe_job_continuation_schema, open_object_schema,
     permission_decision_schema, schema_type, session_hint_schema,
 };
+use webcodex_core::runtime_contract::{ContinuationCarrier, ContinuationKind};
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -109,6 +111,14 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                     "description": "Current opaque observation token for the exact public Job snapshot returned by a promoted validation handoff."
                 }),
             ),
+            (
+                "continuation_semantics",
+                continuation_semantics_schema(
+                    ContinuationKind::Observe,
+                    ContinuationCarrier::ObservationToken,
+                    "A promoted structured validation continues by observing the exact Job stream; observation_token is a delta cursor, never retry authority or execution identity.",
+                ),
+            ),
             ("activity", job_activity_schema()),
             (
                 "promoted_to_job",
@@ -130,6 +140,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ("tool_failure", schema_type("boolean", "Whether rejection happened before execution.")),
             ("async_handoff_available", schema_type("boolean", "Whether this Runner supports validation Job handoff.")),
             ("detected_summary", open_object_schema("Current bounded validation/progress summary at the initial durable Job handoff; advisory only and never retry authority.")),
+            ("continuation", observe_job_continuation_schema()),
             ("session_hint", session_hint_schema()),
             ("permission", permission_decision_schema()),
     ];
@@ -287,7 +298,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "project", "command_summary", "cwd", "shell", "executor",
                             "execution_source", "purpose", "promoted_to_job", "terminal",
                             "command_started", "command_completed", "execution_state", "job_id",
-                            "job_status", "observation_token", "activity", "effective_timeout_secs", "sync_wait_secs",
+                            "job_status", "observation_token", "continuation_semantics", "activity",
+                            "continuation", "effective_timeout_secs", "sync_wait_secs",
                             "stdout_tail", "stderr_tail", "stdout_lines", "stderr_lines",
                             "stdout_truncated", "stderr_truncated"
                         ],
@@ -329,7 +341,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "failure_kind": {"enum": []},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "observation_token": {"enum": []},
+                            "continuation": {"enum": []},
+                            "continuation_semantics": {"enum": []}
                         }
                     }
                 }
@@ -351,7 +365,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "failure_kind": {"const": "timeout"},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "observation_token": {"enum": []},
+                            "continuation": {"enum": []},
+                            "continuation_semantics": {"enum": []}
                         }
                     }
                 }
@@ -373,7 +389,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "failure_kind": {"const": "outcome_unknown"},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "observation_token": {"enum": []},
+                            "continuation": {"enum": []},
+                            "continuation_semantics": {"enum": []}
                         }
                     }
                 }
@@ -395,7 +413,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "failure_kind": {"enum": ["permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "observation_token": {"enum": []},
+                            "continuation": {"enum": []},
+                            "continuation_semantics": {"enum": []}
                         }
                     }
                 }
@@ -417,7 +437,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "failure_kind": {"enum": ["validation_failed", "process_exit"]},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
-                            "observation_token": {"enum": []}
+                            "observation_token": {"enum": []},
+                            "continuation": {"enum": []},
+                            "continuation_semantics": {"enum": []}
                         }
                     }
                 }
@@ -436,6 +458,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
                             "observation_token": {"enum": []},
+                            "continuation": {"enum": []},
+                            "continuation_semantics": {"enum": []},
                             "passed": {"enum": []},
                             "promoted_to_job": {"enum": []},
                             "terminal": {"enum": []}

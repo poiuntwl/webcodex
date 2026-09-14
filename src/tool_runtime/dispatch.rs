@@ -976,7 +976,6 @@ impl ToolRuntime {
         start: Option<sessions::ToolCallStart>,
         tool_name: &str,
         error_kind: Option<&str>,
-        auth: Option<&AuthContext>,
         model_facing: bool,
         ack_observation: Option<&sessions::SessionAckObservation>,
         ack_requested: bool,
@@ -995,10 +994,7 @@ impl ToolRuntime {
             );
             add_session_hint(result, &self.sessions, session_id);
             if let Some(recorded) = recorded.as_ref() {
-                if session_context::add_session_context_continuity(result, recorded) {
-                    self.add_session_history_recovery(result, recorded, auth)
-                        .await;
-                }
+                session_context::add_session_context_continuity(result, recorded);
             }
             if let Some(ack) = ack_observation {
                 session_context::add_session_attention_projection(
@@ -1210,7 +1206,6 @@ impl ToolRuntime {
                 session_start,
                 call.tool_name(),
                 Some(session_context::SESSION_PROJECT_MISMATCH_KIND),
-                auth,
                 inner_model_facing_recording,
                 inner_ack_observation.as_ref(),
                 inner_ack_requested,
@@ -1282,7 +1277,6 @@ impl ToolRuntime {
                     session_start,
                     call.tool_name(),
                     Some(error_kind.as_str()),
-                    auth,
                     inner_model_facing_recording,
                     inner_ack_observation.as_ref(),
                     inner_ack_requested,
@@ -1312,7 +1306,6 @@ impl ToolRuntime {
                     session_start,
                     call.tool_name(),
                     Some("session_guard_denied"),
-                    auth,
                     inner_model_facing_recording,
                     inner_ack_observation.as_ref(),
                     inner_ack_requested,
@@ -1355,7 +1348,6 @@ impl ToolRuntime {
                     session_start,
                     call.tool_name(),
                     None,
-                    auth,
                     inner_model_facing_recording,
                     inner_ack_observation.as_ref(),
                     inner_ack_requested,
@@ -1393,7 +1385,6 @@ impl ToolRuntime {
                         session_start,
                         call.tool_name(),
                         None,
-                        auth,
                         inner_model_facing_recording,
                         inner_ack_observation.as_ref(),
                         inner_ack_requested,
@@ -1447,7 +1438,6 @@ impl ToolRuntime {
                 session_start,
                 tool_name,
                 None,
-                auth,
                 inner_model_facing_recording,
                 inner_ack_observation.as_ref(),
                 inner_ack_requested,
@@ -1470,7 +1460,9 @@ impl ToolRuntime {
                 scope: super::activity::activity_scope_from_auth(auth),
             });
         }
-        if result.success && super::observations::is_meaningful_activity_tool(tool_name) {
+        if result.success
+            && webcodex_tool_contracts::runtime_tool_activity_interaction(tool_name).is_meaningful()
+        {
             if let Ok((principal_kind, principal_id)) =
                 super::session_context::runtime_observation_principal(auth)
             {
@@ -1569,8 +1561,26 @@ impl ToolRuntime {
                 .await
             }
 
+            ToolCall::PresentWorkResult {
+                project,
+                session_id,
+            } => self.present_work_result(project, session_id, auth).await,
+
+            ToolCall::WorkResultState {
+                project,
+                session_id,
+            } => self.work_result_state(project, session_id, auth).await,
+
             call @ ToolCall::SessionHandoffSummary { .. } => {
-                self.dispatch_handoff_tool(call, auth).await
+                let context_continuity_capable = protocol_capabilities.context_continuity
+                    && super::tool_definition::runtime_tool_accepts_context_ack(call.tool_name());
+                self.dispatch_handoff_tool(
+                    call,
+                    auth,
+                    context_continuity_capable,
+                    trusted_recording_session_id,
+                )
+                .await
             }
 
             #[cfg(feature = "workspace-checkpoints")]
@@ -1809,9 +1819,9 @@ impl ToolRuntime {
 
             ToolCall::GetGoal { goal_id } => self.get_goal(auth, goal_id),
 
-            ToolCall::PresentGoalPlan { goal_id } => self.present_goal_plan(auth, goal_id),
+            ToolCall::PresentGoalPlan { goal_id } => self.present_goal_plan(auth, goal_id).await,
 
-            ToolCall::GoalPlanState { goal_id } => self.goal_plan_state(auth, goal_id),
+            ToolCall::GoalPlanState { goal_id } => self.goal_plan_state(auth, goal_id).await,
 
             ToolCall::ListGoals {
                 lifecycle,
@@ -1853,6 +1863,30 @@ impl ToolRuntime {
                     .await
             }
 
+            ToolCall::WaitForAgentEvents {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                events,
+                idempotency_key,
+            } => self.wait_for_agent_events(
+                auth,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                events,
+                idempotency_key,
+            ),
+
+            ToolCall::ReadAgentWait { wait_id } => self.read_agent_wait(auth, wait_id),
+
+            ToolCall::CancelAgentWait {
+                wait_id,
+                idempotency_key,
+            } => self.cancel_agent_wait(auth, wait_id, idempotency_key),
+
+            ToolCall::AgentWaitState { wait_id } => self.agent_wait_state(auth, wait_id),
+
             ToolCall::CreateAgentTask {
                 title,
                 instruction,
@@ -1890,6 +1924,21 @@ impl ToolRuntime {
                 assignee_agent_id,
                 idempotency_key,
             } => self.start_agent_task_attempt(auth, task_id, assignee_agent_id, idempotency_key),
+
+            ToolCall::StartAgentTaskEndpointContinuation {
+                task_id,
+                attempt_id,
+                assignee_agent_id,
+                attempt_fence,
+                attempt_controller_generation,
+            } => self.start_agent_task_endpoint_continuation(
+                auth,
+                task_id,
+                attempt_id,
+                assignee_agent_id,
+                attempt_fence,
+                attempt_controller_generation,
+            ),
 
             ToolCall::StartAgentTaskCodingRun {
                 project,
@@ -1930,6 +1979,8 @@ impl ToolRuntime {
                 assignee_agent_id,
                 attempt_fence,
                 attempt_controller_generation,
+                active_turn_wake_id,
+                active_turn_consume_token,
             } => self.heartbeat_agent_task_attempt(
                 auth,
                 task_id,
@@ -1937,6 +1988,8 @@ impl ToolRuntime {
                 assignee_agent_id,
                 attempt_fence,
                 attempt_controller_generation,
+                active_turn_wake_id,
+                active_turn_consume_token,
             ),
 
             ToolCall::CompleteAgentTaskAttempt {

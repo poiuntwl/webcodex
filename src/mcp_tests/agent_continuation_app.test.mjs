@@ -12,6 +12,7 @@ const assertAppCallId = call => assert.match(appCallId(call), /^wc_app_call_[0-9
 const wake = {
   wake_id: `wc_wake_${"4".repeat(32)}`, attempt_id: `wc_wake_attempt_${"5".repeat(32)}`,
   state: "claimed", revision: 2, dispatch_observation: null,
+  wait_id: null, wait_match_count: null, wait_match_sequence: null,
 };
 const projection = {
   version: 1, agent_id: `wc_dagent_${"1".repeat(32)}`, endpoint_id: `wc_endpoint_${"2".repeat(32)}`,
@@ -22,6 +23,20 @@ const projection = {
 const input = {
   agent_id: projection.agent_id, endpoint_id: projection.endpoint_id,
   expected_controller_generation: projection.controller_generation,
+};
+const waitId = `wc_agent_wait_${"6".repeat(32)}`;
+const waitTaskA = `wc_agent_task_${"7".repeat(32)}`;
+const waitTaskB = `wc_agent_task_${"8".repeat(32)}`;
+const waitingWait = {
+  wait_id: waitId, target_agent_id: projection.agent_id, state: "waiting", revision: 1,
+  created_at_unix_ms: 1000, updated_at_unix_ms: 1000,
+  triggered_at_unix_ms: null, resumed_at_unix_ms: null, cancelled_at_unix_ms: null,
+  source_count: 2, match_count: 0, match_sequence: 0,
+  sources: [
+    { ordinal: 0, kind: "agent_task_terminal", task_id: waitTaskA },
+    { ordinal: 1, kind: "agent_task_terminal", task_id: waitTaskB },
+  ],
+  matches: [],
 };
 const prepared = (current = wake, automatic_message = "Exact test continuation") => toolResult({
   agent_id: input.agent_id, endpoint_id: input.endpoint_id, controller_generation: input.expected_controller_generation,
@@ -49,6 +64,9 @@ function projectContinuationByPublishedSchema(value) {
       wake_id: value.wake.wake_id,
       state: value.wake.state,
       revision: value.wake.revision,
+      wait_id: value.wake.wait_id,
+      wait_match_count: value.wake.wait_match_count,
+      wait_match_sequence: value.wake.wait_match_sequence,
     },
     queued_delivery_count: value.queued_delivery_count,
     dispatch_observation: value.dispatch_observation,
@@ -65,6 +83,106 @@ async function boundView(options = { deliverToolMeta: false }) {
   await view.reply(view.calls("agent_continuation_bind").at(-1), toolResult({ agent_continuation: projection }));
   return view;
 }
+
+test("Agent Wait card tracks waiting -> triggered -> resuming -> resumed without a second dispatcher", async () => {
+  const view = app("mcp_agent_continuation_app.html");
+  await view.initialize();
+  view.toolInput({
+    ...input,
+    events: [
+      { kind: "agent_task_terminal", task_id: waitTaskA },
+      { kind: "agent_task_terminal", task_id: waitTaskB },
+    ],
+    idempotency_key: "wait-card",
+  });
+  const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
+  view.toolResult({ agent_wait: waitingWait, agent_continuation: quiet });
+  await view.reply(view.calls("agent_continuation_bind")[0], toolResult({ agent_continuation: quiet }));
+  assert.equal(view.nodes.waitSummary.hidden, false);
+  assert.equal(view.nodes.waitState.textContent, "Waiting");
+  assert.equal(view.nodes.waitMatches.textContent, "0");
+  assert.equal(view.nodes.status.textContent, "Waiting for selected event");
+
+  const triggeredWake = {
+    ...wake,
+    state: "pending",
+    revision: 2,
+    wait_id: waitId,
+    wait_match_count: 1,
+    wait_match_sequence: 1,
+  };
+  const triggeredProjection = { ...projection, wake: triggeredWake, queued_delivery_count: 0 };
+  await view.reply(
+    view.calls("agent_continuation_state").at(-1),
+    toolResult({ agent_continuation: triggeredProjection }),
+  );
+  const waitStateCall = view.calls("agent_wait_state").at(-1);
+  assert.ok(waitStateCall);
+  assert.deepEqual(businessArgs(waitStateCall), { wait_id: waitId });
+  const triggeredWait = {
+    ...waitingWait,
+    state: "triggered",
+    revision: 2,
+    updated_at_unix_ms: 2000,
+    triggered_at_unix_ms: 2000,
+    match_count: 1,
+    match_sequence: 1,
+    matches: [{
+      sequence: 1, kind: "agent_task_terminal", task_id: waitTaskA,
+      task_attempt_id: `wc_agent_task_attempt_${"9".repeat(32)}`,
+      terminal_task_state: "succeeded", occurred_at_unix_ms: 2000,
+    }],
+  };
+  await view.reply(waitStateCall, toolResult({ agent_wait: triggeredWait }));
+  assert.equal(view.nodes.waitState.textContent, "Triggered");
+  assert.equal(view.nodes.waitMatches.textContent, "1");
+  assert.equal(view.nodes.status.textContent, "Triggered · resuming…");
+
+  await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
+  await view.reply(view.calls("agent_continuation_wake_prepare").at(-1), prepared());
+  assert.equal(hostMessages(view).length, 1);
+  await view.reply(hostMessages(view)[0], {});
+  await view.reply(view.calls("agent_continuation_wake_finish").at(-1), toolResult({}));
+
+  await view.fireTimers(3000);
+  const resumedProjection = { ...quiet, dispatch_observation: "continuation_consumed" };
+  await view.reply(
+    view.calls("agent_continuation_state").at(-1),
+    toolResult({ agent_continuation: resumedProjection }),
+  );
+  const resumedStateCall = view.calls("agent_wait_state").at(-1);
+  await view.reply(resumedStateCall, toolResult({ agent_wait: {
+    ...triggeredWait,
+    state: "resumed",
+    revision: 3,
+    updated_at_unix_ms: 3000,
+    resumed_at_unix_ms: 3000,
+  } }));
+  assert.equal(view.nodes.waitState.textContent, "Resumed");
+  assert.equal(view.nodes.status.textContent, "Wait resumed");
+  assert.equal(hostMessages(view).length, 1);
+});
+
+test("Agent Wait card never filters a competing non-Wait Agent Wake", async () => {
+  const view = app("mcp_agent_continuation_app.html");
+  await view.initialize();
+  view.toolInput({ ...input, events: [{ kind: "agent_task_terminal", task_id: waitTaskA }], idempotency_key: "wait-competition" });
+  const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
+  const oneSourceWait = { ...waitingWait, source_count: 1, sources: waitingWait.sources.slice(0, 1) };
+  view.toolResult({ agent_wait: oneSourceWait, agent_continuation: quiet });
+  await view.reply(view.calls("agent_continuation_bind")[0], toolResult({ agent_continuation: quiet }));
+
+  const inboxWake = { ...wake, state: "pending", revision: 1 };
+  const competing = { ...projection, wake: inboxWake, queued_delivery_count: 1 };
+  await view.reply(
+    view.calls("agent_continuation_state").at(-1),
+    toolResult({ agent_continuation: competing }),
+  );
+  await view.reply(view.calls("agent_wait_state").at(-1), toolResult({ agent_wait: oneSourceWait }));
+  await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
+  await view.reply(view.calls("agent_continuation_wake_prepare").at(-1), prepared());
+  assert.equal(hostMessages(view).length, 1, "Wait presentation must reuse the global Agent dispatcher for competing Wakes");
+});
 
 for (const outcome of ["success", "error", "timeout"]) {
   for (const early of [true, false]) {
@@ -260,10 +378,25 @@ const replacementOutput = (from = projection) => {
         endpoint_id: successor.endpoint_id, controller_generation: successor.controller_generation,
         reason: "endpoint_expired",
       },
+      successor_needs_recovery: false,
     },
     replayed: false, state_changed: true,
   };
 };
+
+const intermediateReplacementOutput = (from = projection) => {
+  const output = replacementOutput(from);
+  output.agent_continuation = null;
+  output.endpoint_recovery.successor_needs_recovery = true;
+  return output;
+};
+
+const successorIdentity = (from, output) => ({
+  ...from,
+  endpoint_id: output.endpoint_recovery.replacement.endpoint_id,
+  controller_generation: output.endpoint_recovery.replacement.controller_generation,
+  host_binding: { bound: false },
+});
 
 test("reopened expired card probes replacement, binds the successor, and dispatches once", async () => {
   const view = app("mcp_agent_continuation_app.html");
@@ -315,6 +448,60 @@ test("reopened expired card probes replacement, binds the successor, and dispatc
   assert.equal(view.calls("agent_continuation_unbind")[0].params.arguments.endpoint_id, current.endpoint_id);
 });
 
+test("expired successor recovery advances exact one-hop selectors until a live successor", async () => {
+  const view = await boundView();
+  await view.reject(view.calls("agent_continuation_state")[0]);
+  let predecessor = projection;
+  for (let hop = 0; hop < 2; hop++) {
+    const recovery = view.calls("agent_continuation_recover_endpoint")[hop];
+    assert.deepEqual(businessArgs(recovery), {
+      agent_id: predecessor.agent_id,
+      endpoint_id: predecessor.endpoint_id,
+      expected_controller_generation: predecessor.controller_generation,
+      binding_id: bindingId(view),
+    });
+    const intermediate = intermediateReplacementOutput(predecessor);
+    await view.reply(recovery, toolResult(intermediate));
+    predecessor = successorIdentity(predecessor, intermediate);
+    assert.equal(view.calls("agent_continuation_bind").length, 1, "expired intermediate successors must not be bootstrapped or bound");
+  }
+  const finalRecovery = view.calls("agent_continuation_recover_endpoint")[2];
+  assert.deepEqual(businessArgs(finalRecovery), {
+    agent_id: predecessor.agent_id,
+    endpoint_id: predecessor.endpoint_id,
+    expected_controller_generation: predecessor.controller_generation,
+    binding_id: bindingId(view),
+  });
+  const final = replacementOutput(predecessor);
+  await view.reply(finalRecovery, toolResult(final));
+  const successorBind = view.calls("agent_continuation_bind")[1];
+  assert.deepEqual(businessArgs(successorBind), {
+    agent_id: final.agent_continuation.agent_id,
+    endpoint_id: final.agent_continuation.endpoint_id,
+    expected_controller_generation: final.agent_continuation.controller_generation,
+    binding_id: bindingId(view),
+  });
+});
+
+test("expired successor recovery stops after eight exact one-hop transitions", async () => {
+  const view = await boundView();
+  await view.reject(view.calls("agent_continuation_state")[0]);
+  let predecessor = projection;
+  for (let hop = 0; hop < 8; hop++) {
+    const recovery = view.calls("agent_continuation_recover_endpoint")[hop];
+    assert.ok(recovery, `missing bounded recovery hop ${hop + 1}`);
+    assert.equal(recovery.params.arguments.endpoint_id, predecessor.endpoint_id);
+    assert.equal(recovery.params.arguments.expected_controller_generation, predecessor.controller_generation);
+    const intermediate = intermediateReplacementOutput(predecessor);
+    await view.reply(recovery, toolResult(intermediate));
+    predecessor = successorIdentity(predecessor, intermediate);
+  }
+  assert.equal(view.calls("agent_continuation_recover_endpoint").length, 8);
+  assert.equal(view.calls("agent_continuation_bind").length, 1);
+  assert.equal(view.nodes.binding.textContent, "Unavailable");
+  assert.equal(view.nodes.status.textContent, "Connection unavailable. Queued work is preserved.");
+});
+
 test("expiry replacement retries a lost response with the same selector and accepts one successor", async () => {
   const view = await boundView();
   await view.reject(view.calls("agent_continuation_state")[0]);
@@ -361,7 +548,7 @@ test("healthy heartbeat permits a later expiry probe on the same long-lived card
   await view.reject(view.calls("agent_continuation_state")[0]);
   await view.reply(view.calls("agent_continuation_recover_endpoint")[0], toolResult({
     agent_continuation: projection,
-    endpoint_recovery: { kind: "controller_live", replacement: null },
+    endpoint_recovery: { kind: "controller_live", replacement: null, successor_needs_recovery: false },
   }));
   assert.equal(view.calls("agent_continuation_bind").length, 1, "a live probe cannot replace a controller");
   await view.fireTimers(3000);
@@ -393,19 +580,30 @@ for (const method of ["ui/resource-teardown", "pagehide", "beforeunload"]) {
   });
 }
 
-test("input-only background carrier heartbeats and reconciles immediately on foreground", async () => {
+test("input-only background carrier keeps bounded heartbeat cadence", async () => {
+  const view = await boundView();
+  const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
+  await view.visibility(true);
+  await view.reply(view.calls("agent_continuation_state")[0], toolResult({ agent_continuation: quiet }));
+  assert.equal(view.calls("agent_continuation_wake_acquire").length, 0);
+  await view.fireTimers(15000);
+  assert.equal(view.calls("agent_continuation_state").length, 2);
+});
+
+test("input-only hidden carrier acquires prepares and dispatches exactly once", async () => {
   const view = await boundView();
   await view.visibility(true);
   await view.reply(view.calls("agent_continuation_state")[0], toolResult({ agent_continuation: projection }));
-  await view.fireTimers(15000);
-  assert.equal(view.calls("agent_continuation_state").length, 2);
-  await view.reply(view.calls("agent_continuation_state")[1], toolResult({ agent_continuation: projection }));
-  assert.equal(view.calls("agent_continuation_wake_acquire").length, 0);
-  await view.visibility(false);
-  assert.equal(view.calls("agent_continuation_state").length, 3);
-  await view.reply(view.calls("agent_continuation_state")[2], toolResult({ agent_continuation: projection }));
   assert.equal(view.calls("agent_continuation_wake_acquire").length, 1);
-  assert.equal(view.nodes.status.textContent, "Continuing queued work…");
+  await view.reply(view.calls("agent_continuation_wake_acquire")[0], toolResult({ wake }));
+  assert.equal(view.calls("agent_continuation_wake_prepare").length, 1);
+  await view.reply(view.calls("agent_continuation_wake_prepare")[0], prepared());
+  assert.equal(hostMessages(view).length, 1);
+  await view.reply(hostMessages(view)[0], {});
+  const finish = view.calls("agent_continuation_wake_finish")[0];
+  assert.equal(finish.params.arguments.outcome, "dispatch_accepted");
+  await view.reply(finish, toolResult({}));
+  assert.equal(hostMessages(view).length, 1);
 });
 
 test("input-only dispatch never displays its private binding or consume envelope", async () => {
@@ -455,24 +653,56 @@ for (const outcome of ["success", "error", "timeout"]) {
   }
 }
 
-for (const stage of ["acquire", "prepare"]) {
-  test(`backgrounding during ${stage} does not dispatch a Host message`, async () => {
-    const view = await boundView();
-    await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
-    const acquisition = view.calls("agent_continuation_wake_acquire").at(-1);
-    if (stage === "acquire") await view.visibility(true);
-    await view.reply(acquisition, toolResult({ wake }));
-    if (stage === "prepare") {
-      await view.visibility(true);
-      await view.reply(view.calls("agent_continuation_wake_prepare").at(-1), prepared());
-      assert.equal(hostMessages(view).length, 0);
-      assert.equal(view.calls("agent_continuation_wake_finish").at(-1).params.arguments.outcome, "delivery_unknown");
-    } else {
-      assert.equal(view.calls("agent_continuation_wake_prepare").length, 0);
-    }
-    assert.equal(hostMessages(view).length, 0);
-  });
-}
+test("visible to hidden transition during prepare still dispatches exactly once", async () => {
+  const view = await boundView();
+  await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+  await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
+  const prepareCall = view.calls("agent_continuation_wake_prepare").at(-1);
+  await view.visibility(true);
+  await view.reply(prepareCall, prepared());
+  assert.equal(hostMessages(view).length, 1);
+  await view.reply(hostMessages(view)[0], {});
+  assert.equal(view.calls("agent_continuation_wake_finish").at(-1).params.arguments.outcome, "dispatch_accepted");
+  assert.equal(hostMessages(view).length, 1);
+});
+
+test("hidden to visible transition during Host dispatch never duplicates ui/message", async () => {
+  const view = await boundView();
+  await view.visibility(true);
+  await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+  await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
+  await view.reply(view.calls("agent_continuation_wake_prepare").at(-1), prepared());
+  assert.equal(hostMessages(view).length, 1);
+  await view.visibility(false);
+  assert.equal(hostMessages(view).length, 1);
+  await view.reply(hostMessages(view)[0], {});
+  assert.equal(view.calls("agent_continuation_wake_finish").at(-1).params.arguments.outcome, "dispatch_accepted");
+  assert.equal(hostMessages(view).length, 1);
+});
+
+test("teardown before a prepare response never dispatches a Host message", async () => {
+  const view = await boundView();
+  await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+  await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
+  const prepareCall = view.calls("agent_continuation_wake_prepare").at(-1);
+  await view.teardown();
+  await view.reply(prepareCall, prepared());
+  assert.equal(hostMessages(view).length, 0);
+});
+
+test("Host dispatch rejection after prepare is unknown and never resent", async () => {
+  const view = await boundView();
+  await view.visibility(true);
+  await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+  await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
+  await view.reply(view.calls("agent_continuation_wake_prepare").at(-1), prepared());
+  assert.equal(hostMessages(view).length, 1);
+  await view.reject(hostMessages(view)[0]);
+  const finish = view.calls("agent_continuation_wake_finish").at(-1);
+  assert.equal(finish.params.arguments.outcome, "delivery_unknown");
+  await view.reply(finish, toolResult({}));
+  assert.equal(hostMessages(view).length, 1);
+});
 
 test("Host dispatch timeout is finished as unknown and the same Attempt is never resent", async () => {
   const view = await boundView();
@@ -699,6 +929,9 @@ test("published outputSchema projection preserves restart recovery and triggers 
       wake_id: projection.wake.wake_id,
       state: projection.wake.state,
       revision: projection.wake.revision,
+      wait_id: projection.wake.wait_id,
+      wait_match_count: projection.wake.wait_match_count,
+      wait_match_sequence: projection.wake.wait_match_sequence,
     },
     recovery: { kind: "host_binding_missing_in_process" },
   };
@@ -892,7 +1125,7 @@ test("bind response-loss retries are bounded even with repeated bootstrap notifi
   assert.equal(view.calls("agent_continuation_recover_endpoint").length, 1);
   await view.reply(recovery, toolResult({
     agent_continuation: projection,
-    endpoint_recovery: { kind: "controller_live", replacement: null },
+    endpoint_recovery: { kind: "controller_live", replacement: null, successor_needs_recovery: false },
     replayed: false,
     state_changed: false,
   }));

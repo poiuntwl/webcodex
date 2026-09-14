@@ -495,13 +495,32 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
         import["_meta"]["openai/fileParams"],
         json!(["openaiFileIdRefs"])
     );
+    let show_changes = compact_tools
+        .iter()
+        .find(|tool| tool["name"] == "show_changes")
+        .expect("missing show_changes");
+    assert!(
+        show_changes.pointer("/_meta/ui/resourceUri").is_none(),
+        "ordinary show_changes must not create a Work/Changes App card"
+    );
+    let present_work_result = compact_tools
+        .iter()
+        .find(|tool| tool["name"] == "present_work_result")
+        .expect("missing present_work_result");
+    assert_eq!(
+        present_work_result["_meta"]["ui"]["resourceUri"], MCP_WORK_RESULT_UI_RESOURCE_URI,
+        "explicit Work presentation entry must retain its App binding"
+    );
     let list_jobs = compact_tools
         .iter()
         .find(|tool| tool["name"] == "list_jobs")
         .expect("missing list_jobs");
-    assert_eq!(
-        list_jobs["_meta"]["ui"]["resourceUri"], MCP_RESULT_UI_RESOURCE_URI,
-        "compact projection lost MCP App metadata for list_jobs"
+    assert_ne!(
+        list_jobs
+            .pointer("/_meta/ui/resourceUri")
+            .and_then(Value::as_str),
+        Some(MCP_RESULT_UI_RESOURCE_URI),
+        "routine list_jobs discovery must not create a Changes App card"
     );
     let observe_jobs = compact_tools
         .iter()
@@ -512,7 +531,7 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
             .pointer("/_meta/ui/resourceUri")
             .and_then(Value::as_str),
         Some(MCP_RESULT_UI_RESOURCE_URI),
-        "routine observe_jobs must remain unbound from the Result App"
+        "routine observe_jobs must remain unbound from the Changes App"
     );
     let tools = compact_tools;
     let names: Vec<&str> = tools
@@ -591,6 +610,7 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
         "import_conversation_files_to_project",
         "export_project_artifact",
         "read_project_artifact",
+        "present_work_result"
     ] {
         assert!(
             names.contains(&promoted),
@@ -782,7 +802,20 @@ async fn adaptive_runtime_gateway_uses_long_tail_target_checkpoint_policy_once()
         None,
     )
     .await;
-    assert!(matches!(gateway_read, McpOutcome::Ok(_)));
+    let McpOutcome::Ok(value) = gateway_read else {
+        panic!("gateway parsing failed");
+    };
+    let output = &value["result"]["structuredContent"]["output"];
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+    ] {
+        assert!(
+            output.get(field).is_none(),
+            "target policy ignored: {field}"
+        );
+    }
     assert_eq!(
         runtime
             .sessions
@@ -820,6 +853,71 @@ async fn adaptive_runtime_gateway_uses_long_tail_target_checkpoint_policy_once()
             .context_revision(&gateway_session.session_id),
         Some(1),
         "one checkpoint-capable gateway invocation must allocate exactly one revision"
+    );
+}
+
+#[tokio::test]
+async fn direct_and_gateway_routes_preserve_result_continuation_semantics() {
+    let expected = json!({
+        "kind": "observe",
+        "carrier": "observation_token"
+    });
+
+    let direct_runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let direct_session = direct_runtime
+        .sessions
+        .start_session(None, Some("direct continuation semantics".to_string()));
+    let direct = handle_mcp_request(
+        &direct_runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7222)),
+            mcp_2026_params(json!({
+                "name": "observe_session_messages",
+                "arguments": {"session_id": direct_session.session_id}
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(direct_value) = direct else {
+        panic!("Full Operator direct observation must succeed");
+    };
+    let direct_structured = &direct_value["result"]["structuredContent"];
+    assert_eq!(direct_structured["success"], true, "{direct_value}");
+    assert_eq!(
+        direct_structured["output"]["continuation_semantics"],
+        expected
+    );
+
+    let gateway_runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let gateway_session = gateway_runtime
+        .sessions
+        .start_session(None, Some("gateway continuation semantics".to_string()));
+    let gateway = handle_mcp_request(
+        &gateway_runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7223)),
+            mcp_2026_params(json!({
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {
+                    "tool": "observe_session_messages",
+                    "arguments": {"session_id": gateway_session.session_id}
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(gateway_value) = gateway else {
+        panic!("Adaptive Runtime gateway observation must succeed");
+    };
+    let gateway_structured = &gateway_value["result"]["structuredContent"];
+    assert_eq!(gateway_structured["success"], true, "{gateway_value}");
+    assert_eq!(
+        gateway_structured["output"]["continuation_semantics"],
+        expected
     );
 }
 
@@ -1031,7 +1129,7 @@ async fn adaptive_runtime_tool_manifest_exact_projection_is_sparse_and_routes_ex
             tool_name: Some("read_files".to_string()),
             category: None,
             intent: None,
-            include_recommended_flows: true,
+            include_recommended_flows: false,
             include_risk_summary: true,
         })
         .await;
@@ -1063,6 +1161,11 @@ async fn adaptive_runtime_tool_manifest_exact_projection_is_sparse_and_routes_ex
     assert_eq!(output["input_schema"]["type"], "object");
     assert!(output["input_schema"]["properties"]["items"].is_object());
     assert_eq!(output["effect"], "observe");
+    assert!(output.get("recommended_flows").is_none());
+    assert!(output["risk"].is_string());
+    assert!(output["approval"].is_string());
+    assert!(output["idempotency"].is_string());
+
     assert!(output["authority"]["scopes"].is_array());
     assert!(output["annotations"].is_object());
     for redundant in [
@@ -1090,6 +1193,54 @@ async fn adaptive_runtime_tool_manifest_exact_projection_is_sparse_and_routes_ex
         sparse_bytes < canonical_bytes,
         "{canonical_bytes} -> {sparse_bytes}"
     );
+
+    let exact_flow_opt_in = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7240)),
+            mcp_2026_params(json!({
+                "name": "tool_manifest",
+                "arguments": {
+                    "tool_name": "cargo_test",
+                    "include_recommended_flows": true
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = exact_flow_opt_in else {
+        panic!("adaptive tool_manifest exact flow opt-in must succeed");
+    };
+    let flow_output = &value["result"]["structuredContent"]["output"];
+    assert_eq!(flow_output["name"], "cargo_test");
+    assert!(flow_output["recommended_flows"]
+        .as_array()
+        .is_some_and(|flows| !flows.is_empty()));
+
+    let exact_flow_opt_out = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(72401)),
+            mcp_2026_params(json!({
+                "name": "tool_manifest",
+                "arguments": {
+                    "tool_name": "cargo_test",
+                    "include_recommended_flows": false
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = exact_flow_opt_out else {
+        panic!("adaptive tool_manifest exact flow opt-out must succeed");
+    };
+    assert!(value["result"]["structuredContent"]["output"]
+        .get("recommended_flows")
+        .is_none());
 
     let gateway = handle_mcp_request(
         &runtime,

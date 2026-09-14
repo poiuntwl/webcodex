@@ -41,6 +41,83 @@ fn from_tool_name_parses_unit_tools_with_empty_object() {
 }
 
 #[test]
+fn heartbeat_agent_task_attempt_parses_optional_active_turn_proof() {
+    let base = json!({
+        "task_id": format!("wc_agent_task_{}", "1".repeat(32)),
+        "attempt_id": format!("wc_agent_task_attempt_{}", "2".repeat(32)),
+        "assignee_agent_id": format!("wc_dagent_{}", "3".repeat(32)),
+        "attempt_fence": format!("wc_agent_task_fence_{}", "4".repeat(32)),
+        "attempt_controller_generation": 7,
+    });
+    let ordinary = ToolCall::from_tool_name("heartbeat_agent_task_attempt", base.clone()).unwrap();
+    assert!(matches!(
+        ordinary,
+        ToolCall::HeartbeatAgentTaskAttempt {
+            active_turn_wake_id: None,
+            active_turn_consume_token: None,
+            ..
+        }
+    ));
+
+    let mut with_proof = base;
+    with_proof["active_turn_wake_id"] = json!(format!("wc_wake_{}", "5".repeat(32)));
+    with_proof["active_turn_consume_token"] = json!(format!("wc_wake_consume_{}", "6".repeat(32)));
+    let renewed = ToolCall::from_tool_name("heartbeat_agent_task_attempt", with_proof).unwrap();
+    assert!(matches!(
+        renewed,
+        ToolCall::HeartbeatAgentTaskAttempt {
+            active_turn_wake_id: Some(ref wake_id),
+            active_turn_consume_token: Some(ref consume_token),
+            ..
+        } if wake_id.starts_with("wc_wake_") && consume_token.starts_with("wc_wake_consume_")
+    ));
+}
+
+#[test]
+fn agent_wait_calls_parse_closed_selectors_and_keep_audit_payload_free() {
+    const PRIVATE_TASK: &str = "wc_agent_task_abcdefabcdefabcdefabcdefabcdefab";
+    const PRIVATE_KEY: &str = "PRIVATE_WAIT_KEY_MUST_NOT_PERSIST";
+    let call = ToolCall::from_tool_name(
+        "wait_for_agent_events",
+        json!({
+            "agent_id": "wc_dagent_0123456789abcdef0123456789abcdef",
+            "endpoint_id": "wc_endpoint_0123456789abcdef0123456789abcdef",
+            "expected_controller_generation": 4,
+            "events": [{"kind":"agent_task_terminal","task_id":PRIVATE_TASK}],
+            "idempotency_key": PRIVATE_KEY,
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        call,
+        ToolCall::WaitForAgentEvents {
+            expected_controller_generation: 4,
+            ref events,
+            ..
+        } if events.len() == 1 && events[0].kind == "agent_task_terminal" && events[0].task_id == PRIVATE_TASK
+    ));
+    let audit = call.session_log_arguments();
+    assert_eq!(audit["event_count"], 1);
+    assert_eq!(audit["idempotency_key_present"], true);
+    let audit_text = audit.to_string();
+    assert!(!audit_text.contains(PRIVATE_TASK));
+    assert!(!audit_text.contains(PRIVATE_KEY));
+
+    let read = ToolCall::from_tool_name(
+        "read_agent_wait",
+        json!({"wait_id": format!("wc_agent_wait_{}", "6".repeat(32))}),
+    )
+    .unwrap();
+    assert!(matches!(read, ToolCall::ReadAgentWait { .. }));
+    let state = ToolCall::from_tool_name(
+        "agent_wait_state",
+        json!({"wait_id": format!("wc_agent_wait_{}", "6".repeat(32))}),
+    )
+    .unwrap();
+    assert!(matches!(state, ToolCall::AgentWaitState { .. }));
+}
+
+#[test]
 fn runner_config_tools_parse_closed_contracts_and_keep_governance_split() {
     use webcodex_tool_contracts::{
         RunnerCapabilityRequirement, ToolApprovalPolicy, ToolEffect, ToolIdempotency, ToolRisk,
@@ -223,6 +300,46 @@ fn from_tool_name_parses_bounded_list_tools_options() {
 }
 
 #[test]
+fn call_hierarchy_parser_preserves_default_and_oversized_positive_limit_for_runtime_normalization()
+{
+    let omitted = ToolCall::from_tool_name(
+        "call_hierarchy",
+        json!({
+            "project": "agent:test:demo",
+            "path": "src/main.rs",
+            "line": 1,
+            "column": 1
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        omitted,
+        ToolCall::CallHierarchy {
+            direction: webcodex_core::lsp_bridge::CallHierarchyDirection::Both,
+            depth: 1,
+            limit: 50,
+            ..
+        }
+    ));
+
+    let oversized = ToolCall::from_tool_name(
+        "call_hierarchy",
+        json!({
+            "project": "agent:test:demo",
+            "path": "src/main.rs",
+            "line": 1,
+            "column": 1,
+            "limit": 500
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        oversized,
+        ToolCall::CallHierarchy { limit: 500, .. }
+    ));
+}
+
+#[test]
 fn from_tool_name_records_and_strips_testing_metadata_before_parsing() {
     let (call, metadata) = ToolCall::from_tool_name_with_recorder_metadata(
         "list_jobs",
@@ -283,6 +400,72 @@ fn from_tool_name_records_public_result_expectations_before_parsing() {
         Some("failure")
     );
     assert!(metadata.expectation.accepted_exit_codes.is_empty());
+}
+
+#[test]
+fn cargo_test_lib_false_canonicalizes_to_omission_and_true_is_preserved() {
+    for arguments in [
+        json!({"project": "demo"}),
+        json!({"project": "demo", "lib": false}),
+    ] {
+        let call = ToolCall::from_tool_name("cargo_test", arguments).unwrap();
+        assert!(matches!(call, ToolCall::CargoTest { lib: None, .. }));
+    }
+
+    let call =
+        ToolCall::from_tool_name("cargo_test", json!({"project": "demo", "lib": true})).unwrap();
+    assert!(matches!(
+        call,
+        ToolCall::CargoTest {
+            lib: Some(true),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn tool_manifest_default_flows_follow_discovery_shape() {
+    for arguments in [
+        json!({"tool_name": "cargo_test"}),
+        json!({"tool_name": "cargo_test", "include_recommended_flows": false}),
+    ] {
+        let call = ToolCall::from_tool_name("tool_manifest", arguments).unwrap();
+        assert!(matches!(
+            call,
+            ToolCall::ToolManifest {
+                include_recommended_flows: false,
+                ..
+            }
+        ));
+    }
+
+    let exact_opt_in = ToolCall::from_tool_name(
+        "tool_manifest",
+        json!({"tool_name": "cargo_test", "include_recommended_flows": true}),
+    )
+    .unwrap();
+    assert!(matches!(
+        exact_opt_in,
+        ToolCall::ToolManifest {
+            include_recommended_flows: true,
+            ..
+        }
+    ));
+
+    for arguments in [
+        json!({}),
+        json!({"category": "validation"}),
+        json!({"intent": "coding"}),
+    ] {
+        let call = ToolCall::from_tool_name("tool_manifest", arguments).unwrap();
+        assert!(matches!(
+            call,
+            ToolCall::ToolManifest {
+                include_recommended_flows: true,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
@@ -1568,4 +1751,35 @@ fn agent_continuation_bind_parses_required_view_fence_and_omits_it_from_audit() 
     assert!(!audit.contains(&binding_id));
     args.as_object_mut().unwrap().remove("binding_id");
     assert!(ToolCall::from_tool_name("agent_continuation_bind", args).is_err());
+}
+
+#[test]
+fn observe_jobs_wake_policy_defaults_validates_and_audits_safely() {
+    for (policy, expected) in [
+        (None, ObserveJobsWakeOn::Change),
+        (Some("change"), ObserveJobsWakeOn::Change),
+        (Some("terminal"), ObserveJobsWakeOn::Terminal),
+    ] {
+        let mut args = json!({
+            "items": [{"job_id": "job", "after_observation_token": "private-observation-cursor"}],
+            "wait_secs": 1
+        });
+        if let Some(policy) = policy {
+            args["wake_on"] = json!(policy);
+        }
+        let call = ToolCall::from_tool_name("observe_jobs", args.clone()).unwrap();
+        assert!(matches!(&call, ToolCall::ObserveJobs { wake_on, .. } if *wake_on == expected));
+        let audit = call.session_log_arguments();
+        assert_eq!(audit["wake_on"], serde_json::to_value(expected).unwrap());
+        assert!(!audit.to_string().contains("private-observation-cursor"));
+    }
+    for policy in [
+        json!("unknown-private-value"),
+        json!(null),
+        json!(1),
+        json!({"bad": true}),
+    ] {
+        let args = json!({"items": [{"job_id": "job"}], "wake_on": policy});
+        assert!(ToolCall::from_tool_name("observe_jobs", args.clone()).is_err());
+    }
 }

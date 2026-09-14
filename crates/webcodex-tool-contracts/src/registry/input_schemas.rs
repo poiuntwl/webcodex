@@ -1,4 +1,5 @@
 mod agent_tasks;
+mod agent_waits;
 mod artifacts;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
@@ -32,7 +33,11 @@ pub use agent_tasks::{
     create_agent_task_input_schema, heartbeat_agent_task_attempt_input_schema,
     list_agent_tasks_input_schema, read_agent_task_input_schema,
     reconcile_agent_task_coding_run_input_schema, start_agent_task_attempt_input_schema,
-    start_agent_task_coding_run_input_schema,
+    start_agent_task_coding_run_input_schema, start_agent_task_endpoint_continuation_input_schema,
+};
+pub use agent_waits::{
+    agent_wait_state_input_schema, cancel_agent_wait_input_schema, read_agent_wait_input_schema,
+    wait_for_agent_events_input_schema,
 };
 pub use artifacts::{
     artifact_upload_abort_input_schema, artifact_upload_begin_input_schema,
@@ -125,6 +130,7 @@ pub use projects::{
     create_project_input_schema, register_project_input_schema, unregister_project_input_schema,
 };
 pub use runner_config::{runner_config_check_input_schema, runner_config_reload_input_schema};
+pub use sessions::work_result_input_schema;
 pub use sessions::{
     close_session_input_schema, complete_session_message_input_schema,
     get_session_assignment_input_schema, list_session_messages_input_schema,

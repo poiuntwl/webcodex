@@ -537,18 +537,16 @@ fn git_diff_hunks_tool_is_known_and_schema_is_bounded() {
         props["continuation"]["maxLength"],
         GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES
     );
-    assert_eq!(
-        props["max_page_bytes"]["minimum"],
-        MIN_GIT_DIFF_HUNKS_PAGE_BYTES
-    );
+    assert_eq!(props["max_page_bytes"]["minimum"], 0);
     assert_eq!(
         props["max_page_bytes"]["default"],
         DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
     );
-    assert_eq!(
-        props["max_page_bytes"]["maximum"],
-        MAX_GIT_DIFF_HUNKS_PAGE_BYTES
-    );
+    assert!(props["max_page_bytes"].get("maximum").is_none());
+    assert!(props["max_page_bytes"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("runtime-clamped"));
     for field in ["base_commit", "head_commit"] {
         assert_eq!(props[field]["minLength"], 40);
         assert_eq!(props[field]["maxLength"], 40);
@@ -573,6 +571,25 @@ fn git_diff_hunks_tool_is_known_and_schema_is_bounded() {
             cached: None,
             ..
         } if base == "A".repeat(40) && head == "b".repeat(40)
+    ));
+    let committed_false_call = ToolCall::from_tool_name(
+        "git_diff_hunks",
+        json!({
+            "project": "agent:oe:webcodex",
+            "base_commit": "A".repeat(40),
+            "head_commit": "b".repeat(40),
+            "cached": false,
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        committed_false_call,
+        ToolCall::GitDiffHunks {
+            base_commit: Some(_),
+            head_commit: Some(_),
+            cached: Some(false),
+            ..
+        }
     ));
     assert!(ToolCall::from_tool_name(
         "git_diff_hunks",
@@ -970,6 +987,37 @@ async fn run_runner_git_diff_hunks_committed_page_with_budget(
     head_commit: String,
     continuation: Option<String>,
 ) -> (ToolResult, usize, Vec<String>) {
+    run_runner_git_diff_hunks_committed_page_with_options(
+        runtime,
+        client_id,
+        project,
+        repo,
+        paths,
+        max_hunks,
+        max_hunk_lines,
+        max_page_bytes,
+        None,
+        base_commit,
+        head_commit,
+        continuation,
+    )
+    .await
+}
+
+async fn run_runner_git_diff_hunks_committed_page_with_options(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    repo: &Path,
+    paths: Option<Vec<String>>,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+    max_page_bytes: Option<usize>,
+    cached: Option<bool>,
+    base_commit: String,
+    head_commit: String,
+    continuation: Option<String>,
+) -> (ToolResult, usize, Vec<String>) {
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.to_string();
@@ -981,7 +1029,7 @@ async fn run_runner_git_diff_hunks_committed_page_with_budget(
                     Some(max_hunks),
                     Some(max_hunk_lines),
                     max_page_bytes,
-                    None,
+                    cached,
                     Some(base_commit),
                     Some(head_commit),
                     continuation,
@@ -1386,7 +1434,7 @@ async fn git_diff_hunks_committed_range_validation_and_merge_base_fail_closed() 
         (
             Some(base.clone()),
             Some(head.clone()),
-            Some(false),
+            Some(true),
             "committed_range_conflicts_with_cached",
         ),
     ] {
@@ -1640,19 +1688,25 @@ async fn git_diff_hunks_committed_continuation_binds_range_paths_mode_and_state(
     )
     .await;
     let paths = Some(vec!["large.txt".to_string()]);
-    let (first, first_bytes, first_scripts) = run_runner_git_diff_hunks_committed_page(
-        &runtime,
-        "committed-continuation",
-        &project,
-        tmp.path(),
-        paths.clone(),
-        1,
-        120,
-        base.clone(),
-        head.clone(),
-        None,
-    )
-    .await;
+    // Explicit cached=false is the same committed-range mode as omission. Start
+    // with the explicit spelling, then replay the returned continuation through
+    // the ordinary omitted-cached helper below to prove canonical identity.
+    let (first, first_bytes, first_scripts) =
+        run_runner_git_diff_hunks_committed_page_with_options(
+            &runtime,
+            "committed-continuation",
+            &project,
+            tmp.path(),
+            paths.clone(),
+            1,
+            120,
+            None,
+            Some(false),
+            base.clone(),
+            head.clone(),
+            None,
+        )
+        .await;
     assert!(first.success, "{:?}", first.error);
     assert_eq!(first.output["has_more"], true);
     assert!(first_bytes < 48 * 1024);
@@ -1664,6 +1718,18 @@ async fn git_diff_hunks_committed_continuation_binds_range_paths_mode_and_state(
     assert!(token.starts_with("wcdh1."));
     let recovery = &first.output["recovery"];
     assert_eq!(recovery["kind"], "page");
+    assert_eq!(
+        recovery["continuation"]["continuation_semantics"]["kind"],
+        "page"
+    );
+    assert_eq!(
+        recovery["continuation"]["continuation_semantics"]["carrier"],
+        "opaque_token"
+    );
+    assert_eq!(
+        recovery["omitted_lines"]["continuation_semantics"],
+        Value::Null
+    );
     assert_eq!(recovery["arguments"]["project"], project);
     assert_eq!(recovery["arguments"]["paths"], json!(["large.txt"]));
     assert_eq!(recovery["arguments"]["base_commit"], base);
@@ -2299,7 +2365,7 @@ async fn git_diff_hunks_page_budget_is_configurable_bounded_and_scope_bound() {
         None,
         100,
         100,
-        Some(MIN_GIT_DIFF_HUNKS_PAGE_BYTES),
+        Some(1),
         false,
         None,
     )
@@ -2703,8 +2769,20 @@ async fn git_diff_hunks_hunk_line_limit_does_not_create_fake_continuation() {
     assert_eq!(recovery["safe_continuation_for_omitted_lines"], false);
     assert_eq!(recovery["continuation"]["available"], false);
     assert_eq!(recovery["continuation"]["next_call"], Value::Null);
+    assert_eq!(
+        recovery["continuation"]["continuation_semantics"],
+        Value::Null
+    );
     assert_eq!(recovery["omitted_lines"]["present"], true);
     assert_eq!(recovery["omitted_lines"]["recoverable"], true);
+    assert_eq!(
+        recovery["omitted_lines"]["continuation_semantics"]["kind"],
+        "refine"
+    );
+    assert_eq!(
+        recovery["omitted_lines"]["continuation_semantics"]["carrier"],
+        "none"
+    );
     assert_eq!(
         recovery["omitted_lines"]["reason_code"],
         "larger_max_hunk_lines_available"
@@ -3790,6 +3868,10 @@ fn show_changes_complete_diff_does_not_handoff_to_git_diff_hunks() {
 
     let output = bounded_show_changes_output(tmp.path(), true, 20, 80);
     assert_eq!(output["hunks_truncated"], false);
+    assert_eq!(
+        output["hunks"][0]["hunks"][0]["source_completeness"],
+        "complete"
+    );
     assert!(output.get("diff_review_handoff").is_none());
     assert!(!output["suggested_next_actions"]
         .as_array()
@@ -3888,6 +3970,10 @@ fn show_changes_complete_model_projection_removes_only_derived_review_metadata()
     assert!(output["hunks"][0].get("old_path").is_none());
     assert!(output["hunks"][0]["hunks"][0].get("line_count").is_none());
     assert!(output["hunks"][0]["hunks"][0].get("truncated").is_none());
+    assert_eq!(
+        output["hunks"][0]["hunks"][0]["source_completeness"],
+        "complete"
+    );
     assert!(canonical.get("transport_safe").is_some());
     assert!(canonical.get("hunk_count").is_some());
 }
@@ -3916,7 +4002,10 @@ fn show_changes_diff_respects_max_hunks() {
     assert!(reasons.iter().any(|r| r == "diff_hunk_count_limit"));
     assert!(!reasons.iter().any(|r| r == "diff_hunk_line_limit"));
     assert!(!reasons.iter().any(|r| r == "diff_byte_budget"));
-    assert_eq!(output["diff_review_handoff"]["tool"], "git_diff_hunks");
+    assert_eq!(
+        output["hunks"][0]["hunks"][0]["source_completeness"], "complete",
+        "page-only truncation must not make a returned hunk look source-incomplete"
+    );
     assert_eq!(output["diff_review_handoff"]["scope"], "worktree");
     assert_eq!(
         output["diff_review_handoff"]["reason"],
@@ -3926,41 +4015,26 @@ fn show_changes_diff_respects_max_hunks() {
         output["diff_review_handoff"]["truncation_reasons"],
         json!(["diff_hunk_count_limit"])
     );
-    assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["project"],
-        "demo"
-    );
-    assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["cached"],
-        false
-    );
-    assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["paths"],
-        json!([])
-    );
-    assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["max_hunks"],
-        30
-    );
-    assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["max_page_bytes"],
-        DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
-    );
+    assert!(output["diff_review_handoff"].get("tool").is_none());
+    assert!(output["diff_review_handoff"]
+        .get("suggested_call")
+        .is_none());
     let recovery = &output["diff_review_handoff"]["recovery"];
     assert_eq!(recovery["kind"], "page");
     assert_eq!(recovery["tool"], "git_diff_hunks");
-    assert_eq!(recovery["safe_continuation_for_omitted_lines"], Value::Null);
+    assert_eq!(recovery["arguments"]["project"], "demo");
+    assert_eq!(recovery["arguments"]["cached"], false);
+    assert_eq!(recovery["arguments"]["paths"], json!([]));
+    assert_eq!(recovery["arguments"]["max_hunks"], 30);
     assert_eq!(
-        recovery["arguments"],
-        output["diff_review_handoff"]["suggested_call"]
+        recovery["arguments"]["max_page_bytes"],
+        DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
     );
+    assert_eq!(recovery["safe_continuation_for_omitted_lines"], Value::Null);
     assert_git_diff_hunks_recovery_call_parses(recovery);
-    let suggested_call = output["diff_review_handoff"]["suggested_call"].clone();
-    ToolCall::from_tool_name("git_diff_hunks", suggested_call)
-        .expect("show_changes suggested_call must be directly reusable as git_diff_hunks input");
     assert!(
         crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
-            output["diff_review_handoff"]["tool"].as_str().unwrap()
+            recovery["tool"].as_str().unwrap()
         )
     );
     let actions = output["suggested_next_actions"].as_array().unwrap();
@@ -3998,32 +4072,33 @@ fn show_changes_diff_respects_max_hunk_lines() {
     let lines = hunks[0]["diff"].as_str().unwrap().lines().count();
     // header line + up to 3 content lines = at most 4 lines.
     assert!(lines <= 4, "hunk must be line-bounded: {hunks:?}");
+    assert!(hunks[0].get("truncated").is_none());
+    assert_eq!(
+        hunks[0]["source_completeness"], "unknown",
+        "producer-side line truncation must leave completeness explicitly unknown"
+    );
     assert_eq!(output["hunks_truncated"], true);
     let reasons = output["truncation_reasons"].as_array().unwrap();
     assert!(reasons.iter().any(|r| r == "diff_hunk_line_limit"));
     assert!(!reasons.iter().any(|r| r == "diff_hunk_count_limit"));
     assert!(!reasons.iter().any(|r| r == "diff_byte_budget"));
-    assert_eq!(output["diff_review_handoff"]["tool"], "git_diff_hunks");
     assert_eq!(
         output["diff_review_handoff"]["truncation_reasons"],
         json!(["diff_hunk_line_limit"])
     );
+    assert!(output["diff_review_handoff"].get("tool").is_none());
+    assert!(output["diff_review_handoff"]
+        .get("suggested_call")
+        .is_none());
+    let recovery = &output["diff_review_handoff"]["recovery"];
+    assert_eq!(recovery["kind"], "hunk_lines");
     assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["paths"],
+        recovery["arguments"]["paths"],
         json!([]),
         "line truncation must not guess a narrower path without per-hunk provenance"
     );
-    assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["max_hunk_lines"],
-        400
-    );
-    let recovery = &output["diff_review_handoff"]["recovery"];
-    assert_eq!(recovery["kind"], "hunk_lines");
+    assert_eq!(recovery["arguments"]["max_hunk_lines"], 400);
     assert_eq!(recovery["safe_continuation_for_omitted_lines"], false);
-    assert_eq!(
-        recovery["arguments"],
-        output["diff_review_handoff"]["suggested_call"]
-    );
     assert_git_diff_hunks_recovery_call_parses(recovery);
     let actions = output["suggested_next_actions"].as_array().unwrap();
     assert!(actions.iter().any(|action| action
@@ -4056,6 +4131,10 @@ fn show_changes_combined_hunk_count_and_line_truncation_keeps_both_guidance_path
     assert!(reasons
         .iter()
         .any(|reason| reason == "diff_hunk_line_limit"));
+    assert_eq!(
+        output["hunks"][0]["hunks"][0]["source_completeness"], "unknown",
+        "mixed page/line truncation leaves per-hunk source completeness unknown"
+    );
     let handoff_reasons = output["diff_review_handoff"]["truncation_reasons"]
         .as_array()
         .unwrap();
@@ -4065,18 +4144,18 @@ fn show_changes_combined_hunk_count_and_line_truncation_keeps_both_guidance_path
     assert!(handoff_reasons
         .iter()
         .any(|reason| reason == "diff_hunk_line_limit"));
+    assert!(output["diff_review_handoff"].get("tool").is_none());
+    assert!(output["diff_review_handoff"]
+        .get("suggested_call")
+        .is_none());
+    let recovery = &output["diff_review_handoff"]["recovery"];
+    assert_eq!(recovery["kind"], "mixed");
     assert_eq!(
-        output["diff_review_handoff"]["suggested_call"]["paths"],
+        recovery["arguments"]["paths"],
         json!([]),
         "combined page truncation must not narrow away later files"
     );
-    let recovery = &output["diff_review_handoff"]["recovery"];
-    assert_eq!(recovery["kind"], "mixed");
     assert_eq!(recovery["safe_continuation_for_omitted_lines"], false);
-    assert_eq!(
-        recovery["arguments"],
-        output["diff_review_handoff"]["suggested_call"]
-    );
     assert_git_diff_hunks_recovery_call_parses(recovery);
     let actions = output["suggested_next_actions"].as_array().unwrap();
     assert!(actions
@@ -4177,7 +4256,6 @@ fn show_changes_schema_covers_truncation_and_transport_fields() {
     let handoff = &properties["diff_review_handoff"];
     assert_eq!(handoff["type"], "object");
     assert_eq!(handoff["additionalProperties"], false);
-    assert_eq!(handoff["properties"]["tool"]["const"], "git_diff_hunks");
     assert_eq!(handoff["properties"]["scope"]["const"], "worktree");
     assert_eq!(
         handoff["properties"]["reason"]["const"],
@@ -4194,35 +4272,28 @@ fn show_changes_schema_covers_truncation_and_transport_fields() {
     );
     assert_eq!(
         handoff["required"],
-        json!([
-            "tool",
-            "scope",
-            "reason",
-            "truncation_reasons",
-            "recovery",
-            "suggested_call"
-        ])
+        json!(["scope", "reason", "truncation_reasons", "recovery"])
     );
+    assert!(handoff["properties"].get("tool").is_none());
+    assert!(handoff["properties"].get("suggested_call").is_none());
     let recovery = &handoff["properties"]["recovery"];
     assert_eq!(recovery["additionalProperties"], false);
     assert_eq!(recovery["properties"]["tool"]["const"], "git_diff_hunks");
+    assert!(recovery["description"]
+        .as_str()
+        .unwrap()
+        .contains("Canonical parser-ready"));
     assert_eq!(
         recovery["properties"]["kind"]["enum"],
         json!(["page", "hunk_lines", "mixed"])
     );
-    let suggested = &handoff["properties"]["suggested_call"];
-    assert_eq!(suggested["additionalProperties"], false);
-    assert_eq!(suggested["properties"]["cached"]["const"], false);
     assert_eq!(
-        suggested["required"],
-        json!([
-            "project",
-            "cached",
-            "paths",
-            "max_hunks",
-            "max_hunk_lines",
-            "max_page_bytes"
-        ])
+        recovery["properties"]["arguments"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        recovery["properties"]["arguments"]["properties"]["cached"]["const"],
+        false
     );
 }
 
@@ -4843,7 +4914,7 @@ async fn show_changes_with_session_id_returns_session_block_and_records_call() {
     });
     let req = wait_for_patch_agent_request(&runtime, "telemetry-show").await;
     let stdout = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         framed_block(
             'S',
             "## main\n M README.md\n",
@@ -4858,6 +4929,11 @@ async fn show_changes_with_session_id_returns_session_block_and_records_call() {
             'T',
             "README.md | 1 +\n",
             "diff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes=15\n"
+        ),
+        framed_block(
+            'N',
+            "1\t0\tREADME.md\n",
+            "numstat_exit=0\nnumstat_truncated=0\nnumstat_bytes=13\n"
         )
     );
     complete_patch_agent_request(&runtime, "telemetry-show", &req.request_id, 0, &stdout, "").await;
@@ -6011,7 +6087,7 @@ fn show_changes_modern_framing_requires_exact_blocks_and_tail() {
         let (_, stdout, stderr) = run_bounded_show_changes_full(tmp.path(), include_diff, 20, 80);
         assert_eq!(
             stdout.matches("WCSF1:").count(),
-            if include_diff { 4 } else { 3 }
+            if include_diff { 5 } else { 4 }
         );
         let frames = split_show_changes_stdout(&stdout, include_diff);
         assert!(frames.framing_valid);
@@ -6024,10 +6100,13 @@ fn show_changes_modern_framing_requires_exact_blocks_and_tail() {
             &stderr,
         );
         assert_eq!(output["transport_safe"], true, "{output}");
+        assert_eq!(output["files"][0]["path"], "README.md");
+        assert_eq!(output["files"][0]["additions"], 1);
+        assert_eq!(output["files"][0]["deletions"], 1);
     }
 
     let (_, valid, stderr) = run_bounded_show_changes_full(tmp.path(), false, 20, 80);
-    let trailer = valid.rfind("WCSF1:T:").unwrap();
+    let trailer = valid.rfind("WCSF1:N:").unwrap();
     let mut variants = Vec::new();
     variants.push(("extra_tail", format!("{valid}x")));
     variants.push(("missing_tail", valid[..valid.len() - 1].to_string()));
@@ -6057,10 +6136,11 @@ fn show_changes_modern_framing_requires_exact_blocks_and_tail() {
     }
 
     let synthetic = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         framed_block('S', "## main\n", "status_exit=0\n"),
         framed_block('H', "", "head_exit=1\n"),
-        framed_block('T', "", "diff_stat_exit=0\n")
+        framed_block('T', "", "diff_stat_exit=0\n"),
+        framed_block('N', "", "numstat_exit=0\n")
     );
     assert!(split_show_changes_stdout(&synthetic, false).framing_valid);
 
@@ -6083,6 +6163,30 @@ fn show_changes_modern_framing_requires_exact_blocks_and_tail() {
     assert!(legacy_head["head"]["commit"].is_null());
     assert!(legacy_head["head"]["short"].is_null());
     assert!(legacy_head["head"]["summary"].is_null());
+}
+
+#[test]
+fn show_changes_numstat_does_not_report_rename_as_full_line_churn() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "old.txt", "one\ntwo\nthree\n", "initial");
+    std::fs::rename(tmp.path().join("old.txt"), tmp.path().join("new.txt")).unwrap();
+    let (add_exit, _, add_stderr, _) = run_command_sync("git add -A", tmp.path(), 30);
+    assert_eq!(add_exit, 0, "git add failed: {add_stderr}");
+
+    let (_, stdout, stderr) = run_bounded_show_changes_full(tmp.path(), false, 20, 80);
+    let frames = split_show_changes_stdout(&stdout, false);
+    assert!(frames.framing_valid);
+    let output =
+        bounded_show_changes_output_from_frames(&frames, tmp.path(), false, 20, 80, &stderr);
+    assert_eq!(output["transport_safe"], true, "{output}");
+    assert_eq!(output["counts"]["renamed"], 1, "{output}");
+    let file = output["files"]
+        .as_array()
+        .and_then(|files| files.iter().find(|file| file["status"] == "renamed"))
+        .expect("rename record");
+    assert!(file.get("additions").is_none(), "{file}");
+    assert!(file.get("deletions").is_none(), "{file}");
 }
 
 #[tokio::test]
@@ -6828,7 +6932,6 @@ fn show_changes_long_path_diff_budgets_complete_preambles_and_bytes() {
     assert!(!reasons.iter().any(|r| r == "diff_hunk_line_limit"));
 
     assert_eq!(output["hunks_truncated"], true);
-    assert_eq!(output["diff_review_handoff"]["tool"], "git_diff_hunks");
     assert_eq!(
         output["diff_review_handoff"]["truncation_reasons"],
         json!(["diff_byte_budget"])

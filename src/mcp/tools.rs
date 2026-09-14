@@ -21,7 +21,8 @@ use crate::tool_runtime::model_ergonomics_telemetry::{
 };
 use crate::tool_runtime::specialized::SpecializedGovernanceDenial;
 use crate::tool_runtime::tool_definition::{
-    is_adaptive_runtime_direct_tool, runtime_tool_accepts_context_ack, LOCAL_CODING_TOOL_NAMES,
+    is_adaptive_runtime_direct_tool, runtime_tool_accepts_context_ack,
+    runtime_tool_operator_extension_family, ToolOperatorExtensionFamily, LOCAL_CODING_TOOL_NAMES,
 };
 use crate::tool_runtime::{registered_tool_specs, ToolCall, ToolResult, ToolRuntime, ToolSpec};
 use serde::Deserialize;
@@ -66,17 +67,23 @@ fn full_operator_runtime_specs_for_auth(
         specs.extend(
             crate::tool_runtime::stateless_operator_extension_tool_specs()
                 .into_iter()
-                .filter(|spec| {
-                    if crate::tool_runtime::skills::is_skill_runtime_tool_name(&spec.name) {
-                        !oauth_scope_projection
-                            || check_runtime_tool_scope(auth, &spec.name).is_ok()
-                    } else if crate::tool_runtime::skills::is_skill_management_tool_name(&spec.name)
-                    {
-                        auth.is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
-                    } else {
-                        check_runtime_tool_scope(auth, &spec.name).is_ok()
-                    }
-                }),
+                .filter(
+                    |spec| match runtime_tool_operator_extension_family(&spec.name) {
+                        Some(ToolOperatorExtensionFamily::SkillRuntime) => {
+                            !oauth_scope_projection
+                                || check_runtime_tool_scope(auth, &spec.name).is_ok()
+                        }
+                        Some(ToolOperatorExtensionFamily::SkillManagement) => {
+                            auth.is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
+                        }
+                        Some(
+                            ToolOperatorExtensionFamily::MemoryRuntime
+                            | ToolOperatorExtensionFamily::MemoryManagement
+                            | ToolOperatorExtensionFamily::TraceDiagnostics,
+                        ) => check_runtime_tool_scope(auth, &spec.name).is_ok(),
+                        None => false,
+                    },
+                ),
         );
     }
     specs
@@ -328,6 +335,7 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
         let mut app_specs = filter_specs_for_oauth(
             crate::tool_runtime::goal_plan_app_tool_specs()
                 .into_iter()
+                .chain(crate::tool_runtime::work_result_app_tool_specs())
                 .chain(crate::tool_runtime::agent_continuation_app_tool_specs())
                 .collect(),
             auth,
@@ -418,28 +426,62 @@ fn mcp_context_projection_output_schema() -> Value {
     })
 }
 
-fn add_context_projection_to_output_shape(schema: &mut Value, projection_schema: &Value) {
+fn add_context_projection_to_output_shape(
+    schema: &mut Value,
+    projection_schema: &Value,
+    accepts_context_ack: bool,
+) {
     if schema.get("type").and_then(Value::as_str) == Some("object") {
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             properties.insert("context_projection".to_string(), projection_schema.clone());
+            if accepts_context_ack {
+                properties.insert("session_context_revision".to_string(), json!({
+                    "type": "integer", "minimum": 0,
+                    "description": "Safely recovered Session checkpoint watermark; retain for later ACK."
+                }));
+                properties.insert("session_continuity".to_string(), json!({
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["exact", "behind", "unacknowledged", "invalid", "recovered"], "description": "Observed Context continuity state only; it is not authority, retry permission, or an action."},
+                        "suggested_call": webcodex_tool_contracts::suggested_tool_call_schema(
+                            "session_handoff_summary",
+                            json!({
+                                "type": "object",
+                                "properties": {
+                                    "session_id": {"type": "string", "pattern": "^wc_sess_[A-Za-z0-9_]+$"}
+                                },
+                                "required": ["session_id"],
+                                "additionalProperties": false
+                            }),
+                            "Parser-ready advisory recovery call for re-observing bounded Session context. Its presence is the sole machine representation that explicit handoff recovery is actionable; it grants no authority and is not an ACK token."
+                        )
+                    },
+                    "required": ["status"]
+                }));
+                properties.insert("session_recovery".to_string(), json!({"type": "object"}));
+            }
         }
     }
     for keyword in ["anyOf", "oneOf", "allOf"] {
         if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
             for branch in branches {
-                add_context_projection_to_output_shape(branch, projection_schema);
+                add_context_projection_to_output_shape(
+                    branch,
+                    projection_schema,
+                    accepts_context_ack,
+                );
             }
         }
     }
 }
 
-fn add_stateless_context_projection_output_schema(tool: &mut Value) {
+fn add_stateless_context_projection_output_schema(tool: &mut Value, accepts_context_ack: bool) {
     let Some(output_schema) = tool.get_mut("outputSchema") else {
         return;
     };
     let projection_schema = mcp_context_projection_output_schema();
     if let Some(output) = output_schema.pointer_mut("/properties/output") {
-        add_context_projection_to_output_shape(output, &projection_schema);
+        add_context_projection_to_output_shape(output, &projection_schema, accepts_context_ack);
     }
     if let Some(conditions) = output_schema.get_mut("allOf").and_then(Value::as_array_mut) {
         for condition in conditions {
@@ -447,7 +489,11 @@ fn add_stateless_context_projection_output_schema(tool: &mut Value) {
                 if let Some(output) =
                     condition.pointer_mut(&format!("/{branch_name}/properties/output"))
                 {
-                    add_context_projection_to_output_shape(output, &projection_schema);
+                    add_context_projection_to_output_shape(
+                        output,
+                        &projection_schema,
+                        accepts_context_ack,
+                    );
                 }
             }
         }
@@ -463,7 +509,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
     };
     for tool in tools {
         let tool_name = tool.get("name").and_then(Value::as_str);
-        if tool_name == Some("goal_plan_state")
+        if matches!(tool_name, Some("goal_plan_state" | "work_result_state"))
             || tool_name.is_some_and(is_agent_continuation_app_tool_name)
         {
             continue;
@@ -541,11 +587,11 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
                     json!({
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Echo the latest Session context revision retained by the model; omit it when unknown. A known behind revision may receive bounded delta recovery; missing, invalid, future, lost-history, or truncated recovery gets a compact current Session handoff. Recovery is nonblocking."
+                        "description": "Echo the latest retained session_context_revision; omit when unknown."
                     }),
                 );
             }
-            add_stateless_context_projection_output_schema(tool);
+            add_stateless_context_projection_output_schema(tool, accepts_context_ack);
         }
     }
 }
@@ -593,6 +639,7 @@ fn is_agent_continuation_app_tool_name(tool_name: &str) -> bool {
             | "agent_continuation_wake_prepare"
             | "agent_continuation_wake_finish"
             | "agent_continuation_unbind"
+            | "agent_wait_state"
     )
 }
 
@@ -803,6 +850,9 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> V
     }
     if app_enabled && presentation::tool_supports_result_app(&tool_name) {
         attach_app_metadata(&mut value, resources::MCP_RESULT_UI_RESOURCE_URI);
+    }
+    if app_enabled && presentation::tool_supports_work_result_app(&tool_name) {
+        attach_app_metadata(&mut value, resources::MCP_WORK_RESULT_UI_RESOURCE_URI);
     }
     if app_enabled && presentation::tool_supports_goal_plan_app(&tool_name) {
         attach_app_metadata(&mut value, resources::MCP_GOAL_PLAN_UI_RESOURCE_URI);
@@ -1818,15 +1868,19 @@ pub(super) async fn handle_call(
     // target's preferred exposure is gateway or direct.
     let goal_plan_app_surface =
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
+    let work_result_app_surface =
+        server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let agent_continuation_app_surface =
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let app_only_goal_plan_state = goal_plan_app_surface && params.name == "goal_plan_state";
+    let app_only_work_result_state = work_result_app_surface && params.name == "work_result_state";
     let app_only_agent_continuation =
         agent_continuation_app_surface && is_agent_continuation_app_tool_name(&params.name);
     let surface_denied = match model_surface {
         ModelSurface::LocalCoding => !LOCAL_CODING_TOOL_NAMES.contains(&params.name.as_str()),
         ModelSurface::AdaptiveRuntime => {
             !app_only_goal_plan_state
+                && !app_only_work_result_state
                 && !app_only_agent_continuation
                 && !via_adaptive_runtime_gateway
                 && !is_adaptive_runtime_direct_tool(&params.name)
@@ -1875,7 +1929,7 @@ pub(super) async fn handle_call(
                 return McpOutcome::BadRequest(rpc_error(id, -32602, error.message()));
             }
         };
-    let session_id = match strip_recording_session_id(&mut params.arguments) {
+    let mut session_id = match strip_recording_session_id(&mut params.arguments) {
         Ok(session_id) => session_id,
         Err(message) => {
             if let Some(lc) = lifecycle.as_deref() {
@@ -1895,6 +1949,14 @@ pub(super) async fn handle_call(
             return McpOutcome::BadRequest(rpc_error(id, -32602, message));
         }
     };
+    // Work Result refresh is an App-only observation of the exact business
+    // Session carried inside the tool's own arguments. Never let the generic
+    // Stateless recording wrapper turn a user-driven refresh into a write to
+    // that or any other Workflow Session, even if a caller hand-crafts an
+    // unadvertised recording_session_id field.
+    if params.name == "work_result_state" {
+        session_id = None;
+    }
     let ack_session_message_ids = if stateless_2026 {
         match strip_stateless_ack_session_message_ids(&mut params.arguments) {
             Ok(ids) => ids,
@@ -1964,6 +2026,7 @@ pub(super) async fn handle_call(
     let memory_surface_capable = stateless_2026 && model_surface.supports_operator_extensions();
     let trace_diagnostics_capable = stateless_2026 && model_surface.supports_operator_extensions();
     let goal_plan_app_capable = goal_plan_app_surface;
+    let work_result_app_capable = work_result_app_surface;
     let agent_continuation_app_capable = agent_continuation_app_surface;
     let context_request = if context_sidecar_capable {
         match strip_stateless_context_request(&mut params.arguments) {
@@ -2034,6 +2097,7 @@ pub(super) async fn handle_call(
                 memory_surface: memory_surface_capable,
                 trace_diagnostics: trace_diagnostics_capable,
                 goal_plan_app: goal_plan_app_capable,
+                work_result_app: work_result_app_capable,
                 agent_continuation_app: agent_continuation_app_capable,
             },
         )

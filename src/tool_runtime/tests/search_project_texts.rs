@@ -546,13 +546,14 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         schema["properties"]["max_result_bytes"]["default"],
         64 * 1024
     );
-    assert_eq!(
-        schema["properties"]["max_result_bytes"]["maximum"],
-        512 * 1024
-    );
+    assert_eq!(schema["properties"]["max_result_bytes"]["minimum"], 0);
+    assert!(schema["properties"]["max_result_bytes"]
+        .get("maximum")
+        .is_none());
     let budget_description = schema["properties"]["max_result_bytes"]["description"]
         .as_str()
         .unwrap();
+    assert!(budget_description.contains("runtime-clamped"));
     assert!(budget_description.contains("whole-query"));
     assert!(budget_description.contains("narrow"));
     let removed_input_cursor = ["match", "offset"].join("_");
@@ -568,10 +569,22 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         .unwrap()
         .insert(removed_input_cursor, json!(1));
     assert!(!validates(&removed_cursor_input));
+    for max_result_bytes in [0, 1, 512 * 1024 + 1, 1024 * 1024] {
+        assert!(validates(&json!({
+            "project": "demo",
+            "queries": [{"pattern": "needle"}],
+            "max_result_bytes": max_result_bytes
+        })));
+    }
     assert!(!validates(&json!({
         "project": "demo",
         "queries": [{"pattern": "needle"}],
-        "max_result_bytes": 512 * 1024 + 1
+        "max_result_bytes": -1
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "queries": [{"pattern": "needle"}],
+        "max_result_bytes": "65536"
     })));
     assert!(
         schema["properties"].get("session_id").is_some(),
@@ -1489,6 +1502,32 @@ async fn search_project_texts_does_not_retry_nontransient_agent_failures() {
     );
     assert_no_agent_request(&runtime, client_id).await;
 
+    let mut missing_query = query("missing", None);
+    missing_query.path = Some("src/definitely-missing".to_string());
+    let missing_result = run_single_agent_batch_response(
+        "batch-search-no-retry-missing",
+        missing_query,
+        2,
+        r#"{"webcodex_search":{"backend":"native","feature_unavailable":false,"path_status":"not_found"}}
+"#
+        .to_string(),
+        "",
+    )
+    .await;
+    let missing_output = &missing_result.output["items"][0]["output"];
+    assert_eq!(missing_output["reason_code"], "not_found");
+    assert_eq!(missing_output["failure_stage"], "path_resolution");
+    assert_eq!(missing_output["detail_code"], "not_found");
+    assert_eq!(missing_output["state_changed"], false);
+    assert!(missing_output.get("backend").is_none());
+    assert!(missing_output.get("exit_code").is_none());
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("search_project_texts");
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &serde_json::to_value(&missing_result).unwrap(),
+        &schema,
+    )
+    .unwrap();
+
     let mut timeout_query = query("timeout", None);
     timeout_query.timeout_secs = Some(1);
     let timeout_result = run_single_agent_batch_response(
@@ -2390,19 +2429,15 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
     assert!(outcome.success);
     let result = outcome.result.expect("model-facing result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
     assert_eq!(result.output["context_projection"]["timing"], "post_tool");
     assert_eq!(
         result.output["context_projection"]["materials"][0]["key"],
         "webcodex.workflow"
     );
-    assert_eq!(
-        result.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
+
     assert!(result.output.get("output_truncated").is_none());
     assert!(result.output.get("next_index").is_none());
     assert!(result.output.get("returned_count").is_none());

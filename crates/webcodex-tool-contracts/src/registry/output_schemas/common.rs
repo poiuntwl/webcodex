@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
 
-use webcodex_core::runtime_contract::{RECOVERY_KIND_VALUES, RECOVERY_TOOL_VALUES};
+use webcodex_core::runtime_contract::{
+    ContinuationCarrier, ContinuationKind, CONTINUATION_CARRIER_VALUES, CONTINUATION_KIND_VALUES,
+    RECOVERY_KIND_VALUES, RECOVERY_TOOL_VALUES,
+};
 use webcodex_core::workflow_session_contract::{
     SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON,
 };
@@ -21,6 +24,45 @@ pub fn nullable_schema(kind: &str, description: &str) -> Value {
             { "type": "null" }
         ],
         "description": description,
+    })
+}
+
+pub fn continuation_semantics_schema(
+    kind: ContinuationKind,
+    carrier: ContinuationCarrier,
+    description: &str,
+) -> Value {
+    debug_assert!(CONTINUATION_KIND_VALUES.contains(&kind.as_str()));
+    debug_assert!(CONTINUATION_CARRIER_VALUES.contains(&carrier.as_str()));
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"type": "string", "const": kind.as_str()},
+            "carrier": {"type": "string", "const": carrier.as_str()}
+        },
+        "required": ["kind", "carrier"]
+    })
+}
+
+/// Schema for an advisory parser-ready next tool call. The shape never grants
+/// authority or executes the tool; domain schemas remain responsible for the
+/// bounded argument contract.
+pub fn suggested_tool_call_schema(
+    tool: &'static str,
+    arguments: Value,
+    description: &str,
+) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "tool": {"type": "string", "const": tool},
+            "arguments": arguments
+        },
+        "required": ["tool", "arguments"]
     })
 }
 
@@ -55,6 +97,40 @@ pub fn job_activity_schema() -> Value {
         ],
         "description": "Runner-owned bounded current activity for an active Job. Observation only: it never replaces canonical status, proves completion, or grants retry/continuation authority. null means unavailable, terminal, or temporarily untrusted during recovery."
     })
+}
+
+pub fn observe_job_continuation_schema() -> Value {
+    suggested_tool_call_schema(
+        "observe_jobs",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "job_id": {"type": "string", "minLength": 1},
+                            "after_observation_token": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN
+                            }
+                        },
+                        "required": ["job_id"]
+                    }
+                },
+                "wait_secs": {"type": "integer", "const": 60, "minimum": 1, "maximum": 60},
+                "wake_on": {"type": "string", "const": "terminal"}
+            },
+            "required": ["items", "wait_secs", "wake_on"]
+        }),
+        "Bounded next-call hint for observing the exact already-started Job. Advisory only: it grants no authority, is not a retry token, and never starts background polling.",
+    )
 }
 
 pub fn exploration_tool_name_schema() -> Value {

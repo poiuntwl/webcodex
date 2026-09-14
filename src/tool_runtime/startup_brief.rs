@@ -66,13 +66,13 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
             "Complete authorized work through validation and review; ask only for missing requirements or authority.",
             "Verify Project, branch, HEAD, and existing changes; read nested rules for changed paths and recover truncated instructions.",
             "Preserve unrelated work; make the smallest coherent change. Push/publish/deploy/restart need an explicit action and target.",
-            "Use structured tools and edit guards; apply model_protocol only where the exposed schema supports it.",
+            "Use structured tools and edit guards; after source edits or a rustfmt check diff, prefer cargo_fmt(check=false) to ensure formatting instead of reproducing rustfmt edits manually; apply model_protocol only where the exposed schema supports it.",
             "Long required validation + independent read-only inspection: use short sync_wait_secs for same-execution Job handoff, inspect then observe; do not fan out heavy validations. Covered-source mutation makes that result stale/cache-warmup; final source needs fresh validation.",
             "Observe existing Jobs; inspect state before retrying an unknown outcome. Timeout does not prove no effect.",
             "Review the diff; report evidence, limits, and Jobs. finish_coding_task is advisory evidence, not proof."
         ],
         "model_protocol": {
-            "session_context_ack": "Echo session_context_revision exactly in ack_session_context_revision; never derive it. No revision: keep prior ACK; if unknown, omit. Missing/invalid recovers compact handoff; stale may recover delta. Nonblocking.",
+            "session_context_ack": "Checkpoint/recovery tools may expose session_context_revision. Echo the latest retained revision in ack_session_context_revision only where exposed; never invent it. If unknown, omit; use the advertised Session handoff recovery path. ACK is nonblocking.",
             "session_recording": "When work_on_project creates or resumes, pass recording_session_id for recorder provenance only. business session_id may target another Session; it grants no authority.",
             "session_message_ack": "For retained session_attention requires_ack guidance, echo ack_session_message_ids. This request-scoped model-context proof neither resolves messages, grants authority, nor gates execution.",
             "session_message_resolution": "For a handled non-todo, send session_message_resolution on the next ordinary call with recording_session_id; ACK guidance also needs ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
@@ -136,8 +136,10 @@ pub(crate) struct StartupPluginEntry {
     pub(crate) annotations: webcodex_core::plugin::PluginSelectionAnnotations,
 }
 
+/// Shared startup metadata projection, not a resource store or authority.
+/// Entry types, discovery, and execution remain owned by their domains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct StartupSkillsCatalog {
+pub(crate) struct StartupCatalog<Entry> {
     pub(crate) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason_code: Option<&'static str>,
@@ -146,13 +148,16 @@ pub(crate) struct StartupSkillsCatalog {
     pub(crate) total_count: usize,
     pub(crate) returned_count: usize,
     pub(crate) truncated: bool,
-    pub(crate) entries: Vec<StartupSkillEntry>,
+    pub(crate) entries: Vec<Entry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) discovery_hint: Option<&'static str>,
 }
 
-impl StartupSkillsCatalog {
-    pub(crate) fn unavailable(reason_code: &'static str) -> Self {
+pub(crate) type StartupSkillsCatalog = StartupCatalog<StartupSkillEntry>;
+pub(crate) type StartupPluginsCatalog = StartupCatalog<StartupPluginEntry>;
+
+impl<Entry: Serialize> StartupCatalog<Entry> {
+    fn unavailable_with_hint(reason_code: &'static str, discovery_hint: &'static str) -> Self {
         Self {
             status: "unavailable",
             reason_code: Some(reason_code),
@@ -161,10 +166,58 @@ impl StartupSkillsCatalog {
             returned_count: 0,
             truncated: false,
             entries: Vec::new(),
-            discovery_hint: Some(
-                "Use skills.catalog or skill_list for explicit discovery when available.",
-            ),
+            discovery_hint: Some(discovery_hint),
         }
+    }
+
+    fn update_completeness(&mut self, upstream_truncated: bool, discovery_hint: &'static str) {
+        self.returned_count = self.entries.len();
+        self.truncated = upstream_truncated || self.returned_count < self.total_count;
+        self.discovery_hint = self.truncated.then_some(discovery_hint);
+    }
+
+    fn available_bounded(
+        catalog_revision: String,
+        total_count: usize,
+        upstream_truncated: bool,
+        entries: Vec<Entry>,
+        max_bytes: usize,
+        discovery_hint: &'static str,
+    ) -> Self {
+        let mut projection = Self {
+            status: "available",
+            reason_code: None,
+            catalog_revision: Some(catalog_revision),
+            total_count,
+            returned_count: 0,
+            truncated: false,
+            entries: Vec::new(),
+            discovery_hint: None,
+        };
+        for entry in entries {
+            projection.entries.push(entry);
+            projection.update_completeness(upstream_truncated, discovery_hint);
+            // Measure the full wire envelope: optional hints and JSON escaping
+            // participate in the budget. Preserve the original greedy prefix.
+            if !serde_json::to_vec(&projection)
+                .map(|bytes| bytes.len() <= max_bytes)
+                .unwrap_or(false)
+            {
+                projection.entries.pop();
+                break;
+            }
+        }
+        projection.update_completeness(upstream_truncated, discovery_hint);
+        projection
+    }
+}
+
+impl StartupSkillsCatalog {
+    pub(crate) fn unavailable(reason_code: &'static str) -> Self {
+        Self::unavailable_with_hint(
+            reason_code,
+            "Use skills.catalog or skill_list for explicit discovery when available.",
+        )
     }
 
     pub(crate) fn available(
@@ -172,77 +225,23 @@ impl StartupSkillsCatalog {
         discovery_truncated: bool,
         entries: Vec<StartupSkillEntry>,
     ) -> Self {
-        let total_count = entries.len();
-        let mut returned = Vec::new();
-        for entry in entries {
-            let mut candidate = returned.clone();
-            candidate.push(entry);
-            let truncated = discovery_truncated || candidate.len() < total_count;
-            let projection = Self {
-                status: "available",
-                reason_code: None,
-                catalog_revision: Some(catalog_revision.clone()),
-                total_count,
-                returned_count: candidate.len(),
-                truncated,
-                entries: candidate.clone(),
-                discovery_hint: truncated.then_some(
-                    "Use skills.catalog or skill_list for broader or refreshed discovery.",
-                ),
-            };
-            if serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= STARTUP_SKILL_CATALOG_MAX_BYTES)
-                .unwrap_or(false)
-            {
-                returned = candidate;
-            } else {
-                break;
-            }
-        }
-        let truncated = discovery_truncated || returned.len() < total_count;
-        Self {
-            status: "available",
-            reason_code: None,
-            catalog_revision: Some(catalog_revision),
-            total_count,
-            returned_count: returned.len(),
-            truncated,
-            entries: returned,
-            discovery_hint: truncated
-                .then_some("Use skills.catalog or skill_list for broader or refreshed discovery."),
-        }
+        Self::available_bounded(
+            catalog_revision,
+            entries.len(),
+            discovery_truncated,
+            entries,
+            STARTUP_SKILL_CATALOG_MAX_BYTES,
+            "Use skills.catalog or skill_list for broader or refreshed discovery.",
+        )
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct StartupPluginsCatalog {
-    pub(crate) status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reason_code: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) catalog_revision: Option<String>,
-    pub(crate) total_count: usize,
-    pub(crate) returned_count: usize,
-    pub(crate) truncated: bool,
-    pub(crate) entries: Vec<StartupPluginEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) discovery_hint: Option<&'static str>,
 }
 
 impl StartupPluginsCatalog {
     pub(crate) fn unavailable(reason_code: &'static str) -> Self {
-        Self {
-            status: "unavailable",
-            reason_code: Some(reason_code),
-            catalog_revision: None,
-            total_count: 0,
-            returned_count: 0,
-            truncated: false,
-            entries: Vec::new(),
-            discovery_hint: Some(
-                "Use explicit plugin_tool list and describe when Plugin discovery is available.",
-            ),
-        }
+        Self::unavailable_with_hint(
+            reason_code,
+            "Use explicit plugin_tool list and describe when Plugin discovery is available.",
+        )
     }
 
     pub(crate) fn available(
@@ -250,45 +249,14 @@ impl StartupPluginsCatalog {
         total_count: usize,
         entries: Vec<StartupPluginEntry>,
     ) -> Self {
-        let mut returned = Vec::new();
-        for entry in entries {
-            let mut candidate = returned.clone();
-            candidate.push(entry);
-            let truncated = candidate.len() < total_count;
-            let projection = Self {
-                status: "available",
-                reason_code: None,
-                catalog_revision: Some(catalog_revision.clone()),
-                total_count,
-                returned_count: candidate.len(),
-                truncated,
-                entries: candidate.clone(),
-                discovery_hint: truncated.then_some(
-                    "Use plugins.catalog or explicit plugin_tool list and describe for broader or current schema discovery.",
-                ),
-            };
-            if serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= STARTUP_PLUGIN_CATALOG_MAX_BYTES)
-                .unwrap_or(false)
-            {
-                returned = candidate;
-            } else {
-                break;
-            }
-        }
-        let truncated = returned.len() < total_count;
-        Self {
-            status: "available",
-            reason_code: None,
-            catalog_revision: Some(catalog_revision),
+        Self::available_bounded(
+            catalog_revision,
             total_count,
-            returned_count: returned.len(),
-            truncated,
-            entries: returned,
-            discovery_hint: truncated.then_some(
-                "Use plugins.catalog or explicit plugin_tool list and describe for broader or current schema discovery.",
-            ),
-        }
+            false,
+            entries,
+            STARTUP_PLUGIN_CATALOG_MAX_BYTES,
+            "Use plugins.catalog or explicit plugin_tool list and describe for broader or current schema discovery.",
+        )
     }
 }
 
@@ -322,6 +290,7 @@ pub(crate) struct StartupBriefInput<'a> {
     pub(crate) requested_project: &'a str,
     pub(crate) project_resolution: &'a Value,
     pub(crate) resolved: &'a ResolvedProject,
+    pub(crate) knowledge_association: Option<&'a Value>,
     pub(crate) session: &'a SessionSummary,
     pub(crate) continuation_kind: &'a str,
     pub(crate) reused: bool,
@@ -403,6 +372,9 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
         "deterministic": true,
         "llm_summary": false,
     });
+    if let Some(association) = input.knowledge_association {
+        brief["project"]["knowledge_association"] = association.clone();
+    }
     if let Some(extensions) = input.extensions {
         debug_assert!(extensions.serialized_len() <= STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES);
         brief["extensions"] = serde_json::to_value(extensions).unwrap_or_else(|_| {
@@ -1093,6 +1065,10 @@ fn continuation_projection(
             action_item,
         ),
     });
+
+    if active_jobs.get("active_job").is_some_and(Value::is_object) {
+        projected["jobs"]["active_job"] = active_jobs["active_job"].clone();
+    }
 
     if minimal {
         // The first action remains concrete, while bulk evidence lists are
@@ -2007,6 +1983,29 @@ mod tests {
     }
 
     #[test]
+    fn continuation_projection_preserves_only_explicit_active_job_handle() {
+        let feedback = json!({"status": "available", "attempt": {}, "validation_delta": {}});
+        let mut jobs = empty_active_jobs();
+        assert!(
+            continuation_projection(&feedback, &jobs, true, "continued")["jobs"]
+                .get("active_job")
+                .is_none()
+        );
+
+        jobs["active_job"] = json!({
+            "job_id": "job-exact",
+            "status": "running",
+            "kind": "shell"
+        });
+        let projected = continuation_projection(&feedback, &jobs, true, "continued");
+        assert_eq!(
+            projected["jobs"]["active_job"],
+            json!({"job_id": "job-exact", "status": "running", "kind": "shell"})
+        );
+        assert_eq!(projected["jobs"]["active_count"], 0);
+    }
+
+    #[test]
     fn validation_delta_truncates_only_still_failing_when_only_it_exceeds_limit() {
         let projected = continuation_projection(
             &delta_feedback(0, 1, 25),
@@ -2065,6 +2064,8 @@ mod tests {
                 client_id: "size".to_string(),
                 allow_patch: true,
             },
+            root_fingerprint: None,
+            knowledge_association: None,
         };
         let instructions = instruction_snapshot();
         let git = json!({
@@ -2145,6 +2146,7 @@ mod tests {
                 requested_project: "agent:size:demo",
                 project_resolution: &project_resolution,
                 resolved: &resolved,
+                knowledge_association: None,
                 session: &session,
                 continuation_kind: "continued",
                 reused: true,

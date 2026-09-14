@@ -805,6 +805,7 @@ async fn detached_process_uses_existing_job_identity_and_typed_runner_request() 
     assert!(result.success, "{:?}", result.error);
     let job_id = result.output["job_id"].as_str().unwrap().to_string();
     assert_eq!(result.output["execution_source"], "run_detached_process");
+    assert_observe_job_continuation(&result.output);
 
     let request = wait_for_patch_agent_request(&runtime, "detached-product-path").await;
     assert_eq!(request.kind, "start_detached_process_job");
@@ -879,6 +880,7 @@ async fn run_process_fast_terminal_jobs_project_back_without_visible_duplicates(
                 "job_status",
                 "observation_token",
                 "effective_timeout_secs",
+                "continuation",
                 "sync_wait_secs",
                 "async_handoff_available",
                 "failure_kind",
@@ -902,6 +904,7 @@ async fn run_process_fast_terminal_jobs_project_back_without_visible_duplicates(
             assert!(result.output["job_id"].is_null());
             assert!(result.output["job_status"].is_null());
             assert_eq!(result.output["async_handoff_available"], true);
+            assert!(result.output.get("continuation").is_none());
             assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
             assert_eq!(result.output["tool_failure"], false);
         }
@@ -1222,6 +1225,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     );
     let job_id = handoff.output["job_id"].as_str().unwrap().to_string();
     assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
+    assert_observe_job_continuation(&handoff.output);
 
     let status = runtime
         .job_status_for_auth(job_id.clone(), false, Some(&auth))
@@ -1649,6 +1653,7 @@ async fn run_process_transport_uncertainty_and_timeout_preserve_phase_a_truth() 
     assert_eq!(uncertain.output["execution_state"], "outcome_unknown");
     assert_eq!(uncertain.output["command_started"], true);
     assert_eq!(uncertain.output["command_completed"], false);
+    assert!(uncertain.output.get("continuation").is_none());
     assert!(uncertain
         .error
         .as_deref()

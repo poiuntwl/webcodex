@@ -3,6 +3,7 @@
 mod support;
 
 mod agent_tasks;
+mod agent_waits;
 mod apply_text_edits;
 mod assignment_fence;
 mod builtin_coding_workflow;
@@ -45,6 +46,7 @@ mod sessions_resolver;
 mod skills;
 mod specialized_dispatch;
 mod startup_brief;
+mod startup_catalog;
 mod sync_timeout;
 mod targeted_inventory;
 mod trusted_smoke;
@@ -54,4 +56,5 @@ mod validation_handoff;
 mod validation_identity;
 mod validation_summary;
 mod work_on_project;
+mod work_result;
 mod write_project_file;

@@ -288,7 +288,7 @@ impl Database {
             "objective": objective,
         }));
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Goal);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(goal_store_error)?;
@@ -353,7 +353,7 @@ impl Database {
     ) -> Result<GoalDetail, GoalStoreError> {
         validate_goal_principal(principal)?;
         validate_goal_id(goal_id)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Goal);
         load_owned_goal(&conn, principal, goal_id)
     }
 
@@ -377,7 +377,7 @@ impl Database {
                 "offset exceeds the durable Goal store range",
             )
         })?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Goal);
         let (total_count, goal_ids) = match lifecycle {
             Some(lifecycle) => {
                 let total_count = conn
@@ -532,7 +532,7 @@ impl Database {
             "terminal_reason": terminal_reason,
         }));
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Goal);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(goal_store_error)?;
@@ -709,7 +709,7 @@ impl Database {
             "kind": kind,
             "reference_id": reference_id,
         }));
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Goal);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(goal_store_error)?;
@@ -767,6 +767,29 @@ impl Database {
                     "goal_correlation_capacity_exceeded",
                     format!("Goal correlation count is limited to {MAX_GOAL_CORRELATIONS}"),
                 ));
+            }
+            if kind == GoalCorrelationKind::AgentTask {
+                let active_goal_fanout = transaction
+                    .query_row(
+                        "SELECT COUNT(*)
+                         FROM wc_goal_correlations c
+                         JOIN wc_goals g ON g.goal_id = c.goal_id
+                         WHERE c.kind = 'agent_task' AND c.reference_id = ?1
+                           AND g.lifecycle = 'active'
+                           AND g.owner_principal_kind = ?2
+                           AND g.owner_principal_digest = ?3",
+                        params![reference_id, principal.kind, principal.digest],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(goal_store_error)?;
+                if active_goal_fanout >= MAX_GOAL_CORRELATIONS {
+                    return Err(GoalStoreError::new(
+                        "goal_agent_task_fanout_capacity_exceeded",
+                        format!(
+                            "One AgentTask may be correlated to at most {MAX_GOAL_CORRELATIONS} active Goals per owner"
+                        ),
+                    ));
+                }
             }
             transaction
                 .execute(

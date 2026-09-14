@@ -1061,7 +1061,12 @@ impl ToolRuntime {
         // potentially slow startup probes, then share it across continuation,
         // the legacy full verdict, and the model-facing brief.
         let active_jobs = self
-            .active_jobs_summary(Some(&resolved.resolved_id), auth, 10)
+            .active_jobs_summary(
+                Some(&resolved.resolved_id),
+                Some(&session_outcome.summary.session_id),
+                auth,
+                10,
+            )
             .await;
         let continuation_feedback = self
             .startup_continuation_feedback(
@@ -1152,6 +1157,9 @@ impl ToolRuntime {
             // A fresh Session starts at the currently resolved canonical root.
             Some(true)
         };
+        let knowledge_association = self
+            .project_knowledge_association_diagnostic(&resolved, auth)
+            .await;
         let project_resolution_value =
             serde_json::to_value(&project_resolution).unwrap_or_else(|_| json!({}));
         let startup_brief = build_startup_brief(StartupBriefInput {
@@ -1159,6 +1167,7 @@ impl ToolRuntime {
             requested_project: &project,
             project_resolution: &project_resolution_value,
             resolved: &resolved,
+            knowledge_association: knowledge_association.as_ref(),
             session: session_summary,
             continuation_kind,
             reused: session_outcome.reused,
@@ -1563,7 +1572,7 @@ impl ToolRuntime {
         append_hygiene_warnings(&hygiene, &mut final_warnings);
 
         let jobs = self
-            .active_jobs_summary(Some(&resolved.resolved_id), auth, 10)
+            .active_jobs_summary(Some(&resolved.resolved_id), Some(&session_id), auth, 10)
             .await;
         if let Some(warnings) = jobs.get("warnings").and_then(Value::as_array) {
             final_warnings.extend(warnings.iter().cloned());
@@ -2070,6 +2079,8 @@ struct WorkOnProjectSessionProjection {
 #[derive(Deserialize)]
 struct WorkOnProjectProjectProjection {
     resolved_id: String,
+    #[serde(default)]
+    knowledge_association: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2443,6 +2454,9 @@ fn project_work_on_project_output_with_workflow_inner(
         "instructions": instructions,
         "semantic_navigation": semantic_navigation,
     }));
+    if let Some(knowledge_association) = projection.project.knowledge_association {
+        result.output["knowledge_association"] = knowledge_association;
+    }
     if let Some(extensions) = projection.extensions {
         result.output["extensions"] = extensions;
     }
@@ -3068,7 +3082,7 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
         == Some(false)
     {
         if output
-            .pointer("/changes/show_changes/diff_review_handoff/tool")
+            .pointer("/changes/show_changes/diff_review_handoff/recovery/tool")
             .and_then(Value::as_str)
             == Some("git_diff_hunks")
         {
@@ -3173,7 +3187,9 @@ mod startup_runner_tests {
             "workspace": {"clean": false},
             "changes": {
                 "show_changes": {
-                    "diff_review_handoff": {"tool": "git_diff_hunks"}
+                    "diff_review_handoff": {
+                        "recovery": {"tool": "git_diff_hunks", "arguments": {}}
+                    }
                 }
             },
             "jobs": {"blocking_active_count": 0},
@@ -3186,7 +3202,7 @@ mod startup_runner_tests {
             .any(|action| action == "continue the diff review with git_diff_hunks"));
         assert!(
             crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
-                output["changes"]["show_changes"]["diff_review_handoff"]["tool"]
+                output["changes"]["show_changes"]["diff_review_handoff"]["recovery"]["tool"]
                     .as_str()
                     .unwrap()
             )
@@ -3205,6 +3221,8 @@ mod startup_runner_tests {
                 client_id: client_id.to_string(),
                 allow_patch: true,
             },
+            root_fingerprint: None,
+            knowledge_association: None,
         }
     }
 

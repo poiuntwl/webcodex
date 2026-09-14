@@ -336,6 +336,7 @@ pub enum McpAppEndpointRecovery {
         endpoint: AgentEndpointRecord,
         replayed: bool,
         state_changed: bool,
+        successor_needs_recovery: bool,
     },
 }
 
@@ -663,7 +664,7 @@ impl Database {
             "specialty_labels": specialty_labels,
         }));
         let now = now_unix_ms();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -744,7 +745,7 @@ impl Database {
     ) -> Result<AgentIdentityPage, CommunicationStoreError> {
         validate_communication_principal(principal)?;
         let limit = bounded_limit(limit)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         if let Some(agent_id) = agent_id {
             validate_id(agent_id, DURABLE_AGENT_ID_PREFIX, "invalid_agent_id")?;
             let owned: bool = conn
@@ -791,7 +792,7 @@ impl Database {
                         (SELECT COUNT(*) FROM wc_agent_deliveries d
                          WHERE d.recipient_agent_id = a.agent_id AND d.state = 'queued'),
                         (SELECT COUNT(*) FROM wc_agent_wakes w
-                         WHERE w.target_agent_id = a.agent_id AND w.state != 'consumed'),
+                         WHERE w.target_agent_id = a.agent_id AND w.state NOT IN ('consumed', 'retired')),
                         (SELECT w.wake_id FROM wc_agent_wakes w
                          WHERE w.target_agent_id = a.agent_id
                          ORDER BY w.created_at_unix_ms DESC, w.wake_id DESC LIMIT 1),
@@ -857,7 +858,7 @@ impl Database {
                 "At least one Agent profile field must be provided",
             ));
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -956,7 +957,7 @@ impl Database {
         }));
         let now = now_unix_ms();
         let lease_expires_at_unix_ms = now.saturating_add(DEFAULT_ENDPOINT_LEASE_MS);
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1020,6 +1021,7 @@ impl Database {
                 previous_endpoint_id,
                 *previous_generation,
                 now,
+                true,
             )?;
         }
         transaction
@@ -1137,7 +1139,7 @@ impl Database {
         }));
         let now = now_unix_ms();
         let lease_expires_at_unix_ms = now.saturating_add(DEFAULT_ENDPOINT_LEASE_MS);
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1174,7 +1176,7 @@ impl Database {
                 .map_err(store_error)?;
             if replacement.agent_id != agent_id
                 || replacement.controller_generation != expected_replacement_generation
-                || current_controller_generation != replacement.controller_generation
+                || current_controller_generation < replacement.controller_generation
                 || replacement.lifecycle == AgentEndpointLifecycle::Detached
             {
                 return Err(CommunicationStoreError::new(
@@ -1190,17 +1192,27 @@ impl Database {
                 )
                 .map_err(store_error)?;
             if successor_window.as_deref() != Some(client_window_key) {
+                if current_controller_generation > replacement.controller_generation {
+                    return Err(CommunicationStoreError::new(
+                        "endpoint_generation_stale",
+                        "A newer unrelated Endpoint generation retired this recovery lineage",
+                    ));
+                }
                 return Err(CommunicationStoreError::new(
                     "host_binding_stale",
                     "Recovered Agent Endpoint no longer retains this Host ClientWindow",
                 ));
             }
+            let successor_needs_recovery = replacement.lifecycle == AgentEndpointLifecycle::Expired
+                || (replacement.lifecycle == AgentEndpointLifecycle::Attached
+                    && replacement.lease_expires_at_unix_ms <= now);
             return Ok(McpAppEndpointRecovery::Replaced {
                 from_endpoint_id: endpoint_id.to_string(),
                 from_controller_generation: expected_controller_generation,
                 endpoint: replacement,
                 replayed: true,
                 state_changed: false,
+                successor_needs_recovery,
             });
         }
 
@@ -1265,6 +1277,7 @@ impl Database {
             endpoint_id,
             expected_controller_generation,
             now,
+            true,
         )?;
         transaction
             .execute(
@@ -1351,6 +1364,7 @@ impl Database {
             endpoint,
             replayed: false,
             state_changed: true,
+            successor_needs_recovery: false,
         })
     }
 
@@ -1361,7 +1375,7 @@ impl Database {
     ) -> Result<AgentEndpointMutation, CommunicationStoreError> {
         validate_communication_principal(principal)?;
         validate_id(endpoint_id, AGENT_ENDPOINT_ID_PREFIX, "invalid_endpoint_id")?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1388,6 +1402,7 @@ impl Database {
             endpoint_id,
             current.controller_generation,
             now,
+            true,
         )?;
         transaction
             .execute(
@@ -1427,7 +1442,7 @@ impl Database {
         }
         let now = now_unix_ms();
         let lease_expires_at_unix_ms = now.saturating_add(DEFAULT_ENDPOINT_LEASE_MS);
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1472,7 +1487,7 @@ impl Database {
         expected_controller_generation: i64,
     ) -> Result<AgentEndpointRecord, CommunicationStoreError> {
         validate_communication_principal(principal)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         require_current_endpoint(
             &conn,
             principal,
@@ -1555,7 +1570,7 @@ impl Database {
         if let Some(window_key) = client_window_key {
             validate_mcp_app_client_window_key(window_key)?;
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1592,6 +1607,7 @@ impl Database {
                 endpoint_id,
                 expected_controller_generation,
                 now,
+                false,
             )?;
         }
         transaction
@@ -1633,7 +1649,7 @@ impl Database {
     ) -> Result<Option<AgentEndpointRecord>, CommunicationStoreError> {
         validate_communication_principal(principal)?;
         validate_mcp_app_recovery_fingerprint(recovery_fingerprint)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         let current = require_current_endpoint(
             &conn,
             principal,
@@ -1670,7 +1686,7 @@ impl Database {
     ) -> Result<Option<AgentEndpointRecord>, CommunicationStoreError> {
         validate_communication_principal(principal)?;
         validate_mcp_app_client_window_key(client_window_key)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         let current = require_current_endpoint(
             &conn,
             principal,
@@ -1708,7 +1724,7 @@ impl Database {
         if let Some(window_key) = client_window_key {
             validate_mcp_app_client_window_key(window_key)?;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         let _current = require_current_endpoint(
             &conn,
             principal,
@@ -1750,7 +1766,7 @@ impl Database {
         if let Some(window_key) = client_window_key {
             validate_mcp_app_client_window_key(window_key)?;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         let current = require_current_endpoint(
             &conn,
             principal,
@@ -1792,7 +1808,7 @@ impl Database {
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
         let request_hash = digest_json(&json!({"title": title, "agent_ids": agent_ids}));
         let now = now_unix_ms();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -1915,7 +1931,7 @@ impl Database {
     ) -> Result<ConversationPage, CommunicationStoreError> {
         validate_communication_principal(principal)?;
         let limit = bounded_limit(limit)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         let agent_id = authorize_list_access(&conn, principal, access)?;
         let (where_clause, identity) = match agent_id.as_deref() {
             Some(agent_id) => (
@@ -2002,7 +2018,7 @@ impl Database {
             ));
         }
         let limit = bounded_limit(limit)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         read_conversation_in_connection(&conn, principal, access, conversation_id, after_seq, limit)
     }
 
@@ -2131,7 +2147,7 @@ impl Database {
             "wake_reply_id": wake_reply.as_ref().map(|(wake_id, _)| wake_id),
             "reply_operation_index": wake_reply.as_ref().map(|(_, index)| index),
         }));
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -2210,6 +2226,12 @@ impl Database {
                     return Err(CommunicationStoreError::new(
                         "wake_already_consumed",
                         "Agent Wake was already consumed; re-read the Conversation before posting new work",
+                    ));
+                }
+                AgentWakeState::Retired => {
+                    return Err(CommunicationStoreError::new(
+                        "wake_retired",
+                        "Agent Wake was retired before dispatch and no longer authorizes a reply",
                     ));
                 }
             }
@@ -2439,7 +2461,7 @@ impl Database {
             ));
         }
         let limit = bounded_limit(limit)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
         require_current_endpoint(
             &conn,
             principal,
@@ -2527,7 +2549,7 @@ impl Database {
         validate_id(agent_id, DURABLE_AGENT_ID_PREFIX, "invalid_agent_id")?;
         validate_id(endpoint_id, AGENT_ENDPOINT_ID_PREFIX, "invalid_endpoint_id")?;
         let delivery_ids = canonicalize_delivery_ids(delivery_ids)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
@@ -2764,7 +2786,7 @@ pub(super) fn read_conversation_in_connection(
     })
 }
 
-fn require_agent_owner(
+pub(super) fn require_agent_owner(
     conn: &Connection,
     principal: &CommunicationPrincipal,
     agent_id: &str,
@@ -2870,7 +2892,7 @@ pub(super) fn load_agent(
                 (SELECT COUNT(*) FROM wc_agent_deliveries d
                  WHERE d.recipient_agent_id = a.agent_id AND d.state = 'queued'),
                 (SELECT COUNT(*) FROM wc_agent_wakes w
-                 WHERE w.target_agent_id = a.agent_id AND w.state != 'consumed'),
+                 WHERE w.target_agent_id = a.agent_id AND w.state NOT IN ('consumed', 'retired')),
                 (SELECT w.wake_id FROM wc_agent_wakes w
                  WHERE w.target_agent_id = a.agent_id
                  ORDER BY w.created_at_unix_ms DESC, w.wake_id DESC LIMIT 1),

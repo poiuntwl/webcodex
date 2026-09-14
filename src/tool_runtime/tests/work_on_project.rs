@@ -20,13 +20,13 @@ use crate::tool_runtime::{
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
-use webcodex_core::configured_skills::{
-    ConfiguredSkillDescriptor, ConfiguredSkillRootsListResponse, ConfiguredSkillRootsRequest,
-    CONFIGURED_SKILL_ROOTS_RESPONSE_FORMAT,
-};
 use webcodex_core::plugin::{
     PluginGatewayRequest, PluginGatewayResponse, PluginGatewayResponsePayload,
     PluginSelectionAnnotations, ProjectPluginCatalog, ProjectPluginCatalogEntry,
+};
+use webcodex_core::runner_skill::{
+    RunnerSkillDescriptor, RunnerSkillListResponse, RunnerSkillRequest,
+    RUNNER_SKILL_RESPONSE_FORMAT,
 };
 
 fn record_window_activity_fixture(
@@ -345,6 +345,14 @@ fn seed_managed_tool_runtime_fixture(source: &Path, worktree: &Path) -> String {
     sha
 }
 
+fn managed_source_root_fingerprint() -> String {
+    format!("wc_projroot_{}", "1".repeat(64))
+}
+
+fn managed_target_root_fingerprint() -> String {
+    format!("wc_projroot_{}", "2".repeat(64))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_with_managed_worktree_runner(
     runtime: &ToolRuntime,
@@ -413,6 +421,13 @@ async fn dispatch_with_managed_worktree_runner(
                     "allow_patch": true,
                     "disabled": false,
                     "revision": format!("sha256:{}", "b".repeat(64)),
+                    "root_fingerprint": managed_target_root_fingerprint(),
+                    "lineage": {
+                        "kind": "managed_worktree_source",
+                        "source_project_id": "source",
+                        "source_root_fingerprint": managed_source_root_fingerprint(),
+                        "base_sha": base_sha,
+                    },
                     "source": "managed_worktree",
                     "outcome": outcome,
                     "registered": registered,
@@ -626,7 +641,7 @@ async fn dispatch_startup_with_configured_skill_catalog(
     client_id: &str,
     call: ToolCall,
     auth: &crate::auth::AuthContext,
-    configured_skill: ConfiguredSkillDescriptor,
+    configured_skill: RunnerSkillDescriptor,
 ) -> (ToolResult, Vec<String>) {
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -645,15 +660,15 @@ async fn dispatch_startup_with_configured_skill_catalog(
             continue;
         };
         request_kinds.push(request.kind.clone());
-        if request.kind == "configured_skill_roots" {
-            let operation: ConfiguredSkillRootsRequest = serde_json::from_str(
+        if request.kind == "skill" {
+            let operation: RunnerSkillRequest = serde_json::from_str(
                 request
                     .content
                     .as_deref()
-                    .expect("typed configured Skill roots request"),
+                    .expect("typed Runner Skill request"),
             )
             .unwrap();
-            assert!(matches!(operation, ConfiguredSkillRootsRequest::List));
+            assert!(matches!(operation, RunnerSkillRequest::List));
             runtime
                 .runner_registry
                 .complete(RunnerResultRequest {
@@ -662,8 +677,8 @@ async fn dispatch_startup_with_configured_skill_catalog(
                     request_id: request.request_id,
                     exit_code: Some(0),
                     stdout: Some(
-                        serde_json::to_string(&ConfiguredSkillRootsListResponse {
-                            format: CONFIGURED_SKILL_ROOTS_RESPONSE_FORMAT.to_string(),
+                        serde_json::to_string(&RunnerSkillListResponse {
+                            format: RUNNER_SKILL_RESPONSE_FORMAT.to_string(),
                             skills: vec![configured_skill.clone()],
                             invalid_count: 0,
                             diagnostics: Vec::new(),
@@ -1277,7 +1292,7 @@ async fn work_on_project_extension_catalog_is_defaulted_bounded_and_skips_all_ex
 }
 
 #[tokio::test]
-async fn work_on_project_extension_catalog_includes_runner_configured_skill_roots() {
+async fn work_on_project_extension_catalog_includes_runner_local_configured_skill() {
     let root = tempfile::tempdir().unwrap();
     init_git_repo(root.path());
     let runtime = ToolRuntime::new_for_tests();
@@ -1290,7 +1305,7 @@ async fn work_on_project_extension_catalog_includes_runner_configured_skill_root
             shell: true,
             git: true,
             file_read: true,
-            configured_skill_roots_read: true,
+            skill_runtime: true,
             ..Default::default()
         },
     )
@@ -1303,7 +1318,7 @@ async fn work_on_project_extension_catalog_includes_runner_configured_skill_root
         "wop-ext-configured-skill",
         work_on_project_call_with_extensions(&project, "discover configured Skill", true),
         &auth,
-        ConfiguredSkillDescriptor {
+        RunnerSkillDescriptor::Configured {
             skill_id: configured_id.clone(),
             name: "operator-live-guidance".to_string(),
             description: "Configured live Skill metadata".to_string(),
@@ -1312,7 +1327,7 @@ async fn work_on_project_extension_catalog_includes_runner_configured_skill_root
     )
     .await;
     assert!(result.success, "{:?}", result.error);
-    assert!(requests.iter().any(|kind| kind == "configured_skill_roots"));
+    assert!(requests.iter().any(|kind| kind == "skill"));
     let skills = &result.output["extensions"]["skills"];
     assert_eq!(skills["status"], "available");
     assert_eq!(skills["total_count"], 1);
@@ -2126,6 +2141,8 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
     let source_status_before = managed_fixture_git(&source, &["status", "--porcelain"]);
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "wop-managed";
+    let mut source_project = registered_project("source", &source_path);
+    source_project.root_fingerprint = Some(managed_source_root_fingerprint());
     register_agent_with_projects(
         &runtime,
         client_id,
@@ -2140,7 +2157,7 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
             internal_posix_script: true,
             ..Default::default()
         },
-        Vec::new(),
+        vec![source_project],
     )
     .await;
 
@@ -2182,6 +2199,17 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
     assert_eq!(first.output["worktree"]["base_sha"], base_sha);
     assert_eq!(first.output["worktree"]["source_dirty"], true);
     assert_eq!(
+        first.output["knowledge_association"]["kind"],
+        "managed_worktree_source"
+    );
+    assert_eq!(first.output["knowledge_association"]["status"], "available");
+    assert_eq!(
+        first.output["knowledge_association"]["source_project"],
+        "agent:wop-managed:source"
+    );
+    assert_eq!(first.output["knowledge_association"]["base_sha"], base_sha);
+    assert_eq!(first.output["knowledge_association"]["read_through"], false);
+    assert_eq!(
         first.output["project_resolution"]["source"],
         "managed_worktree"
     );
@@ -2197,6 +2225,8 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
     let compact = first.output.to_string();
     assert!(!compact.contains(&source_path));
     assert!(!compact.contains(&managed_path));
+    assert!(!compact.contains(&managed_source_root_fingerprint()));
+    assert!(!compact.contains("managed_operation_id"));
     let session_id = first.output["session_id"].as_str().unwrap().to_string();
     let session = runtime.sessions.summary(&session_id, Some(50)).unwrap();
     assert_eq!(session.project.as_deref(), Some(project));

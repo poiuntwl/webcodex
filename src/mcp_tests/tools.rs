@@ -678,6 +678,8 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         "search_project_texts",
         "tool_manifest",
         "show_changes",
+        "work_on_project",
+        "workspace_hygiene_check",
     ] {
         let tool = full["tools"]
             .as_array()
@@ -687,10 +689,10 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
             .unwrap_or_else(|| panic!("missing {name} schema"));
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
         assert!(
-            properties.contains_key(
+            !properties.contains_key(
                 crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
             ),
-            "{name} must advertise recovery ACK even when it does not advance checkpoints"
+            "{name} must not advertise context ACK"
         );
         assert!(properties.contains_key(
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
@@ -703,7 +705,7 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD
         ));
     }
-    for name in ["work_on_project", "apply_text_edits", "run_process"] {
+    for name in ["session_handoff_summary", "apply_text_edits", "run_process"] {
         let tool = full["tools"]
             .as_array()
             .unwrap()
@@ -714,6 +716,35 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         assert!(properties.contains_key(
             crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
         ));
+        assert_eq!(
+            properties["ack_session_context_revision"]["description"],
+            "Echo the latest retained session_context_revision; omit when unknown."
+        );
+        assert!(
+            tool["outputSchema"]["properties"]["output"]["properties"]["session_continuity"]
+                ["properties"]["status"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("recovered"))
+        );
+        let suggested = &tool["outputSchema"]["properties"]["output"]["properties"]
+            ["session_continuity"]["properties"]["suggested_call"];
+        assert_eq!(
+            suggested["properties"]["tool"]["const"],
+            "session_handoff_summary"
+        );
+        assert_eq!(
+            suggested["properties"]["arguments"]["required"],
+            json!(["session_id"])
+        );
+        let continuity = &tool["outputSchema"]["properties"]["output"]["properties"]
+            ["session_continuity"]["properties"];
+        assert!(continuity.get("recovery_tool").is_none());
+        assert!(continuity.get("recovery_session_id").is_none());
+        assert!(continuity.get("recovery_required").is_none());
+        assert!(tool["outputSchema"]["properties"]["output"]["properties"]
+            .get("session_context_continuation")
+            .is_none());
         assert!(properties.contains_key(
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
         ));
@@ -735,6 +766,12 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         .find(|tool| tool["name"] == "read_files")
         .expect("full-operator read_files schema");
     let read_files_output = serde_json::to_string(&read_files["outputSchema"]).unwrap();
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("\"recovery_required\""));
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("\"session_context_continuation\""));
     assert!(read_files_output.contains("context_projection"));
     assert!(read_files_output.contains("post_tool"));
     let list_tools = full["tools"]
@@ -916,7 +953,7 @@ fn stateless_context_revision_ack_is_request_scoped_and_removed_before_parsing()
 }
 
 #[test]
-fn no_checkpoint_tool_still_accepts_context_revision_ack() {
+fn reobservable_tool_strips_cached_context_ack_without_accepting_it() {
     let mut arguments = json!({
         "project": "proj",
         "items": [{"path": "src/lib.rs"}],
@@ -930,7 +967,7 @@ fn no_checkpoint_tool_still_accepts_context_revision_ack() {
 
     let accepts_ack =
         crate::tool_runtime::tool_definition::runtime_tool_accepts_context_ack("read_files");
-    assert!(accepts_ack);
+    assert!(!accepts_ack);
     assert_eq!(
         session_context_revision_ack_from_wire(Some(ack)),
         crate::tool_runtime::sessions::SessionContextRevisionAck::Revision(41)
@@ -1292,6 +1329,8 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -2098,6 +2137,8 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,

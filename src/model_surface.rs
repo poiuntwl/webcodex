@@ -338,10 +338,12 @@ mod tests {
     const EXPECTED_ADAPTIVE_RUNTIME_DIRECT_TOOL_NAMES: &[&str] = &[
         "work_on_project",
         "session_discussion_summary",
+        "session_handoff_summary",
         "present_goal_plan",
         "present_agent_continuation",
         "rotate_agent_continuation_endpoint",
         "runtime_status",
+        "wait_for_agent_events",
         "plugin_tool",
         "tool_manifest",
         "search_project_texts",
@@ -362,6 +364,7 @@ mod tests {
         "show_changes",
         "workspace_hygiene_check",
         "finish_coding_task",
+        "present_work_result",
     ];
 
     #[test]
@@ -386,11 +389,20 @@ mod tests {
                 "session_hint.suggested_next_tool",
                 "session_discussion_summary",
             ),
-            ("observe_jobs", "recovery_tool", "list_jobs"),
-            ("show_changes", "diff_review_handoff.tool", "git_diff_hunks"),
+            ("observe_jobs", "items[].suggested_call.tool", "list_jobs"),
+            (
+                "run_process",
+                "session_continuity.suggested_call.tool",
+                "session_handoff_summary",
+            ),
+            (
+                "show_changes",
+                "diff_review_handoff.recovery.tool",
+                "git_diff_hunks",
+            ),
             (
                 "finish_coding_task",
-                "changes.show_changes.diff_review_handoff.tool",
+                "changes.show_changes.diff_review_handoff.recovery.tool",
                 "git_diff_hunks",
             ),
         ] {
