@@ -3,6 +3,7 @@
 use super::files::{SearchOptions, SearchRequest};
 use super::project_resolution::ResolvedProject;
 use super::{SearchProjectTextsQuery, ToolResult, ToolRuntime};
+use crate::json_measurement::serialized_json_len;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -98,17 +99,13 @@ fn serialized_batch_len(output: &Value) -> usize {
 }
 
 fn serialized_value_len(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(value).unwrap_or(usize::MAX)
 }
 
 fn projected_batch_serialized_len(output: &Value, default_timeouts: &[bool]) -> usize {
     let mut projected = ToolResult::ok(output.clone());
     super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
-    serde_json::to_vec(&projected)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
 fn projected_search_item_len(item: &Value, default_timeout: bool) -> usize {
@@ -448,9 +445,7 @@ pub(crate) fn apply_model_facing_output_budget(
 fn final_model_result_len(output: &Value, default_timeouts: &[bool]) -> usize {
     let mut projected = ToolResult::ok(output.clone());
     super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
-    serde_json::to_vec(&projected)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
 fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {
@@ -650,6 +645,50 @@ mod tests {
         output.insert("context_before".to_string(), json!(0));
         output.insert("context_after".to_string(), json!(0));
         item
+    }
+
+    #[test]
+    fn batch_projection_preserves_incomplete_count_truth_after_path_filtering() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(crate::tool_runtime::SearchResultMode::Count),
+            timeout_secs: None,
+        })
+        .unwrap();
+        let marker = "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n";
+        let stdout = format!("{marker}/private/absolute/secret.rs\u{0}2\n");
+        let single = crate::tool_runtime::files::search_project_text_output(
+            "agent:special:demo",
+            &options,
+            &stdout,
+            Some(0),
+            "",
+        );
+        assert!(single.success, "{:?}", single.error);
+
+        let item = batch_item(0, single);
+        let mut batch = ToolResult::ok(batch_output(
+            "agent:special:demo",
+            1,
+            vec![item],
+            false,
+            None,
+            None,
+        ));
+        super::super::dispatch::sparsify_search_batch_success_for_model(&[true], &mut batch);
+        let output = &batch.output["items"][0]["output"];
+        assert_eq!(output["count_complete"], false);
+        assert_eq!(output["total_matches"], Value::Null);
+        assert_eq!(output["files"], json!([]));
+        assert!(!serde_json::to_string(&batch)
+            .unwrap()
+            .contains("/private/absolute/secret.rs"));
     }
 
     #[test]

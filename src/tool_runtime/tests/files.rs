@@ -281,7 +281,7 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
                         content: "do-not-log-this-content\n".to_string(),
                         session_id: Some(session_id),
                         overwrite: None,
-                        expected_sha256: None,
+                        expected_read_revision: None,
                     },
                     Some(&bootstrap),
                 )
@@ -622,6 +622,8 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
             exit_code: Some(0),
             stdout: Some(r#"{"deleted_paths":["tmp.txt"]}"#.to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -1074,7 +1076,7 @@ async fn conversation_import_durable_session_events_do_not_store_host_file_refs(
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("explicitly trusted OAuth MCP client"));
+        .contains("explicitly trusted OAuth MCP host-file rewrite"));
 
     let summary = runtime
         .sessions
@@ -2291,6 +2293,57 @@ fn search_status_and_records_must_agree_before_empty_is_trusted() {
     assert_eq!(proven_empty.output["exit_code"], 1);
 }
 
+#[test]
+fn search_count_uses_backend_evidence_without_claiming_filtered_absence() {
+    let options = SearchOptions::normalize(SearchRequest {
+        result_mode: Some(SearchResultMode::Count),
+        limit: Some(10),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let marker = "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n";
+
+    let no_match = search_project_text_output("demo", &options, marker, Some(1), "");
+    assert!(no_match.success, "{:?}", no_match.error);
+    assert_eq!(no_match.output["files"], json!([]));
+    assert_eq!(no_match.output["count_complete"], true);
+    assert_eq!(no_match.output["total_matches"], 0);
+
+    let safe_stdout = format!("{marker}src/lib.rs\u{0}2\n");
+    let safe = search_project_text_output("demo", &options, &safe_stdout, Some(0), "");
+    assert!(safe.success, "{:?}", safe.error);
+    assert_eq!(safe.output["count_complete"], true);
+    assert_eq!(safe.output["total_matches"], 2);
+    assert_eq!(safe.output["files"][0]["path"], "src/lib.rs");
+
+    let malformed_stdout = format!("{marker}src/lib.rs:not-a-number\n");
+    let malformed = search_project_text_output("demo", &options, &malformed_stdout, Some(0), "");
+    assert!(!malformed.success);
+    assert_eq!(
+        malformed.output["reason_code"],
+        "backend_output_inconsistent"
+    );
+
+    let filtered_stdout = format!("{marker}/private/absolute/secret.rs\u{0}2\n");
+    let filtered = search_project_text_output("demo", &options, &filtered_stdout, Some(0), "");
+    assert!(filtered.success, "{:?}", filtered.error);
+    assert_eq!(filtered.output["files"], json!([]));
+    assert_eq!(filtered.output["returned_match_count"], 0);
+    assert_eq!(filtered.output["count_complete"], false);
+    assert_eq!(filtered.output["total_matches"], Value::Null);
+    assert_eq!(filtered.output["truncated"], false);
+    assert!(!serde_json::to_string(&filtered)
+        .unwrap()
+        .contains("/private/absolute/secret.rs"));
+
+    let contradictory = search_project_text_output("demo", &options, &filtered_stdout, Some(1), "");
+    assert!(!contradictory.success);
+    assert_eq!(
+        contradictory.output["reason_code"],
+        "backend_output_inconsistent"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn search_command_preserves_rg_exit_2_despite_head() {
@@ -3074,6 +3127,8 @@ async fn search_agent_command_timeout_returns_search_timeout() {
                     .to_string(),
             ),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
@@ -3124,6 +3179,8 @@ async fn search_agent_execution_failure_is_structured_and_does_not_leak_diagnost
                     .to_string(),
             ),
             stderr: Some(private_diagnostic.to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(5),
             error: Some(private_diagnostic.to_string()),
         })
@@ -3180,6 +3237,8 @@ async fn search_agent_timeout_without_trusted_marker_cannot_return_partial_succe
             exit_code: Some(-1),
             stdout: Some("src/a.rs:1:needle\n".to_string()),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
@@ -3240,6 +3299,8 @@ async fn search_agent_timeout_with_complete_records_returns_partial_success() {
                     .to_string(),
             ),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
@@ -3315,6 +3376,8 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
             exit_code: Some(0),
             stdout: Some(String::new()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -4534,18 +4597,18 @@ async fn write_project_file_rejects_invalid_input_before_agent_dispatch() {
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("sensitive"));
-    // bad expected_sha256 format
+    // invalid model-facing read revision
     let result = runtime
         .write_project_file(
             "agent:c:p".to_string(),
             "EDIT_PROBE.txt".to_string(),
             "x".to_string(),
             Some(true),
-            Some("not-a-hash".to_string()),
+            Some(0),
         )
         .await;
     assert!(!result.success);
-    assert!(result.error.unwrap().contains("expected_sha256"));
+    assert!(result.error.unwrap().contains("expected_read_revision"));
 }
 
 #[test]

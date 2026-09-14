@@ -657,6 +657,14 @@ fn structured_validation_sync_wait_parser_enforces_lifecycle_bounds() {
             json!({"project": "demo", "check": true, "timeout_secs": 60, "sync_wait_secs": 60}),
         ),
         (
+            "cargo_fmt",
+            json!({"project": "demo", "check": false, "timeout_secs": 60, "sync_wait_secs": 1}),
+        ),
+        (
+            "cargo_fmt",
+            json!({"project": "demo", "timeout_secs": 60, "sync_wait_secs": 60}),
+        ),
+        (
             "cargo_test",
             json!({"project": "demo", "timeout_secs": 600, "sync_wait_secs": 61}),
         ),
@@ -669,6 +677,33 @@ fn structured_validation_sync_wait_parser_enforces_lifecycle_bounds() {
             .unwrap_or_else(|error| panic!("{name} valid sync wait should parse: {error}"));
     }
 
+    let check = ToolCall::from_tool_name(
+        "cargo_fmt",
+        json!({"project": "demo", "check": true, "timeout_secs": 60, "sync_wait_secs": 60}),
+    )
+    .unwrap();
+    assert!(matches!(
+        check,
+        ToolCall::CargoFmt {
+            check: Some(true),
+            sync_wait_secs: Some(60),
+            ..
+        }
+    ));
+    for arguments in [
+        json!({"project": "demo", "check": false, "timeout_secs": 60, "sync_wait_secs": 1}),
+        json!({"project": "demo", "timeout_secs": 60, "sync_wait_secs": 60}),
+    ] {
+        let ensure = ToolCall::from_tool_name("cargo_fmt", arguments).unwrap();
+        assert!(matches!(
+            ensure,
+            ToolCall::CargoFmt {
+                sync_wait_secs: None,
+                ..
+            }
+        ));
+    }
+
     for (name, arguments) in [
         (
             "cargo_check",
@@ -676,15 +711,15 @@ fn structured_validation_sync_wait_parser_enforces_lifecycle_bounds() {
         ),
         (
             "cargo_fmt",
-            json!({"project": "demo", "check": false, "timeout_secs": 60, "sync_wait_secs": 1}),
+            json!({"project": "demo", "check": false, "timeout_secs": 60, "sync_wait_secs": 0}),
         ),
         (
             "cargo_fmt",
-            json!({"project": "demo", "timeout_secs": 60, "sync_wait_secs": 1}),
+            json!({"project": "demo", "timeout_secs": 60, "sync_wait_secs": 0}),
         ),
     ] {
-        let error = ToolCall::from_tool_name(name, arguments)
-            .expect_err("zero or semantically unavailable sync wait must fail closed");
+        let error =
+            ToolCall::from_tool_name(name, arguments).expect_err("zero sync wait must fail closed");
         assert!(error.contains("sync_wait_secs"), "{name}: {error}");
     }
 }
@@ -967,8 +1002,8 @@ fn from_tool_name_unknown_tool_lists_available_tools_and_hint() {
     let err = ToolCall::from_tool_name("definitely_not_a_tool", Value::Null).unwrap_err();
     assert!(err.contains("definitely_not_a_tool"));
     assert!(
-        err.contains("listRuntimeTools") || err.contains("list_tools"),
-        "unknown-tool error should hint at discovery: {}",
+        err.contains("tool_manifest") && err.contains("tool_name"),
+        "unknown-tool error should hint at canonical discovery: {}",
         err
     );
     // Should list at least a couple of known tool names.
@@ -1574,12 +1609,12 @@ fn from_tool_name_parses_write_project_file() {
     .unwrap();
     assert!(matches!(
         write,
-        ToolCall::WriteProjectFile { project, path, content, overwrite, expected_sha256, .. }
+        ToolCall::WriteProjectFile { project, path, content, overwrite, expected_read_revision, .. }
             if project == "agent:c:p"
             && path == "new.txt"
             && content == "hello"
             && overwrite.is_none()
-            && expected_sha256.is_none()
+            && expected_read_revision.is_none()
     ));
 }
 
@@ -1592,14 +1627,14 @@ fn from_tool_name_rejects_retired_write_prefix_guard() {
             "path": "existing.txt",
             "content": "replacement",
             "overwrite": true,
-            "expected_sha256": "a".repeat(64),
+            "expected_read_revision": 3817291045227_u64,
             "expected_content_prefix": "legacy"
         }),
     )
     .expect_err("retired prefix guard must fail before dispatch");
     assert!(error.contains("expected_content_prefix"), "{error}");
     assert!(error.contains("no longer supported"), "{error}");
-    assert!(error.contains("expected_sha256"), "{error}");
+    assert!(error.contains("expected_read_revision"), "{error}");
 }
 
 #[test]

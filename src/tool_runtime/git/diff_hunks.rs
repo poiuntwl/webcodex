@@ -1,5 +1,4 @@
 use base64::{engine::general_purpose, Engine as _};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 pub(crate) use webcodex_core::runtime_contract::GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES;
@@ -16,22 +15,25 @@ use super::super::git_committed::{
 use super::super::helpers::{
     decode_git_quoted_path, shell_escape_simple, validate_project_relative_path,
 };
+use super::super::shell::{command_execution_state_name, ProjectCommandOutput};
 use super::super::tool_result::ToolResult;
 use super::super::{
     ContinuationCarrier, ContinuationKind, ContinuationSemantics, SuggestedToolCall, ToolRuntime,
 };
 use super::shared::{
-    is_git_object_hex, is_lower_hex, parse_fixed_decimal, parse_optional_bool,
-    parse_optional_usize, parse_status_result_field, strip_wire_lf,
+    is_git_object_hex, parse_fixed_decimal, parse_optional_bool, parse_optional_usize,
+    parse_status_result_field, strip_wire_lf,
 };
 
 pub(super) const DEFAULT_MAX_HUNKS: usize = 30;
 const MAX_MAX_HUNKS: usize = 100;
 pub(super) const DEFAULT_MAX_HUNK_LINES: usize = 160;
-pub(super) const MAX_MAX_HUNK_LINES: usize = 400;
-const GIT_DIFF_HUNKS_CONTINUATION_PREFIX: &str = "wcdh1.";
-const GIT_DIFF_HUNKS_CONTINUATION_VERSION: u8 = 1;
-const GIT_DIFF_HUNKS_COMMITTED_CONTINUATION_VERSION: u8 = 2;
+pub(crate) const MAX_MAX_HUNK_LINES: usize = 400;
+const GIT_DIFF_HUNKS_V2_CONTINUATION_PREFIX: &str = "wcdh2.";
+const GIT_DIFF_HUNKS_V2_WORKTREE_PAGE: u8 = 1;
+const GIT_DIFF_HUNKS_V2_COMMITTED_PAGE: u8 = 2;
+const GIT_DIFF_HUNKS_V2_WORKTREE_FRAGMENT: u8 = 3;
+const GIT_DIFF_HUNKS_V2_COMMITTED_FRAGMENT: u8 = 4;
 const GIT_DIFF_HUNKS_STDERR_BYTES: usize = 8 * 1024;
 const GIT_DIFF_HUNKS_BLOCK_TRAILER_BYTES: usize = 30;
 const GIT_DIFF_HUNKS_BLOCK_MAGIC: &[u8; 6] = b"WCDH1:";
@@ -141,17 +143,25 @@ pub(super) fn sparsify_complete_git_diff_hunks_output(output: &mut serde_json::M
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct GitDiffHunksContinuationV1 {
-    v: u8,
-    scope: String,
-    fence: String,
-    next: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mac: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitDiffHunksContinuation {
+    Page {
+        fence: String,
+        next_record: usize,
+    },
+    HunkFragment {
+        fence: String,
+        record_index: usize,
+        next_line: usize,
+    },
+}
+
+impl GitDiffHunksContinuation {
+    fn fence(&self) -> &str {
+        match self {
+            Self::Page { fence, .. } | Self::HunkFragment { fence, .. } => fence,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,15 +261,142 @@ fn git_diff_hunks_committed_token_mac(
     format!("{:x}", outer.finalize())
 }
 
-fn fixed_time_ascii_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
+fn git_diff_hunks_committed_hunk_fragment_token_mac(
+    key: &[u8; 32],
+    scope: &str,
+    fence: &str,
+    record_index: u64,
+    next_line: u64,
+) -> String {
+    const BLOCK_BYTES: usize = 64;
+    let mut ipad = [0x36u8; BLOCK_BYTES];
+    let mut opad = [0x5cu8; BLOCK_BYTES];
+    for (index, byte) in key.iter().enumerate() {
+        ipad[index] ^= byte;
+        opad[index] ^= byte;
     }
-    left.as_bytes()
-        .iter()
-        .zip(right.as_bytes())
-        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
-        == 0
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(b"webcodex.git-diff-hunks.continuation.hunk-fragment.committed.v1\0");
+    inner.update((scope.len() as u64).to_be_bytes());
+    inner.update(scope.as_bytes());
+    inner.update((fence.len() as u64).to_be_bytes());
+    inner.update(fence.as_bytes());
+    inner.update(record_index.to_be_bytes());
+    inner.update(next_line.to_be_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    format!("{:x}", outer.finalize())
+}
+
+fn decode_lower_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let nibble = |byte: u8| -> Option<u8> {
+                match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    _ => None,
+                }
+            };
+            Some((nibble(pair[0])? << 4) | nibble(pair[1])?)
+        })
+        .collect()
+}
+
+fn lower_hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
+}
+
+fn fixed_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+            == 0
+}
+
+fn encode_git_diff_hunks_v2_token(
+    tag: u8,
+    scope: &str,
+    fence: &str,
+    next: u64,
+    line: Option<u64>,
+    mac: Option<&str>,
+) -> Result<String, String> {
+    let scope_bytes = decode_lower_hex_bytes(scope)
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or_else(|| "invalid git diff continuation scope".to_string())?;
+    let fence_bytes = decode_lower_hex_bytes(fence)
+        .filter(|bytes| matches!(bytes.len(), 20 | 32) && is_git_object_hex(fence))
+        .ok_or_else(|| "invalid git diff continuation fence".to_string())?;
+    if next == 0 || line.is_some_and(|line| line == 0) {
+        return Err("invalid git diff continuation cursor".to_string());
+    }
+    let committed = matches!(
+        tag,
+        GIT_DIFF_HUNKS_V2_COMMITTED_PAGE | GIT_DIFF_HUNKS_V2_COMMITTED_FRAGMENT
+    );
+    let fragment = matches!(
+        tag,
+        GIT_DIFF_HUNKS_V2_WORKTREE_FRAGMENT | GIT_DIFF_HUNKS_V2_COMMITTED_FRAGMENT
+    );
+    if !matches!(tag, 1..=4) || fragment != line.is_some() || committed != mac.is_some() {
+        return Err("invalid git diff continuation shape".to_string());
+    }
+    let mac_bytes = match mac {
+        Some(mac) => Some(
+            decode_lower_hex_bytes(mac)
+                .filter(|bytes| bytes.len() == 32)
+                .ok_or_else(|| "invalid git diff continuation mac".to_string())?,
+        ),
+        None => None,
+    };
+    let mut payload = Vec::with_capacity(
+        1 + 32
+            + 1
+            + fence_bytes.len()
+            + 8
+            + usize::from(fragment) * 8
+            + usize::from(committed) * 32,
+    );
+    payload.push(tag);
+    payload.extend_from_slice(&scope_bytes);
+    payload.push(fence_bytes.len() as u8);
+    payload.extend_from_slice(&fence_bytes);
+    payload.extend_from_slice(&next.to_be_bytes());
+    if let Some(line) = line {
+        payload.extend_from_slice(&line.to_be_bytes());
+    }
+    if let Some(mac) = mac_bytes {
+        payload.extend_from_slice(&mac);
+    }
+    let value = format!(
+        "{GIT_DIFF_HUNKS_V2_CONTINUATION_PREFIX}{}",
+        general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    );
+    if value.len() > GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES {
+        return Err("git diff continuation exceeded its size bound".to_string());
+    }
+    Ok(value)
 }
 
 fn encode_git_diff_hunks_continuation(
@@ -267,21 +404,15 @@ fn encode_git_diff_hunks_continuation(
     fence: &str,
     next: usize,
 ) -> Result<String, String> {
-    let token = GitDiffHunksContinuationV1 {
-        v: GIT_DIFF_HUNKS_CONTINUATION_VERSION,
-        scope: scope.to_string(),
-        fence: fence.to_string(),
-        next: next as u64,
-        mode: None,
-        mac: None,
-    };
-    let encoded = general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&token).map_err(|_| "failed to encode git diff continuation")?);
-    let value = format!("{GIT_DIFF_HUNKS_CONTINUATION_PREFIX}{encoded}");
-    if value.len() > GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES {
-        return Err("git diff continuation exceeded its size bound".to_string());
-    }
-    Ok(value)
+    let next = u64::try_from(next).map_err(|_| "git diff continuation cursor overflow")?;
+    encode_git_diff_hunks_v2_token(
+        GIT_DIFF_HUNKS_V2_WORKTREE_PAGE,
+        scope,
+        fence,
+        next,
+        None,
+        None,
+    )
 }
 
 fn encode_git_diff_hunks_committed_continuation(
@@ -290,76 +421,170 @@ fn encode_git_diff_hunks_committed_continuation(
     fence: &str,
     next: usize,
 ) -> Result<String, String> {
-    let next = next as u64;
-    let token = GitDiffHunksContinuationV1 {
-        v: GIT_DIFF_HUNKS_COMMITTED_CONTINUATION_VERSION,
-        scope: scope.to_string(),
-        fence: fence.to_string(),
+    let next = u64::try_from(next).map_err(|_| "git diff continuation cursor overflow")?;
+    let mac = git_diff_hunks_committed_token_mac(key, scope, fence, next);
+    encode_git_diff_hunks_v2_token(
+        GIT_DIFF_HUNKS_V2_COMMITTED_PAGE,
+        scope,
+        fence,
         next,
-        mode: Some("committed".to_string()),
-        mac: Some(git_diff_hunks_committed_token_mac(key, scope, fence, next)),
-    };
-    let encoded = general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&token).map_err(|_| "failed to encode git diff continuation")?);
-    let value = format!("{GIT_DIFF_HUNKS_CONTINUATION_PREFIX}{encoded}");
-    if value.len() > GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES {
-        return Err("git diff continuation exceeded its size bound".to_string());
+        None,
+        Some(&mac),
+    )
+}
+
+fn encode_git_diff_hunks_hunk_fragment_continuation(
+    scope: &str,
+    fence: &str,
+    record_index: usize,
+    next_line: usize,
+) -> Result<String, String> {
+    let record_index =
+        u64::try_from(record_index).map_err(|_| "git diff continuation cursor overflow")?;
+    let next_line = u64::try_from(next_line).map_err(|_| "git diff continuation line overflow")?;
+    encode_git_diff_hunks_v2_token(
+        GIT_DIFF_HUNKS_V2_WORKTREE_FRAGMENT,
+        scope,
+        fence,
+        record_index,
+        Some(next_line),
+        None,
+    )
+}
+
+fn encode_git_diff_hunks_committed_hunk_fragment_continuation(
+    key: &[u8; 32],
+    scope: &str,
+    fence: &str,
+    record_index: usize,
+    next_line: usize,
+) -> Result<String, String> {
+    let record_index =
+        u64::try_from(record_index).map_err(|_| "git diff continuation cursor overflow")?;
+    let next_line = u64::try_from(next_line).map_err(|_| "git diff continuation line overflow")?;
+    let mac = git_diff_hunks_committed_hunk_fragment_token_mac(
+        key,
+        scope,
+        fence,
+        record_index,
+        next_line,
+    );
+    encode_git_diff_hunks_v2_token(
+        GIT_DIFF_HUNKS_V2_COMMITTED_FRAGMENT,
+        scope,
+        fence,
+        record_index,
+        Some(next_line),
+        Some(&mac),
+    )
+}
+
+fn decode_git_diff_hunks_v2_continuation(
+    raw: &str,
+    expected_scope: &str,
+    committed_mac_key: Option<&[u8; 32]>,
+) -> Result<GitDiffHunksContinuation, GitDiffHunksContinuationError> {
+    let encoded = raw
+        .strip_prefix(GIT_DIFF_HUNKS_V2_CONTINUATION_PREFIX)
+        .ok_or(GitDiffHunksContinuationError::Invalid)?;
+    let payload = general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| GitDiffHunksContinuationError::Invalid)?;
+    if payload.len() < 1 + 32 + 1 + 20 + 8 {
+        return Err(GitDiffHunksContinuationError::Invalid);
     }
-    Ok(value)
+    let tag = payload[0];
+    let (committed, fragment) = match tag {
+        GIT_DIFF_HUNKS_V2_WORKTREE_PAGE => (false, false),
+        GIT_DIFF_HUNKS_V2_COMMITTED_PAGE => (true, false),
+        GIT_DIFF_HUNKS_V2_WORKTREE_FRAGMENT => (false, true),
+        GIT_DIFF_HUNKS_V2_COMMITTED_FRAGMENT => (true, true),
+        _ => return Err(GitDiffHunksContinuationError::Invalid),
+    };
+    if committed != committed_mac_key.is_some() {
+        return Err(GitDiffHunksContinuationError::ScopeMismatch);
+    }
+    let scope = lower_hex_bytes(&payload[1..33]);
+    let fence_len = payload[33] as usize;
+    if !matches!(fence_len, 20 | 32) {
+        return Err(GitDiffHunksContinuationError::Invalid);
+    }
+    let expected_len =
+        1 + 32 + 1 + fence_len + 8 + usize::from(fragment) * 8 + usize::from(committed) * 32;
+    if payload.len() != expected_len {
+        return Err(GitDiffHunksContinuationError::Invalid);
+    }
+    let fence_start = 34;
+    let fence_end = fence_start + fence_len;
+    let fence = lower_hex_bytes(&payload[fence_start..fence_end]);
+    if !is_git_object_hex(&fence) {
+        return Err(GitDiffHunksContinuationError::Invalid);
+    }
+    let mut cursor = fence_end;
+    let next = u64::from_be_bytes(
+        payload[cursor..cursor + 8]
+            .try_into()
+            .map_err(|_| GitDiffHunksContinuationError::Invalid)?,
+    );
+    cursor += 8;
+    if next == 0 {
+        return Err(GitDiffHunksContinuationError::Invalid);
+    }
+    let record_or_next =
+        usize::try_from(next).map_err(|_| GitDiffHunksContinuationError::Invalid)?;
+    let line = if fragment {
+        let line = u64::from_be_bytes(
+            payload[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| GitDiffHunksContinuationError::Invalid)?,
+        );
+        cursor += 8;
+        if line == 0 || usize::try_from(line).is_err() {
+            return Err(GitDiffHunksContinuationError::Invalid);
+        }
+        Some(line)
+    } else {
+        None
+    };
+    if let Some(key) = committed_mac_key {
+        let supplied_mac = &payload[cursor..cursor + 32];
+        let expected_mac = if let Some(line) = line {
+            git_diff_hunks_committed_hunk_fragment_token_mac(key, &scope, &fence, next, line)
+        } else {
+            git_diff_hunks_committed_token_mac(key, &scope, &fence, next)
+        };
+        let expected_mac =
+            decode_lower_hex_bytes(&expected_mac).ok_or(GitDiffHunksContinuationError::Invalid)?;
+        if !fixed_time_bytes_eq(supplied_mac, &expected_mac) {
+            return Err(GitDiffHunksContinuationError::Invalid);
+        }
+    }
+    if scope != expected_scope {
+        return Err(GitDiffHunksContinuationError::ScopeMismatch);
+    }
+    if let Some(line) = line {
+        Ok(GitDiffHunksContinuation::HunkFragment {
+            fence,
+            record_index: record_or_next,
+            next_line: usize::try_from(line).map_err(|_| GitDiffHunksContinuationError::Invalid)?,
+        })
+    } else {
+        Ok(GitDiffHunksContinuation::Page {
+            fence,
+            next_record: record_or_next,
+        })
+    }
 }
 
 fn decode_git_diff_hunks_continuation(
     raw: &str,
     expected_scope: &str,
     committed_mac_key: Option<&[u8; 32]>,
-) -> Result<GitDiffHunksContinuationV1, GitDiffHunksContinuationError> {
+) -> Result<GitDiffHunksContinuation, GitDiffHunksContinuationError> {
     if raw.is_empty() || raw.len() > GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES {
         return Err(GitDiffHunksContinuationError::Invalid);
     }
-    let encoded = raw
-        .strip_prefix(GIT_DIFF_HUNKS_CONTINUATION_PREFIX)
-        .ok_or(GitDiffHunksContinuationError::Invalid)?;
-    let decoded = general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded.as_bytes())
-        .map_err(|_| GitDiffHunksContinuationError::Invalid)?;
-    if decoded.len() > GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES {
-        return Err(GitDiffHunksContinuationError::Invalid);
-    }
-    let token: GitDiffHunksContinuationV1 =
-        serde_json::from_slice(&decoded).map_err(|_| GitDiffHunksContinuationError::Invalid)?;
-    if !is_lower_hex(&token.scope, 64)
-        || !is_git_object_hex(&token.fence)
-        || token.next == 0
-        || usize::try_from(token.next).is_err()
-    {
-        return Err(GitDiffHunksContinuationError::Invalid);
-    }
-    if let Some(key) = committed_mac_key {
-        if token.v != GIT_DIFF_HUNKS_COMMITTED_CONTINUATION_VERSION
-            || token.mode.as_deref() != Some("committed")
-        {
-            return Err(GitDiffHunksContinuationError::ScopeMismatch);
-        }
-        let mac = token
-            .mac
-            .as_deref()
-            .filter(|value| is_lower_hex(value, 64))
-            .ok_or(GitDiffHunksContinuationError::Invalid)?;
-        let expected_mac =
-            git_diff_hunks_committed_token_mac(key, &token.scope, &token.fence, token.next);
-        if !fixed_time_ascii_eq(mac, &expected_mac) {
-            return Err(GitDiffHunksContinuationError::Invalid);
-        }
-    } else if token.v != GIT_DIFF_HUNKS_CONTINUATION_VERSION
-        || token.mode.is_some()
-        || token.mac.is_some()
-    {
-        return Err(GitDiffHunksContinuationError::ScopeMismatch);
-    }
-    if token.scope != expected_scope {
-        return Err(GitDiffHunksContinuationError::ScopeMismatch);
-    }
-    Ok(token)
+    decode_git_diff_hunks_v2_continuation(raw, expected_scope, committed_mac_key)
 }
 
 fn bounded_git_diff_hunks_stderr(stderr: &str) -> String {
@@ -397,6 +622,44 @@ fn git_diff_hunks_failure(
             "stderr": bounded_git_diff_hunks_stderr(stderr),
             "error_kind": "git_diff_hunks_failed",
             "reason_code": reason_code,
+            "state_changed": false,
+        }),
+    )
+}
+
+fn git_diff_hunks_source_failure(
+    project: &str,
+    paths: &[String],
+    cached: bool,
+    reason_code: &'static str,
+    source_stage: &'static str,
+    output: Option<&ProjectCommandOutput>,
+) -> ToolResult {
+    let stderr = output
+        .map(|output| bounded_git_diff_hunks_stderr(&output.stderr))
+        .unwrap_or_default();
+    ToolResult::err_with_output(
+        format!("git_diff_hunks failed: {reason_code}"),
+        json!({
+            "project": project,
+            "paths": paths,
+            "cached": cached,
+            "files": [],
+            "hunk_count": 0,
+            "truncated": false,
+            "truncation_reasons": [],
+            "has_more": false,
+            "next_continuation": null,
+            "exit_code": output.and_then(|output| output.exit_code),
+            "stderr": stderr,
+            "error_kind": "git_diff_hunks_failed",
+            "reason_code": reason_code,
+            "source_stage": source_stage,
+            "execution_state": output.map(|output| command_execution_state_name(output.execution_state)),
+            "stdout_bytes": output.map(|output| output.stdout.len()),
+            "stderr_bytes": output.map(|output| output.stderr.len()),
+            "stdout_truncated": output.map(|output| output.stdout_truncated).unwrap_or(false),
+            "stderr_truncated": output.map(|output| output.stderr_truncated).unwrap_or(false),
             "state_changed": false,
         }),
     )
@@ -492,8 +755,9 @@ fn git_diff_hunks_recovery_value(
     line_ceiling_hunks: &[usize],
     line_recoverable_hunks: &[usize],
     next_continuation: Option<&str>,
+    hunk_fragment_continuation: Option<&str>,
 ) -> Option<Value> {
-    let page_truncated = page_hunk_limit || page_byte_budget;
+    let page_truncated = page_hunk_limit || page_byte_budget || next_continuation.is_some();
     let omitted_lines_present = hunk_line_limit || git_diff_files_have_omitted_lines(files);
     if !page_truncated && !omitted_lines_present {
         return None;
@@ -549,13 +813,22 @@ fn git_diff_hunks_recovery_value(
         && truncated_hunks.len() == 1
         && single_returned_hunk
         && !page_truncated;
-    let omitted_lines_recoverable = omitted_lines_present
+    let refinement_recoverable = omitted_lines_present
         && hunk_line_limit
         && max_hunk_lines < MAX_MAX_HUNK_LINES
         && omitted_lines_recovery_proven
         && exact_single_hunk_recovery;
+    let fragment_recoverable = omitted_lines_present
+        && hunk_line_limit
+        && !refinement_recoverable
+        && hunk_fragment_continuation.is_some();
+    let omitted_lines_recoverable = refinement_recoverable || fragment_recoverable;
     let omitted_lines_reason = if !omitted_lines_present {
         Value::Null
+    } else if refinement_recoverable {
+        json!("larger_max_hunk_lines_available")
+    } else if fragment_recoverable {
+        json!("hunk_fragment_continuation_available")
     } else if !hunk_line_limit {
         json!("page_byte_budget_prevents_proven_recovery")
     } else if max_hunk_lines >= MAX_MAX_HUNK_LINES && !omitted_lines_fit_line_ceiling {
@@ -564,12 +837,10 @@ fn git_diff_hunks_recovery_value(
         json!("max_hunk_lines_ceiling_insufficient")
     } else if !omitted_lines_recovery_proven {
         json!("page_byte_budget_prevents_proven_recovery")
-    } else if exact_single_hunk_recovery && max_hunk_lines < MAX_MAX_HUNK_LINES {
-        json!("larger_max_hunk_lines_available")
     } else {
         json!("bounded_recovery_unavailable")
     };
-    let omitted_lines_call = omitted_lines_recoverable.then(|| {
+    let refinement_call = refinement_recoverable.then(|| {
         SuggestedToolCall::new(
             "git_diff_hunks",
             git_diff_hunks_call_arguments(
@@ -585,15 +856,42 @@ fn git_diff_hunks_recovery_value(
         )
         .to_value()
     });
-    let primary_call = omitted_lines_call.as_ref().or(continuation_call.as_ref());
+    let fragment_call = fragment_recoverable.then(|| {
+        SuggestedToolCall::new(
+            "git_diff_hunks",
+            git_diff_hunks_call_arguments(
+                project,
+                paths,
+                cached,
+                committed_scope,
+                max_hunks,
+                max_hunk_lines,
+                max_page_bytes,
+                hunk_fragment_continuation,
+            ),
+        )
+        .to_value()
+    });
+    let omitted_lines_call = refinement_call.as_ref().or(fragment_call.as_ref());
+    let primary_call = omitted_lines_call.or(continuation_call.as_ref());
 
     let page_semantics = continuation_call.as_ref().map(|_| {
         ContinuationSemantics::new(ContinuationKind::Page, ContinuationCarrier::OpaqueToken)
             .to_value()
     });
-    let omitted_lines_semantics = omitted_lines_call.as_ref().map(|_| {
-        ContinuationSemantics::new(ContinuationKind::Refine, ContinuationCarrier::None).to_value()
-    });
+    let omitted_lines_semantics = if refinement_call.is_some() {
+        Some(
+            ContinuationSemantics::new(ContinuationKind::Refine, ContinuationCarrier::None)
+                .to_value(),
+        )
+    } else if fragment_call.is_some() {
+        Some(
+            ContinuationSemantics::new(ContinuationKind::Page, ContinuationCarrier::OpaqueToken)
+                .to_value(),
+        )
+    } else {
+        None
+    };
 
     Some(json!({
         "kind": kind,
@@ -601,10 +899,12 @@ fn git_diff_hunks_recovery_value(
         "arguments": primary_call
             .map(|call| call["arguments"].clone())
             .unwrap_or(Value::Null),
-        "safe_continuation_for_omitted_lines": if omitted_lines_present {
-            Value::Bool(false)
-        } else {
+        "safe_continuation_for_omitted_lines": if !omitted_lines_present {
             Value::Null
+        } else if fragment_call.is_some() {
+            Value::Bool(true)
+        } else {
+            Value::Bool(false)
         },
         "continuation": {
             "available": continuation_call.is_some(),
@@ -776,6 +1076,7 @@ fn git_diff_hunks_page_command(
     paths: &[String],
     cached: bool,
     start_position: usize,
+    fragment_line_position: Option<usize>,
     max_hunks: usize,
     max_hunk_lines: usize,
     max_page_bytes: usize,
@@ -799,6 +1100,8 @@ fn git_diff_hunks_page_command(
         ),
     };
     let expected_fence = shell_escape_simple(expected_fence.unwrap_or(""));
+    let fragment_mode = usize::from(fragment_line_position.is_some());
+    let fragment_line_position = fragment_line_position.unwrap_or(0);
     let script = r#"__PRELUDE__
 LC_ALL=C; export LC_ALL
 page_budget=__PAGE_BUDGET__
@@ -806,6 +1109,8 @@ max_hunks=__MAX_HUNKS__
 max_hunk_lines=__MAX_HUNK_LINES__
 max_recovery_hunk_lines=__MAX_RECOVERY_HUNK_LINES__
 start_position=__START_POSITION__
+fragment_mode=__FRAGMENT_MODE__
+fragment_line_position=__FRAGMENT_LINE_POSITION__
 expected_fence=__EXPECTED_FENCE__
 pre_fence=$(__FINGERPRINT_COMMAND__ | git hash-object --stdin)
 pre_hash_exit=$?
@@ -815,10 +1120,11 @@ stale=0
 if [ -n "$expected_fence" ] && [ "$pre_fence" != "$expected_fence" ]; then stale=1; fi
 if [ "$pre_hash_exit" -eq 0 ] && [ "$pre_diff_exit" -eq 0 ] && [ "$stale" -eq 0 ]; then
   { __DIFF_COMMAND__; diff_exit=$?; printf '__WCDH_DIFF_EXIT__=%s\n' "$diff_exit"; } |
-  awk -v page_budget="$page_budget" -v max_hunks="$max_hunks" -v max_hunk_lines="$max_hunk_lines" -v max_recovery_hunk_lines="$max_recovery_hunk_lines" -v start_position="$start_position" '
+  awk -v page_budget="$page_budget" -v max_hunks="$max_hunks" -v max_hunk_lines="$max_hunk_lines" -v max_recovery_hunk_lines="$max_recovery_hunk_lines" -v start_position="$start_position" -v fragment_mode="$fragment_mode" -v fragment_line_position="$fragment_line_position" '
 function reset_record() {
   record_kind=""; record_buf=""; record_bytes=0; record_byte_trunc=0; record_unreturnable=0;
-  hunk_line_count=0; hunk_full_bytes=0; hunk_line_trunc=0;
+  hunk_line_count=0; hunk_full_bytes=0; hunk_header_bytes=0; hunk_line_trunc=0;
+  fragment_emitted_lines=0; next_fragment_lines=0; next_fragment_bytes=0;
 }
 function append_record(line,    line_bytes) {
   if (stopped) return;
@@ -832,10 +1138,31 @@ function append_record(line,    line_bytes) {
     record_byte_trunc=1;
   }
 }
-function append_hunk_line(line,    line_bytes) {
+function note_next_fragment_line(line_bytes) {
+  if (fragment_capacity>0 && next_fragment_lines<fragment_capacity) {
+    next_fragment_bytes+=line_bytes; next_fragment_lines++;
+  }
+}
+function append_hunk_line(line,    line_bytes, line_position) {
   line_bytes=length(line)+1;
+  line_position=hunk_line_count;
   hunk_full_bytes+=line_bytes;
-  if (hunk_line_count<max_hunk_lines) append_record(line); else hunk_line_trunc=1;
+  if (line_position==0) hunk_header_bytes=line_bytes;
+  if (fragment_mode && record_index==start_position) {
+    if (line_position==0) {
+      append_record(line);
+    } else if (line_position<fragment_line_position) {
+      # Replay-drain prior complete lines without returning them.
+    } else if (fragment_emitted_lines<fragment_capacity) {
+      append_record(line); fragment_emitted_lines++;
+    } else {
+      hunk_line_trunc=1; note_next_fragment_line(line_bytes);
+    }
+  } else if (hunk_line_count<max_hunk_lines) {
+    append_record(line);
+  } else {
+    hunk_line_trunc=1; note_next_fragment_line(line_bytes);
+  }
   hunk_line_count++;
 }
 function note_truncated_hunk(idx) {
@@ -847,7 +1174,7 @@ function note_line_ceiling_hunk(idx) {
 function note_line_recoverable_hunk(idx) {
   if (line_recoverable_hunks=="") line_recoverable_hunks=idx; else line_recoverable_hunks=line_recoverable_hunks "," idx;
 }
-function flush_record(    need_context, combined_bytes, context_truncated, hunk_index, line_ceiling_fit, line_recovery_safe) {
+function flush_record(    need_context, combined_bytes, context_truncated, hunk_index, line_ceiling_fit, line_recovery_safe, candidate_line, candidate_safe) {
   if (record_kind=="") return;
   if (record_kind=="file") {
     file_ctx=record_buf; file_ctx_bytes=record_bytes; file_ctx_truncated=record_byte_trunc;
@@ -855,6 +1182,9 @@ function flush_record(    need_context, combined_bytes, context_truncated, hunk_
   }
   if (record_index<start_position) { reset_record(); return; }
   if (stopped) { has_more=1; reset_record(); return; }
+  if (fragment_mode && record_index==start_position && record_kind!="hunk") {
+    fragment_invalid=1; stopped=1; reset_record(); return;
+  }
   if (record_unreturnable) {
     page_byte_budget=1; has_more=1; stopped=1; reset_record(); return;
   }
@@ -882,14 +1212,28 @@ function flush_record(    need_context, combined_bytes, context_truncated, hunk_
   } else {
     hunk_index=returned_hunks;
     returned_hunks++;
+    if (fragment_mode && record_index==start_position) {
+      fragment_found=1;
+      fragment_progress_lines=fragment_emitted_lines;
+      if (fragment_line_position<=0 || fragment_line_position>=hunk_line_count || fragment_emitted_lines<=0)
+        fragment_invalid=1;
+    }
     if (hunk_line_trunc || record_byte_trunc) note_truncated_hunk(hunk_index);
     line_ceiling_fit=(hunk_line_count<=max_recovery_hunk_lines);
     if ((hunk_line_trunc || record_byte_trunc) && line_ceiling_fit)
       note_line_ceiling_hunk(hunk_index);
     line_recovery_safe=(hunk_line_trunc && !record_byte_trunc && line_ceiling_fit && !file_ctx_truncated && file_ctx_bytes+hunk_full_bytes<=page_budget);
     if (line_recovery_safe) note_line_recoverable_hunk(hunk_index);
+    candidate_line=(fragment_mode && record_index==start_position ? fragment_line_position+fragment_emitted_lines : max_hunk_lines);
+    candidate_safe=(hunk_line_trunc && !record_byte_trunc && !context_truncated && !file_ctx_truncated && fragment_capacity>0 && next_fragment_lines>0 && candidate_line>0 && file_ctx_bytes+hunk_header_bytes+next_fragment_bytes<=page_budget);
+    if (candidate_safe) {
+      fragment_candidate_safe=1;
+      fragment_candidate_record=record_index;
+      fragment_candidate_line=candidate_line;
+    }
     if (hunk_line_trunc) hunk_line_limit=1;
     if (record_byte_trunc) page_byte_budget=1;
+    if (hunk_line_trunc || (fragment_mode && record_index==start_position)) stopped=1;
   }
   if (record_byte_trunc || context_truncated) stopped=1;
   reset_record();
@@ -914,6 +1258,9 @@ BEGIN {
   record_count=0; next_position=start_position; page_bytes=0; returned_hunks=0; returned_file_records=0;
   has_more=0; stopped=0; page_hunk_limit=0; hunk_line_limit=0; page_byte_budget=0;
   first_file_context_only=0; truncated_hunks=""; line_ceiling_hunks=""; line_recoverable_hunks=""; current_file_context_emitted=0; file_ctx_record=-1;
+  fragment_capacity=(max_hunk_lines>1 ? max_hunk_lines-1 : 0);
+  fragment_found=0; fragment_invalid=0; fragment_progress_lines=0;
+  fragment_candidate_safe=0; fragment_candidate_record=0; fragment_candidate_line=0;
   reset_record(); have_pending=0; diff_exit=-1;
 }
 {
@@ -927,14 +1274,16 @@ END {
     process_line(pending);
   }
   flush_record();
-  meta=sprintf("diff_exit=%d\nnext_position=%d\ntotal_records=%d\nhas_more=%d\nreturned_hunks=%d\nreturned_file_records=%d\nfirst_file_context_only=%d\npage_hunk_limit=%d\nhunk_line_limit=%d\npage_byte_budget=%d\npage_bytes=%d\ntruncated_hunks=%s\nline_ceiling_hunks=%s\nline_recoverable_hunks=%s", diff_exit, next_position, record_count, has_more, returned_hunks, returned_file_records, first_file_context_only, page_hunk_limit, hunk_line_limit, page_byte_budget, page_bytes, truncated_hunks, line_ceiling_hunks, line_recoverable_hunks);
+  if (fragment_mode && !fragment_found) fragment_invalid=1;
+  if (fragment_mode && has_more) page_hunk_limit=1;
+  meta=sprintf("diff_exit=%d\nnext_position=%d\ntotal_records=%d\nhas_more=%d\nreturned_hunks=%d\nreturned_file_records=%d\nfirst_file_context_only=%d\npage_hunk_limit=%d\nhunk_line_limit=%d\npage_byte_budget=%d\npage_bytes=%d\ntruncated_hunks=%s\nline_ceiling_hunks=%s\nline_recoverable_hunks=%s\nfragment_mode=%d\nfragment_found=%d\nfragment_invalid=%d\nfragment_progress_lines=%d\nfragment_candidate_safe=%d\nfragment_candidate_record=%d\nfragment_candidate_line=%d", diff_exit, next_position, record_count, has_more, returned_hunks, returned_file_records, first_file_context_only, page_hunk_limit, hunk_line_limit, page_byte_budget, page_bytes, truncated_hunks, line_ceiling_hunks, line_recoverable_hunks, fragment_mode, fragment_found, fragment_invalid, fragment_progress_lines, fragment_candidate_safe, fragment_candidate_record, fragment_candidate_line);
   printf "%s\n", meta;
   printf "WCDH1:P:%010d:%010d\n", page_bytes, length(meta)+1;
 }
 '
   page_filter_exit=$?
 else
-  page_meta=$(printf 'diff_exit=-1\nnext_position=%s\ntotal_records=0\nhas_more=0\nreturned_hunks=0\nreturned_file_records=0\nfirst_file_context_only=0\npage_hunk_limit=0\nhunk_line_limit=0\npage_byte_budget=0\npage_bytes=0\ntruncated_hunks=\nline_ceiling_hunks=\nline_recoverable_hunks=' "$start_position")
+  page_meta=$(printf 'diff_exit=-1\nnext_position=%s\ntotal_records=0\nhas_more=0\nreturned_hunks=0\nreturned_file_records=0\nfirst_file_context_only=0\npage_hunk_limit=0\nhunk_line_limit=0\npage_byte_budget=0\npage_bytes=0\ntruncated_hunks=\nline_ceiling_hunks=\nline_recoverable_hunks=\nfragment_mode=%s\nfragment_found=0\nfragment_invalid=0\nfragment_progress_lines=0\nfragment_candidate_safe=0\nfragment_candidate_record=0\nfragment_candidate_line=0' "$start_position" "$fragment_mode")
   page_meta_bytes=${#page_meta}
   printf '%s\n' "$page_meta"
   printf 'WCDH1:P:%010d:%010d\n' 0 "$((page_meta_bytes+1))"
@@ -963,6 +1312,11 @@ exit 1
             &MAX_MAX_HUNK_LINES.to_string(),
         )
         .replace("__START_POSITION__", &start_position.to_string())
+        .replace("__FRAGMENT_MODE__", &fragment_mode.to_string())
+        .replace(
+            "__FRAGMENT_LINE_POSITION__",
+            &fragment_line_position.to_string(),
+        )
         .replace("__EXPECTED_FENCE__", &expected_fence)
         .replace("__FINGERPRINT_COMMAND__", &fingerprint_command)
         .replace("__DIFF_COMMAND__", &diff_command))
@@ -985,6 +1339,13 @@ struct GitDiffHunksPageWire {
     truncated_hunks: Vec<usize>,
     line_ceiling_hunks: Vec<usize>,
     line_recoverable_hunks: Vec<usize>,
+    fragment_mode: bool,
+    fragment_found: bool,
+    fragment_invalid: bool,
+    fragment_progress_lines: usize,
+    fragment_candidate_safe: bool,
+    fragment_candidate_record: usize,
+    fragment_candidate_line: usize,
     pre_fence: String,
     post_fence: String,
     pre_hash_exit: i32,
@@ -1082,6 +1443,13 @@ fn parse_framed_git_diff_hunks_stdout(
         truncated_hunks,
         line_ceiling_hunks,
         line_recoverable_hunks,
+        fragment_mode: parse_optional_bool(&page_meta, "fragment_mode")?,
+        fragment_found: parse_optional_bool(&page_meta, "fragment_found")?,
+        fragment_invalid: parse_optional_bool(&page_meta, "fragment_invalid")?,
+        fragment_progress_lines: parse_optional_usize(&page_meta, "fragment_progress_lines")?,
+        fragment_candidate_safe: parse_optional_bool(&page_meta, "fragment_candidate_safe")?,
+        fragment_candidate_record: parse_optional_usize(&page_meta, "fragment_candidate_record")?,
+        fragment_candidate_line: parse_optional_usize(&page_meta, "fragment_candidate_line")?,
         pre_fence: parse_status_result_field(&obs_meta, "pre_fence")?.to_string(),
         post_fence: parse_status_result_field(&obs_meta, "post_fence")?.to_string(),
         pre_hash_exit: parse_required_i32(&obs_meta, "pre_hash_exit")?,
@@ -1118,6 +1486,42 @@ fn mark_git_diff_hunks_page_metadata(
         }
     }
     index
+}
+
+fn project_git_diff_hunk_fragment(files: &mut [Value]) -> bool {
+    let mut projected = false;
+    for file in files {
+        let Some(hunks) = file.get_mut("hunks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for hunk in hunks {
+            if projected {
+                return false;
+            }
+            let Some(hunk) = hunk.as_object_mut() else {
+                return false;
+            };
+            let Some(header) = hunk.get("header").and_then(Value::as_str) else {
+                return false;
+            };
+            let Some(diff) = hunk.get("diff").and_then(Value::as_str) else {
+                return false;
+            };
+            let prefix = format!("{header}\n");
+            let Some(body) = diff.strip_prefix(&prefix) else {
+                return false;
+            };
+            if body.is_empty() {
+                return false;
+            }
+            let body = body.to_string();
+            hunk.insert("diff".to_string(), json!(body));
+            hunk.insert("line_count".to_string(), json!(body.lines().count()));
+            hunk.insert("continued".to_string(), json!(true));
+            projected = true;
+        }
+    }
+    projected
 }
 
 fn strip_diff_prefix(path: &str) -> String {
@@ -1521,15 +1925,21 @@ impl ToolRuntime {
             }
             None => None,
         };
-        let start_position = decoded
-            .as_ref()
-            .and_then(|token| usize::try_from(token.next).ok())
-            .unwrap_or(0);
-        let expected_fence = decoded.as_ref().map(|token| token.fence.as_str());
+        let (start_position, fragment_line_position) = match decoded.as_ref() {
+            Some(GitDiffHunksContinuation::Page { next_record, .. }) => (*next_record, None),
+            Some(GitDiffHunksContinuation::HunkFragment {
+                record_index,
+                next_line,
+                ..
+            }) => (*record_index, Some(*next_line)),
+            None => (0, None),
+        };
+        let expected_fence = decoded.as_ref().map(GitDiffHunksContinuation::fence);
         let command = match git_diff_hunks_page_command(
             &command_paths,
             cached,
             start_position,
+            fragment_line_position,
             max_hunks,
             max_hunk_lines,
             max_page_bytes,
@@ -1538,13 +1948,13 @@ impl ToolRuntime {
         ) {
             Ok(command) => command,
             Err(_) => {
-                return git_diff_hunks_failure(
+                return git_diff_hunks_source_failure(
                     &project,
                     &paths,
                     cached,
-                    "source_observation_unavailable",
+                    "source_dispatch_unavailable",
+                    "command_build",
                     None,
-                    "",
                 )
             }
         };
@@ -1554,51 +1964,81 @@ impl ToolRuntime {
         {
             Ok(output) => output,
             Err(_) => {
-                return git_diff_hunks_failure(
+                return git_diff_hunks_source_failure(
                     &project,
                     &paths,
                     cached,
-                    "source_observation_unavailable",
+                    "source_dispatch_unavailable",
+                    "runner_dispatch",
                     None,
-                    "",
                 )
             }
         };
-        let stderr = bounded_git_diff_hunks_stderr(&output.stderr);
-        let Some(wire) = parse_framed_git_diff_hunks_stdout(&output.stdout, max_page_bytes) else {
-            return git_diff_hunks_failure(
+        if output.stdout_truncated {
+            return git_diff_hunks_source_failure(
                 &project,
                 &paths,
                 cached,
-                "source_observation_unavailable",
-                output.exit_code,
-                &stderr,
+                "source_output_truncated",
+                "runner_output",
+                Some(&output),
+            );
+        }
+        if output.execution_state != crate::runner_protocol::ShellCommandExecutionState::Completed
+            || output.error.is_some()
+        {
+            return git_diff_hunks_source_failure(
+                &project,
+                &paths,
+                cached,
+                "source_execution_failed",
+                "source_execution",
+                Some(&output),
+            );
+        }
+        let stderr = bounded_git_diff_hunks_stderr(&output.stderr);
+        let Some(wire) = parse_framed_git_diff_hunks_stdout(&output.stdout, max_page_bytes) else {
+            return git_diff_hunks_source_failure(
+                &project,
+                &paths,
+                cached,
+                if output.exit_code == Some(0) {
+                    "source_frame_invalid"
+                } else {
+                    "source_execution_failed"
+                },
+                if output.exit_code == Some(0) {
+                    "frame_parse"
+                } else {
+                    "source_execution"
+                },
+                Some(&output),
             );
         };
+        if wire.pre_hash_exit != 0
+            || wire.post_hash_exit != 0
+            || !is_git_object_hex(&wire.pre_fence)
+            || !is_git_object_hex(&wire.post_fence)
+        {
+            return git_diff_hunks_source_failure(
+                &project,
+                &paths,
+                cached,
+                "source_fence_unavailable",
+                "source_fence",
+                Some(&output),
+            );
+        }
         if wire.stale
             || decoded
                 .as_ref()
-                .is_some_and(|token| token.fence != wire.pre_fence)
+                .is_some_and(|token| token.fence() != wire.pre_fence)
         {
             return git_diff_hunks_failure(
                 &project,
                 &paths,
                 cached,
                 "stale_continuation",
-                output.exit_code,
-                &stderr,
-            );
-        }
-        if wire.pre_hash_exit != 0
-            || wire.post_hash_exit != 0
-            || !is_git_object_hex(&wire.pre_fence)
-            || !is_git_object_hex(&wire.post_fence)
-        {
-            return git_diff_hunks_failure(
-                &project,
-                &paths,
-                cached,
-                "source_observation_unavailable",
                 output.exit_code,
                 &stderr,
             );
@@ -1627,37 +2067,80 @@ impl ToolRuntime {
                 &stderr,
             );
         }
-        if output.error.is_some()
-            || output.exit_code != Some(0)
-            || wire.page_filter_exit != 0
-            || wire.page_bytes > max_page_bytes
-        {
-            return git_diff_hunks_failure(
+        if wire.page_filter_exit != 0 || wire.page_bytes > max_page_bytes {
+            return git_diff_hunks_source_failure(
                 &project,
                 &paths,
                 cached,
-                "source_observation_unavailable",
-                output.exit_code,
-                &stderr,
+                "source_page_filter_failed",
+                "page_filter",
+                Some(&output),
             );
         }
+        // A valid WCDH frame carries more precise source-stage evidence than the
+        // wrapper process exit. The generated script intentionally exits nonzero
+        // for fence, source-change, and page-filter failures after emitting that
+        // frame, so classify those facts first and use the wrapper exit only as a
+        // fallback when the framed observation itself reports no specific fault.
+        if output.exit_code != Some(0) {
+            return git_diff_hunks_source_failure(
+                &project,
+                &paths,
+                cached,
+                "source_execution_failed",
+                "source_execution",
+                Some(&output),
+            );
+        }
+        let fragment_requested = fragment_line_position.is_some();
+        let fragment_shape_invalid = wire.fragment_mode != fragment_requested
+            || (fragment_requested
+                && (!wire.fragment_found
+                    || wire.fragment_invalid
+                    || wire.fragment_progress_lines == 0
+                    || wire.returned_hunks != 1
+                    || wire.page_byte_budget
+                    || wire.next_position != start_position.saturating_add(1)))
+            || (!fragment_requested
+                && (wire.fragment_found
+                    || wire.fragment_invalid
+                    || wire.fragment_progress_lines != 0))
+            || (wire.fragment_candidate_safe
+                && (!wire.hunk_line_limit
+                    || wire.fragment_candidate_record == 0
+                    || wire.fragment_candidate_line == 0
+                    || wire.returned_hunks != 1))
+            || (!wire.fragment_candidate_safe
+                && (wire.fragment_candidate_record != 0 || wire.fragment_candidate_line != 0))
+            || (fragment_requested
+                && wire.fragment_candidate_safe
+                && (wire.fragment_candidate_record != start_position
+                    || wire.fragment_candidate_line
+                        <= fragment_line_position.expect("fragment request line")));
         if start_position > wire.total_records
             || wire.next_position < start_position
             || wire.next_position > wire.total_records
             || (wire.has_more && wire.next_position <= start_position)
             || wire.returned_hunks > max_hunks
+            || fragment_shape_invalid
         {
-            return git_diff_hunks_failure(
+            if wire.has_more && wire.next_position <= start_position {
+                return git_diff_hunks_failure(
+                    &project,
+                    &paths,
+                    cached,
+                    "page_record_too_large",
+                    output.exit_code,
+                    &stderr,
+                );
+            }
+            return git_diff_hunks_source_failure(
                 &project,
                 &paths,
                 cached,
-                if wire.has_more && wire.next_position <= start_position {
-                    "page_record_too_large"
-                } else {
-                    "source_observation_unavailable"
-                },
-                output.exit_code,
-                &stderr,
+                "source_projection_inconsistent",
+                "projection",
+                Some(&output),
             );
         }
         let (mut files, parsed_hunks, parser_truncated) =
@@ -1677,11 +2160,14 @@ impl ToolRuntime {
             &wire.truncated_hunks,
             wire.first_file_context_only,
         );
+        let fragment_projection_valid =
+            !fragment_requested || project_git_diff_hunk_fragment(&mut files);
         let expected_files = wire.returned_file_records
             + usize::from(wire.first_file_context_only && wire.returned_hunks > 0);
         if parser_truncated
             || parsed_hunks != wire.returned_hunks
             || marked_hunks != wire.returned_hunks
+            || !fragment_projection_valid
             || files.len() != expected_files
             || wire
                 .line_ceiling_hunks
@@ -1693,13 +2179,13 @@ impl ToolRuntime {
                 .any(|index| !wire.line_ceiling_hunks.contains(index))
             || (!wire.hunk_line_limit && !wire.line_recoverable_hunks.is_empty())
         {
-            return git_diff_hunks_failure(
+            return git_diff_hunks_source_failure(
                 &project,
                 &paths,
                 cached,
-                "source_observation_unavailable",
-                output.exit_code,
-                &stderr,
+                "source_projection_inconsistent",
+                "projection",
+                Some(&output),
             );
         }
         let mut truncation_reasons = Vec::new();
@@ -1726,13 +2212,46 @@ impl ToolRuntime {
             match encoded {
                 Ok(value) => Some(value),
                 Err(_) => {
-                    return git_diff_hunks_failure(
+                    return git_diff_hunks_source_failure(
                         &project,
                         &paths,
                         cached,
-                        "source_observation_unavailable",
-                        output.exit_code,
-                        &stderr,
+                        "continuation_encoding_failed",
+                        "continuation_encoding",
+                        Some(&output),
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let hunk_fragment_continuation = if wire.fragment_candidate_safe {
+            let encoded = if committed_scope.is_some() {
+                encode_git_diff_hunks_committed_hunk_fragment_continuation(
+                    self.git_diff_hunks_continuation_mac_key.as_ref(),
+                    &scope,
+                    &wire.pre_fence,
+                    wire.fragment_candidate_record,
+                    wire.fragment_candidate_line,
+                )
+            } else {
+                encode_git_diff_hunks_hunk_fragment_continuation(
+                    &scope,
+                    &wire.pre_fence,
+                    wire.fragment_candidate_record,
+                    wire.fragment_candidate_line,
+                )
+            };
+            match encoded {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    return git_diff_hunks_source_failure(
+                        &project,
+                        &paths,
+                        cached,
+                        "continuation_encoding_failed",
+                        "continuation_encoding",
+                        Some(&output),
                     )
                 }
             }
@@ -1755,6 +2274,7 @@ impl ToolRuntime {
             &wire.line_ceiling_hunks,
             &wire.line_recoverable_hunks,
             next_continuation.as_deref(),
+            hunk_fragment_continuation.as_deref(),
         );
         let mut payload = json!({
             "project": project,
@@ -1800,6 +2320,182 @@ impl ToolRuntime {
                 Some(wire.diff_exit),
                 "",
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod continuation_token_tests {
+    use super::*;
+
+    fn decode_payload(token: &str) -> Vec<u8> {
+        general_purpose::URL_SAFE_NO_PAD
+            .decode(
+                token
+                    .strip_prefix(GIT_DIFF_HUNKS_V2_CONTINUATION_PREFIX)
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn encode_payload(payload: &[u8]) -> String {
+        format!(
+            "{GIT_DIFF_HUNKS_V2_CONTINUATION_PREFIX}{}",
+            general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        )
+    }
+
+    #[test]
+    fn git_diff_hunks_v2_variants_round_trip_with_worst_case_bounds() {
+        let scope = "f".repeat(64);
+        let fence = "e".repeat(64);
+        let key = [0xa5; 32];
+        let worktree_page = encode_git_diff_hunks_continuation(&scope, &fence, usize::MAX).unwrap();
+        let committed_page =
+            encode_git_diff_hunks_committed_continuation(&key, &scope, &fence, usize::MAX).unwrap();
+        let worktree_fragment = encode_git_diff_hunks_hunk_fragment_continuation(
+            &scope,
+            &fence,
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap();
+        let committed_fragment = encode_git_diff_hunks_committed_hunk_fragment_continuation(
+            &key,
+            &scope,
+            &fence,
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap();
+
+        for token in [
+            &worktree_page,
+            &committed_page,
+            &worktree_fragment,
+            &committed_fragment,
+        ] {
+            assert!(token.starts_with("wcdh2."));
+            assert!(token.len() < GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES);
+        }
+        assert_eq!(worktree_page.len(), 105);
+        assert_eq!(committed_page.len(), 148);
+        assert_eq!(worktree_fragment.len(), 116);
+        assert_eq!(committed_fragment.len(), 158);
+
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&worktree_page, &scope, None),
+            Ok(GitDiffHunksContinuation::Page {
+                fence: fence.clone(),
+                next_record: usize::MAX,
+            })
+        );
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&committed_page, &scope, Some(&key)),
+            Ok(GitDiffHunksContinuation::Page {
+                fence: fence.clone(),
+                next_record: usize::MAX,
+            })
+        );
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&worktree_fragment, &scope, None),
+            Ok(GitDiffHunksContinuation::HunkFragment {
+                fence: fence.clone(),
+                record_index: usize::MAX,
+                next_line: usize::MAX,
+            })
+        );
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&committed_fragment, &scope, Some(&key)),
+            Ok(GitDiffHunksContinuation::HunkFragment {
+                fence,
+                record_index: usize::MAX,
+                next_line: usize::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn git_diff_hunks_v2_rejects_malformed_scope_and_restart_mismatches() {
+        let scope = "1".repeat(64);
+        let fence = "2".repeat(40);
+        let key = [3; 32];
+        let other_key = [4; 32];
+        let worktree = encode_git_diff_hunks_continuation(&scope, &fence, 7).unwrap();
+        let committed =
+            encode_git_diff_hunks_committed_continuation(&key, &scope, &fence, 7).unwrap();
+
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&committed, &scope, Some(&other_key)),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+        assert!(decode_git_diff_hunks_continuation(&worktree, &scope, None).is_ok());
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&worktree, &scope, Some(&key)),
+            Err(GitDiffHunksContinuationError::ScopeMismatch)
+        );
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&worktree, &"3".repeat(64), None),
+            Err(GitDiffHunksContinuationError::ScopeMismatch)
+        );
+        assert_eq!(
+            decode_git_diff_hunks_continuation("wcdh1.e30", &scope, None),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+        assert_eq!(
+            decode_git_diff_hunks_continuation("wcdh2.%%%", &scope, None),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+
+        let mut payload = decode_payload(&worktree);
+        payload[0] = 0xff;
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&encode_payload(&payload), &scope, None),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+        let mut payload = decode_payload(&worktree);
+        payload[33] = 21;
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&encode_payload(&payload), &scope, None),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+        let mut payload = decode_payload(&worktree);
+        payload.pop();
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&encode_payload(&payload), &scope, None),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+        let mut payload = decode_payload(&worktree);
+        let cursor = 34 + payload[33] as usize;
+        payload[cursor..cursor + 8].fill(0);
+        assert_eq!(
+            decode_git_diff_hunks_continuation(&encode_payload(&payload), &scope, None),
+            Err(GitDiffHunksContinuationError::Invalid)
+        );
+    }
+
+    #[test]
+    fn git_diff_hunks_v2_committed_tampering_fails_closed() {
+        let scope = "4".repeat(64);
+        let fence = "5".repeat(64);
+        let key = [6; 32];
+        let token =
+            encode_git_diff_hunks_committed_hunk_fragment_continuation(&key, &scope, &fence, 9, 11)
+                .unwrap();
+        let original = decode_payload(&token);
+        let fence_len = original[33] as usize;
+        let fence_start = 34;
+        let cursor_start = fence_start + fence_len;
+        let line_start = cursor_start + 8;
+        let mac_start = line_start + 8;
+        for offset in [1, fence_start, cursor_start + 7, line_start + 7, mac_start] {
+            let mut payload = original.clone();
+            payload[offset] ^= 1;
+            assert_eq!(
+                decode_git_diff_hunks_continuation(&encode_payload(&payload), &scope, Some(&key)),
+                Err(GitDiffHunksContinuationError::Invalid),
+                "tamper offset {offset} must fail closed"
+            );
         }
     }
 }

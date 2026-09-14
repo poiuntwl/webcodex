@@ -211,6 +211,8 @@ async fn complete_startup_plugin_catalog_request(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -687,6 +689,8 @@ async fn dispatch_startup_with_configured_skill_catalog(
                         .unwrap(),
                     ),
                     stderr: Some(String::new()),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(1),
                     error: None,
                 })
@@ -1024,22 +1028,6 @@ fn work_on_project_schema_and_registration() {
         "path": "/root/git/example",
         "instruction": "runtime must reject ambiguity"
     })));
-    let accepted = crate::tool_runtime::registry::accepted_flattened_args_for_spec(spec);
-    for field in [
-        "project",
-        "client_id",
-        "path",
-        "instruction",
-        "include_project_instructions",
-        "include_workflow_guidance",
-        "include_extension_catalog",
-        "session_id",
-    ] {
-        assert!(
-            accepted.contains(&field.to_string()),
-            "flattened Action projection missing {field}"
-        );
-    }
 
     // The canonical entry must not expose internal diagnostic controls.
     for hidden in [
@@ -4022,6 +4010,8 @@ async fn coding_workflow_standard_repository_overview_timeout_is_nonblocking() {
                 exit_code: Some(0),
                 stdout: Some("{}".to_string()),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })

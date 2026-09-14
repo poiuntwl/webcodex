@@ -141,7 +141,8 @@ fn lsp_input_schemas_have_required_bounds() {
         json!(["incoming", "outgoing", "both"])
     );
     assert_eq!(hierarchy["properties"]["depth"]["maximum"], 2);
-    assert_eq!(hierarchy["properties"]["limit"]["maximum"], 100);
+    assert_eq!(hierarchy["properties"]["limit"]["minimum"], 1);
+    assert!(hierarchy["properties"]["limit"].get("maximum").is_none());
     assert_eq!(hierarchy["additionalProperties"], false);
     let diagnostics_output = &by_name["document_diagnostics"].output_schema;
     let output_properties = &diagnostics_output["properties"]["output"]["properties"];
@@ -218,46 +219,6 @@ fn lsp_input_schemas_have_required_bounds() {
     assert_eq!(refs["properties"]["include_declaration"]["default"], true);
     assert!(refs["properties"]["limit"].get("maximum").is_none());
     assert_eq!(refs["additionalProperties"], false);
-
-    // Flattened Action fields must list path/line/column/include_declaration/limit.
-    use crate::tool_runtime::accepted_flattened_args_for_spec;
-    let flat_goto = accepted_flattened_args_for_spec(&by_name["goto_definition"]);
-    for field in ["project", "path", "line", "column", "limit", "session_id"] {
-        assert!(
-            flat_goto.iter().any(|f| f == field),
-            "goto missing flattened {field}: {flat_goto:?}"
-        );
-    }
-    let flat_refs = accepted_flattened_args_for_spec(&by_name["find_references"]);
-    for field in [
-        "project",
-        "path",
-        "line",
-        "column",
-        "include_declaration",
-        "limit",
-        "session_id",
-    ] {
-        assert!(
-            flat_refs.iter().any(|f| f == field),
-            "refs missing flattened {field}: {flat_refs:?}"
-        );
-    }
-    let flat_diagnostics = accepted_flattened_args_for_spec(&by_name["document_diagnostics"]);
-    for field in ["project", "path", "limit", "session_id"] {
-        assert!(
-            flat_diagnostics.iter().any(|item| item == field),
-            "diagnostics missing flattened {field}: {flat_diagnostics:?}"
-        );
-    }
-    let flat_hover = accepted_flattened_args_for_spec(&by_name["hover"]);
-    for field in ["project", "path", "line", "column", "session_id"] {
-        assert!(flat_hover.iter().any(|item| item == field));
-    }
-    let flat_workspace = accepted_flattened_args_for_spec(&by_name["workspace_symbols"]);
-    for field in ["project", "query", "limit", "session_id"] {
-        assert!(flat_workspace.iter().any(|item| item == field));
-    }
 }
 
 #[test]

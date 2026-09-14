@@ -2,6 +2,7 @@ use super::sessions;
 use super::tool_definition::runtime_tool_is_shell_like;
 use super::{RecoveryKind, ToolResult};
 use crate::auth::AuthContext;
+use crate::json_measurement::serialized_json_len;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -25,7 +26,7 @@ pub(crate) fn unknown_session_result(session_id: &str) -> ToolResult {
             "session_id": session_id,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str) -> ToolResult {
@@ -39,7 +40,7 @@ pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str)
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 pub(crate) fn session_project_mismatch_result(
@@ -63,7 +64,7 @@ pub(crate) fn session_project_mismatch_result(
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 pub(crate) fn session_guard_denied_result(
@@ -89,7 +90,7 @@ pub(crate) fn session_guard_denied_result(
         ),
         output,
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 /// Lifecycle denial for Closed workflow sessions (write/shell/mutation).
@@ -117,7 +118,7 @@ pub(crate) fn session_lifecycle_denied_result(
         format!("{error_kind}: {tool_name} blocked on {lifecycle} session"),
         output,
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 pub(crate) fn session_message_error_result(
@@ -147,7 +148,7 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::NotTodo => ToolResult::err_with_output(
             "session_message_not_todo",
             json!({
@@ -198,7 +199,7 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::InvalidAssignmentFence => ToolResult::err_with_output(
             "invalid_assignment_fence",
             json!({
@@ -210,7 +211,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "read the exact assignment with get_session_assignment and pass its opaque assignment_fence unchanged",
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
         sessions::SessionMessageError::AssignmentStale {
             current,
             fresh_assignment_fence,
@@ -227,7 +228,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "re-evaluate the returned current assignment; when fresh_assignment_fence is present it is the durable fence for exactly that returned state, otherwise call get_session_assignment again",
             }),
         )
-        .with_recovery(RecoveryKind::Reobserve, None),
+        .with_recovery(RecoveryKind::Reobserve),
         sessions::SessionMessageError::AssignmentHistoryLost { current } => ToolResult::err_with_output(
             "assignment_history_lost",
             json!({
@@ -240,7 +241,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "retained state cannot prove the full exact assignment; do not complete this todo from stale context",
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::AssignmentTooLarge {
             reply_count,
             max_replies,
@@ -259,7 +260,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "the coordinator must consolidate or supersede this assignment before a fenced completion can be issued",
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::PersistenceUncertain => ToolResult::err_with_output(
             "completion_persistence_uncertain",
             json!({
@@ -271,7 +272,7 @@ pub(crate) fn session_message_error_result(
                 "retry_same_completion": true,
             }),
         )
-        .with_recovery(RecoveryKind::RetrySame, None),
+        .with_recovery(RecoveryKind::RetrySame),
         sessions::SessionMessageError::SessionClosed { lifecycle } => ToolResult::err_with_output(
             "session_closed: session message mutation blocked",
             json!({
@@ -280,7 +281,7 @@ pub(crate) fn session_message_error_result(
                 "lifecycle": lifecycle.as_str(),
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::InvalidInput(message) => ToolResult::err_with_output(
             message.clone(),
             json!({
@@ -289,7 +290,7 @@ pub(crate) fn session_message_error_result(
                 "error": message,
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
     }
 }
 
@@ -410,8 +411,8 @@ fn bounded_model_facing_recovery_events(
         .take(SESSION_CONTINUITY_RECOVERY_EVENT_LIMIT)
     {
         events.insert(0, model_facing_recovery_event(event));
-        let fits = serde_json::to_vec(&events)
-            .map(|bytes| bytes.len() <= SESSION_CONTINUITY_RECOVERY_EVENT_BYTES)
+        let fits = serialized_json_len(&events)
+            .map(|bytes| bytes <= SESSION_CONTINUITY_RECOVERY_EVENT_BYTES)
             .unwrap_or(false);
         if !fits {
             events.remove(0);

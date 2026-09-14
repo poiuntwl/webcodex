@@ -155,13 +155,18 @@ MCP / OpenAPI / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runne
 Runtime Console -----------------------> canonical Server HTTP/kernel paths above
 ```
 
-- `route_metadata` — canonical HTTP route identity, security/surface metadata,
-  and OpenAPI exposure. Public Action operation policy is bound directly to its
-  route; Connector routes bind canonical capability identities. Handler mounting
-  stays explicit in the HTTP modules.
-- `runtime_http` — REST runtime routes.
-- `mcp` — the MCP adapter and surface selection.
-- `openapi` — the GPT Actions schema.
+- `route_metadata` — canonical HTTP route identity plus security/surface metadata.
+  Legacy REST routes and the one dynamic GPT Action adapter remain ordinary HTTP
+  routes; generic GPT Action operation identity is no longer stored here.
+  Connector routes still bind canonical Connector capability identities.
+- `runtime_http` — REST runtime routes plus the shared `/api/actions/{tool_name}`
+  adapter. The Action adapter performs transport decoding/admission only and then
+  enters the same ToolRuntime kernel as the canonical runtime path.
+- `mcp` — the primary model-facing adapter and model-surface selection.
+- `openapi` — the generic GPT Actions compatibility projector. It derives direct
+  operations from the canonical Adaptive Runtime direct rank, removes only explicit
+  protocol-incompatible `ToolDefinition` exceptions, and adds `call_runtime_tool`
+  for the supported long tail. Project Connector OpenAPI remains capability-based.
 - `connector_runtime` — the canonical project-bound coding path.
 - `tool_runtime` — protocol-independent tool parsing, dispatch, project
   resolution, registry metadata, sessions, handoff, hygiene, files, Git,
@@ -213,6 +218,16 @@ be structured and decision-complete. Follow-up calls use one parser-ready
 while continuation, refinement, failure recovery, and Session context ACK remain
 separate semantic lanes. Duplicate aliases and compatibility projections are not
 kept without a named consumer.
+
+Internal protocol taxonomies do not automatically belong on the model surface.
+Typed continuation kinds/carriers, absolute cursors, lifecycle bookkeeping,
+timestamps, derived counts, and forensic recovery metadata can remain canonical
+inside WebCodex while the normal model projection exposes only the business
+result, correctness-critical identity/fence/completeness, and one unambiguous
+follow-up. Extra diagnostic detail is progressively disclosed when an exceptional
+state actually requires the model to reason about it. A field that cannot change
+the model's interpretation or next safe action is not model-facing merely because
+it is useful to implementation, tests, telemetry, or the operator Console.
 
 The standing detailed guidance is
 [`agent/tool-contract-guidelines.md`](agent/tool-contract-guidelines.md). Tool
