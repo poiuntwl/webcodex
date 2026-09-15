@@ -42,18 +42,14 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     for phrase in [
         "adaptive runtime preferred batch-capable inspect tool",
         "only one known range",
-        "read_range",
-        "batch_items",
-        "next_index",
-        "not a read_files input",
-        "increase_result_budget",
         "no fake continuation",
-        "complete a current partial item",
         "512 kib",
         "exact resolved project",
         "business session_id",
         "read_revision",
-        "source_read_revision",
+        "single output-level suggested_call",
+        "continued ranges are fenced",
+        "runtime rejects a continuation",
     ] {
         assert!(
             read_files_desc.contains(phrase),
@@ -194,22 +190,37 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "scope/fence-bound",
         "max_page_bytes",
         "raw producer page",
+        "shared safe producer maximum",
         "512 kib",
         "final model-facing",
-        "next complete-line fragment",
-        "parser-ready suggested_call",
-        "next_continuation",
-        "recovery.continuation",
-        "later-record only",
-        "recovery.omitted_lines",
+        "parser-ready next_call",
+        "recovery.later_hunks.next_call",
+        "next logical diff record",
+        "never an intra-hunk cursor",
+        "recovery.current_hunk.next_call",
         "bounded refinement",
         "exact hunk-fragment token",
+        "next complete diff line",
+        "line-budget and page-byte-budget truncation",
+        "positive complete-line progress",
+        "safe forward progress is not proven",
     ] {
         assert!(
             git_diff_hunks_desc.contains(phrase),
             "git_diff_hunks description should mention {phrase}: {git_diff_hunks_desc}"
         );
     }
+    let default_page_bytes = git_diff_hunks.input_schema["properties"]["max_page_bytes"]["default"]
+        .as_u64()
+        .expect("git_diff_hunks max_page_bytes default");
+    assert_eq!(
+        default_page_bytes as usize,
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
+    );
+    assert_eq!(
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES,
+        webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES
+    );
     let continuation_desc = git_diff_hunks.input_schema["properties"]["continuation"]
         ["description"]
         .as_str()

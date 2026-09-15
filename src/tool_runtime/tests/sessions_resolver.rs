@@ -84,6 +84,7 @@ async fn read_file_accepts_unique_short_id() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -132,6 +133,7 @@ async fn read_files_short_id_continuation_binds_resolved_project_across_registry
                             path: "README.md".to_string(),
                             start_line: Some(1),
                             limit: Some(1),
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -162,7 +164,7 @@ async fn read_files_short_id_continuation_binds_resolved_project_across_registry
         .unwrap();
     let first = first.await.unwrap();
     assert!(first.success, "{:?}", first.error);
-    let suggested = &first.output["items"][0]["continuation"]["suggested_call"];
+    let suggested = &first.output["suggested_call"];
     assert_eq!(
         suggested["arguments"]["project"],
         "agent:workstation:other-repo"
@@ -256,6 +258,7 @@ async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
                             path: "README.md".to_string(),
                             start_line: Some(1),
                             limit: Some(1),
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -286,14 +289,12 @@ async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(
-        result.output["items"][0]["continuation"]["suggested_call"]["arguments"]["project"],
+        result.output["suggested_call"]["arguments"]["project"],
         "agent:workstation:other-repo"
     );
-    assert!(
-        result.output["items"][0]["continuation"]["suggested_call"]["arguments"]
-            .get("session_id")
-            .is_none()
-    );
+    assert!(result.output["suggested_call"]["arguments"]
+        .get("session_id")
+        .is_none());
 }
 
 #[tokio::test]
@@ -348,6 +349,7 @@ async fn ambiguous_short_id_returns_candidates_for_project_tools() {
                     path: "README.md".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: None,
                 with_line_numbers: None,
@@ -377,6 +379,7 @@ async fn full_id_remains_compatible_for_project_tools() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,

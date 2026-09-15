@@ -8,7 +8,7 @@ use super::session_context::{
 use super::{permissions, session_context, sessions, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::tool_runtime::project_resolution::{ProjectResolverError, ResolvedProject};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Add the Phase A lifecycle tuple to a definite pre-execution structured
 /// execution denial without changing generic denial helpers used by unrelated
@@ -52,11 +52,135 @@ pub(super) fn decorate_structured_execution_prestart_denial(
     result.output = Value::Object(output);
 }
 
+fn is_structured_validation_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test"
+    )
+}
+
+fn sparsify_terminal_structured_validation_success(tool_name: &str, result: &mut ToolResult) {
+    if !is_structured_validation_tool(tool_name) || !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    let terminal_success = output.get("execution_state").and_then(Value::as_str)
+        == Some("completed")
+        && output.get("command_started").and_then(Value::as_bool) == Some(true)
+        && output.get("command_completed").and_then(Value::as_bool) == Some(true)
+        && output.get("passed").and_then(Value::as_bool) == Some(true)
+        && output.get("promoted_to_job").and_then(Value::as_bool) == Some(false)
+        && output.get("terminal").and_then(Value::as_bool) == Some(true)
+        && output.get("job_id").map(Value::is_null).unwrap_or(true)
+        && output.get("job_status").map(Value::is_null).unwrap_or(true)
+        && output
+            .get("observation_token")
+            .map(Value::is_null)
+            .unwrap_or(true);
+    if !terminal_success {
+        return;
+    }
+
+    for key in [
+        "project",
+        "command_summary",
+        "cwd",
+        "shell",
+        "executor",
+        "execution_source",
+        "purpose",
+        "execution_state",
+        "exit_code",
+        "duration_ms",
+        "passed",
+        "command_started",
+        "command_completed",
+        "promoted_to_job",
+        "terminal",
+        "job_id",
+        "job_status",
+        "observation_token",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+    ] {
+        output.remove(key);
+    }
+    output.remove("async_handoff_available");
+    if output.get("failure_kind").is_some_and(Value::is_null) {
+        output.remove("failure_kind");
+    }
+    for key in ["stdout_tail", "stderr_tail"] {
+        if output.get(key).and_then(Value::as_str) == Some("") {
+            output.remove(key);
+        }
+    }
+    for key in ["stdout_lines", "stderr_lines"] {
+        if output.get(key).and_then(Value::as_u64) == Some(0) {
+            output.remove(key);
+        }
+    }
+    for key in ["stdout_truncated", "stderr_truncated"] {
+        if output.get(key).and_then(Value::as_bool) == Some(false) {
+            output.remove(key);
+        }
+    }
+}
+
+fn sparsify_structured_validation_runtime_metadata(tool_name: &str, result: &mut ToolResult) {
+    if !is_structured_validation_tool(tool_name) {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    for key in ["execution_source", "purpose", "executor", "shell"] {
+        output.remove(key);
+    }
+    if result.success
+        && matches!(
+            output.get("execution_state").and_then(Value::as_str),
+            Some("queued" | "running" | "started" | "pending")
+        )
+    {
+        for key in [
+            "project",
+            "cwd",
+            "terminal",
+            "command_started",
+            "command_completed",
+            "sync_wait_secs",
+        ] {
+            output.remove(key);
+        }
+        for key in ["stdout_tail", "stderr_tail"] {
+            if output.get(key).and_then(Value::as_str) == Some("") {
+                output.remove(key);
+            }
+        }
+        for key in ["stdout_lines", "stderr_lines"] {
+            if output.get(key).and_then(Value::as_u64) == Some(0) {
+                output.remove(key);
+            }
+        }
+        for key in ["stdout_truncated", "stderr_truncated"] {
+            if output.get(key).and_then(Value::as_bool) == Some(false) {
+                output.remove(key);
+            }
+        }
+    }
+}
+
 /// Remove facts that are fully implied by a successful synchronous terminal
 /// structured execution, but only after the complete ToolResult has already
 /// been recorded into the Session ledger. Failure/uncertain/Job projections
 /// remain explicit because they participate in retry and reconciliation safety.
 fn sparsify_terminal_structured_execution_success(tool_name: &str, result: &mut ToolResult) {
+    if is_structured_validation_tool(tool_name) {
+        sparsify_terminal_structured_validation_success(tool_name, result);
+        return;
+    }
     if !matches!(tool_name, "run_process" | "run_script") || !result.success {
         return;
     }
@@ -225,15 +349,6 @@ fn add_run_process_expectation_projection(
     let Some(output) = result.output.as_object_mut() else {
         return;
     };
-    let execution_success = output.get("execution_state").and_then(Value::as_str)
-        == Some("completed")
-        && output.get("command_completed").and_then(Value::as_bool) == Some(true)
-        && output.get("command_ok").and_then(Value::as_bool) == Some(true)
-        && output.get("tool_failure").and_then(Value::as_bool) != Some(true);
-    output.insert(
-        "execution_success".to_string(),
-        Value::Bool(execution_success),
-    );
     output.insert(
         "expectation_satisfied".to_string(),
         Value::Bool(expectation_satisfied),
@@ -269,6 +384,8 @@ impl SearchModelProjection {
 
 enum ModelFacingProjection {
     None,
+    JobHandoff,
+    AgentWait,
     Read(super::read_files::ReadModelProjection),
     Search(SearchModelProjection),
 }
@@ -284,6 +401,18 @@ pub(super) struct ModelFacingProjectionPlan {
 impl ModelFacingProjectionPlan {
     pub(super) fn capture(call: &ToolCall) -> Self {
         let projection = match call {
+            ToolCall::WaitForAgentEvents { .. }
+            | ToolCall::ReadAgentWait { .. }
+            | ToolCall::CancelAgentWait { .. } => ModelFacingProjection::AgentWait,
+            ToolCall::RunJob { .. }
+            | ToolCall::RunProcess { .. }
+            | ToolCall::RunScript { .. }
+            | ToolCall::RunShell { .. }
+            | ToolCall::RunDetachedProcess { .. }
+            | ToolCall::CargoFmt { .. }
+            | ToolCall::CargoCheck { .. }
+            | ToolCall::CargoTest { .. }
+            | ToolCall::GoTest { .. } => ModelFacingProjection::JobHandoff,
             ToolCall::ReadFiles { .. } => {
                 ModelFacingProjection::Read(super::read_files::ReadModelProjection::capture(call))
             }
@@ -307,6 +436,12 @@ impl ModelFacingProjectionPlan {
     pub(super) fn project(self, result: &mut ToolResult) {
         match self.projection {
             ModelFacingProjection::None => {}
+            ModelFacingProjection::AgentWait => {
+                super::agent_wait::agent_wait_model_projection(result)
+            }
+            ModelFacingProjection::JobHandoff => {
+                super::jobs::sparsify_job_handoff_model_result(result)
+            }
             ModelFacingProjection::Read(projection) => {
                 let super::read_files::ReadModelProjection::Batch {
                     max_result_bytes, ..
@@ -383,24 +518,6 @@ fn sparsify_search_match_items(output: &mut serde_json::Map<String, Value>) {
     }
 }
 
-fn add_search_refinement_continuation(output: &mut serde_json::Map<String, Value>) {
-    if output.get("truncated").and_then(Value::as_bool) != Some(true)
-        || !matches!(
-            output.get("truncation_reason").and_then(Value::as_str),
-            Some("limit" | "output_bytes")
-        )
-    {
-        return;
-    }
-    output.entry("continuation".to_string()).or_insert_with(|| {
-        json!({
-            "kind": "refine_query",
-            "safe_cursor": false,
-            "refine_with": ["path", "include_globs", "pattern", "result_mode", "limit"]
-        })
-    });
-}
-
 /// Project successful text-search presentation after Session/event consumers
 /// have seen canonical evidence. Complete rg results keep only mode-relevant
 /// records and explicit non-default controls. Fallback/truncated successes retain
@@ -413,8 +530,6 @@ pub(crate) fn sparsify_search_output_for_model(
     allow_batch_deadline_reduction: bool,
 ) -> bool {
     sparsify_search_match_items(output);
-    add_search_refinement_continuation(output);
-
     let exit_code = output.get("exit_code").and_then(Value::as_i64);
     let result_mode = output
         .get("result_mode")
@@ -612,8 +727,8 @@ pub(crate) fn sparsify_search_batch_success_for_model(
 }
 
 /// Remove range bookkeeping only when the returned text is provably the complete
-/// file. `sha256` and `total_lines` remain explicit freshness/content-shape
-/// evidence. Partial reads and every real continuation keep the canonical full
+/// file. `read_revision` remains the model-facing snapshot identity and
+/// `total_lines` remains content-shape evidence. Partial reads and every real continuation keep the canonical full
 /// range tuple. In a batch, the outer item path remains the navigation identity,
 /// so an identical inner path is redundant.
 pub(crate) fn sparsify_complete_file_read_output(
@@ -653,6 +768,10 @@ pub(crate) fn sparsify_complete_file_read_output(
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             })
+        && output
+            .get("read_revision")
+            .and_then(Value::as_u64)
+            .is_some()
         && output.get("start_line").and_then(Value::as_u64) == Some(1)
         && output.get("limit").and_then(Value::as_u64) == Some(default_limit)
         && returned_lines == total_lines
@@ -664,6 +783,9 @@ pub(crate) fn sparsify_complete_file_read_output(
         return false;
     }
 
+    // The digest has already served canonical snapshot registration. The model
+    // uses the bounded read_revision handle for this exact snapshot.
+    output.remove("sha256");
     for key in [
         "start_line",
         "limit",
@@ -746,6 +868,21 @@ pub(crate) fn sparsify_complete_read_success(tool_name: &str, result: &mut ToolR
             "next_index",
         ] {
             output.remove(key);
+        }
+    }
+    // The output-level call is the sole machine representation of follow-up
+    // positions. `read_revision` is the sole model-facing snapshot identity;
+    // the underlying digest remains canonical/internal evidence only.
+    output.remove("next_index");
+    if let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            if let Some(read) = item.get_mut("output").and_then(Value::as_object_mut) {
+                read.remove("next_start_line");
+                read.remove("budget_next_limit");
+                if read.get("read_revision").and_then(Value::as_u64).is_some() {
+                    read.remove("sha256");
+                }
+            }
         }
     }
 }
@@ -900,7 +1037,7 @@ impl ToolRuntime {
 
     /// Kernel-only companion that returns the terminal model-facing projection
     /// plan after the same authoritative Project resolution used for execution.
-    /// The returned ToolResult is still canonical with respect to read/search
+    /// The returned ToolResult is still canonical with respect to domain-local
     /// budgeting and sparse projection so an outer recorder can consume it first.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
@@ -1539,6 +1676,7 @@ impl ToolRuntime {
         )
         .await;
         sparsify_terminal_structured_execution_success(tool_name, &mut result);
+        sparsify_structured_validation_runtime_metadata(tool_name, &mut result);
         result
     }
 
@@ -2588,6 +2726,50 @@ mod structured_execution_sparse_projection_tests {
     }
 
     #[test]
+    fn terminal_validation_success_keeps_only_independent_mutation_truth() {
+        let mut result = ToolResult::ok(json!({
+            "project": "agent:test:webcodex",
+            "command_summary": "cargo fmt",
+            "cwd": ".",
+            "shell": "configured",
+            "executor": "agent",
+            "execution_source": "cargo_fmt",
+            "purpose": "format",
+            "execution_state": "completed",
+            "exit_code": 0,
+            "duration_ms": 5,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "command_started": true,
+            "command_completed": true,
+            "passed": true,
+            "failure_kind": null,
+            "promoted_to_job": false,
+            "terminal": true,
+            "job_id": null,
+            "job_status": null,
+            "observation_token": null,
+            "effective_timeout_secs": 60,
+            "sync_wait_secs": 60,
+            "async_handoff_available": false,
+            "changed": true,
+            "state_changed": true
+        }));
+
+        sparsify_terminal_structured_execution_success("cargo_fmt", &mut result);
+        sparsify_structured_validation_runtime_metadata("cargo_fmt", &mut result);
+
+        assert_eq!(
+            result.output,
+            json!({"changed": true, "state_changed": true})
+        );
+    }
+
+    #[test]
     fn failure_projection_removes_audit_noise_but_preserves_decision_relevant_facts() {
         let mut result = ToolResult::err_with_output(
             "process exited 17",
@@ -2614,7 +2796,6 @@ mod structured_execution_sparse_projection_tests {
                 "recovery": {"kind": "inspect_output"}
             }),
         );
-        result.output["execution_success"] = json!(false);
         result.output["expectation_satisfied"] = json!(true);
         sparsify_failure_model_result_metadata("run_process", &mut result);
 
@@ -2647,7 +2828,6 @@ mod structured_execution_sparse_projection_tests {
             "job_id",
             "observation_token",
             "recovery",
-            "execution_success",
             "expectation_satisfied",
         ] {
             assert!(
@@ -2737,5 +2917,41 @@ mod sparse_read_projection_tests {
             assert_eq!(result.output["items"][0]["output"]["path"], "a.rs");
             assert_eq!(result.output["items"][0]["output"]["start_line"], 1);
         }
+    }
+
+    #[test]
+    fn sparse_read_batch_requires_read_revision_before_hiding_digest() {
+        let mut without_revision = complete_batch_item(Some("a.rs"), "a.rs");
+        let mut result = ToolResult::ok(json!({
+            "project": "demo",
+            "requested_count": 1,
+            "returned_count": 1,
+            "succeeded_count": 1,
+            "failed_count": 0,
+            "items": [without_revision.clone()],
+            "output_truncated": false,
+            "next_index": null
+        }));
+        sparsify_complete_read_success("read_files", &mut result);
+        assert_eq!(result.output["requested_count"], 1);
+        assert!(result.output["items"][0]["output"]["sha256"]
+            .as_str()
+            .is_some());
+
+        without_revision["output"]["read_revision"] = json!(42);
+        let mut result = ToolResult::ok(json!({
+            "project": "demo",
+            "requested_count": 1,
+            "returned_count": 1,
+            "succeeded_count": 1,
+            "failed_count": 0,
+            "items": [without_revision],
+            "output_truncated": false,
+            "next_index": null
+        }));
+        sparsify_complete_read_success("read_files", &mut result);
+        assert!(result.output.get("requested_count").is_none());
+        assert_eq!(result.output["items"][0]["output"]["read_revision"], 42);
+        assert!(result.output["items"][0]["output"].get("sha256").is_none());
     }
 }

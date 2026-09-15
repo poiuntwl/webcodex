@@ -1,5 +1,6 @@
 use super::*;
 use webcodex_core::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES;
+use webcodex_core::workflow_session_contract::EXECUTION_PURPOSE_VALUES;
 
 macro_rules! assert_schema_fields {
     (
@@ -123,6 +124,38 @@ fn search_project_texts_query_schema_declares_bounded_advanced_inputs() {
 }
 
 #[test]
+fn read_files_snapshot_fence_schema_matches_read_revision_contract() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "read_files").input_schema;
+    let fence = &schema["properties"]["items"]["items"]["properties"]["expected_read_revision"];
+    assert_eq!(fence["type"], "integer");
+    assert_eq!(fence["minimum"], 1);
+    assert_eq!(fence["maximum"], 9_007_199_254_740_991_u64);
+    let description = fence["description"].as_str().unwrap_or_default();
+    assert!(description.contains("suggested_call"));
+    assert!(description.contains("should not invent"));
+
+    let request = |revision: Value| {
+        json!({
+            "project": "demo",
+            "items": [{"path": "src/lib.rs", "expected_read_revision": revision}]
+        })
+    };
+    assert!(
+        test_support::validate_schema_instance(&request(json!(3_817_291_045_227_u64)), schema)
+            .is_ok()
+    );
+    for invalid in [
+        json!(0),
+        json!(9_007_199_254_740_992_u64),
+        json!("3817"),
+        Value::Null,
+    ] {
+        assert!(test_support::validate_schema_instance(&request(invalid), schema).is_err());
+    }
+}
+
+#[test]
 fn batch_inspection_result_budget_schema_defers_bounds_to_runtime_clamp() {
     let specs = registered_tool_specs();
     for name in ["read_files", "search_project_texts"] {
@@ -167,13 +200,25 @@ fn git_diff_hunks_page_budget_schema_defers_bounds_to_runtime_clamp() {
     let schema = &spec_named(&specs, "git_diff_hunks").input_schema;
     let page = &schema["properties"]["max_page_bytes"];
     assert_eq!(page["type"], "integer");
-    assert_eq!(page["default"], 64 * 1024);
+    assert_eq!(
+        page["default"],
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
+    );
+    assert_eq!(
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES,
+        webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES
+    );
     assert_eq!(page["minimum"], 0);
     assert!(page.get("maximum").is_none());
     let description = page["description"].as_str().unwrap().to_ascii_lowercase();
     assert!(description.contains("producer page"));
     assert!(description.contains("final serialized model result"));
     assert!(description.contains("runtime-clamped"));
+    let default_kib = webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES / 1024;
+    let min_kib = webcodex_core::runtime_contract::MIN_GIT_DIFF_HUNKS_PAGE_BYTES / 1024;
+    let max_kib = webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES / 1024;
+    assert!(description.contains(&format!("{default_kib} kib")));
+    assert!(description.contains(&format!("{min_kib}..{max_kib} kib")));
     for bytes in [0, 1, 16 * 1024, 64 * 1024, 192 * 1024, 300_000] {
         assert!(test_support::validate_schema_instance(
             &json!({"project":"demo","max_page_bytes":bytes}),
@@ -395,6 +440,33 @@ fn raw_shell_tools_expose_the_shared_authored_command_bound() {
         assert_eq!(command["maxLength"], RAW_SHELL_COMMAND_MAX_BYTES, "{name}");
         let description = command["description"].as_str().unwrap_or_default();
         assert!(description.contains("16000") || description.contains("16,000"));
+    }
+}
+
+#[test]
+fn execution_purpose_schemas_share_canonical_vocabulary_and_validators_do_not_accept_it() {
+    let specs = registered_tool_specs();
+    for name in [
+        "run_process",
+        "run_script",
+        "run_shell",
+        "run_job",
+        "session_shell_exec",
+    ] {
+        let purpose = &spec_named(&specs, name).input_schema["properties"]["purpose"];
+        assert_eq!(purpose["enum"], json!(EXECUTION_PURPOSE_VALUES), "{name}");
+        assert!(purpose["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("caller-declared evidence intent")));
+    }
+    for name in ["cargo_fmt", "cargo_check", "cargo_test", "go_test"] {
+        let properties = spec_named(&specs, name).input_schema["properties"]
+            .as_object()
+            .unwrap();
+        assert!(
+            !properties.contains_key("purpose"),
+            "{name} validation purpose must be Runtime-derived"
+        );
     }
 }
 

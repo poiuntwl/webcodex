@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
 use super::helpers::{
     command_rejected_message, explicit_shell_dispatch_command, is_safe_job_id,
@@ -668,6 +669,50 @@ pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&
         }),
     )
     .to_value()
+}
+
+/// Keep the internal handoff receipt intact for recording, then project the
+/// exact observe call as the sole observation-token carrier on normal handoff.
+pub(super) fn sparsify_job_handoff_model_result(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    if !matches!(
+        output.get("execution_state").and_then(Value::as_str),
+        Some("queued" | "running" | "started" | "pending")
+    ) {
+        return;
+    }
+    let Some(job_id) = output
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let call = &output["continuation"];
+    if call["tool"] != "observe_jobs" || call["arguments"]["items"][0]["job_id"] != job_id {
+        return;
+    }
+    let token = output.get("observation_token").and_then(Value::as_str);
+    if call["arguments"]["items"][0]["after_observation_token"].as_str() != token {
+        return;
+    }
+    output.remove("observation_token");
+    output.remove("continuation_semantics");
+    if output.get("promoted_to_job").and_then(Value::as_bool) == Some(true) {
+        output.remove("promoted_to_job");
+    }
+    if output
+        .get("async_handoff_available")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        output.remove("async_handoff_available");
+    }
 }
 
 fn list_jobs_recovery_suggested_call(project: Option<&str>) -> Value {
@@ -1579,12 +1624,10 @@ impl ToolRuntime {
                 .as_ref()
                 .and_then(|metadata| metadata.validation_identity.as_deref())
                 .is_some()
-                && job.purpose.as_deref().is_some_and(|purpose| {
-                    matches!(
-                        purpose,
-                        "validation" | "test" | "build" | "format" | "release"
-                    )
-                });
+                && job
+                    .purpose
+                    .as_deref()
+                    .is_some_and(is_validation_like_execution_purpose);
             if job.project_id.as_deref() == Some(project)
                 && requested.contains(session_id)
                 && (job.validation.is_some() || generic_validation)
