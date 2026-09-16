@@ -6,7 +6,7 @@ use super::runtime_metrics::{
 use super::startup_brief::{
     bounded_extension_description, StartupSkillEntry, StartupSkillsCatalog,
 };
-use super::{SuggestedToolCall, ToolResult, ToolRuntime};
+use super::{ExecutionPurpose, SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::json_measurement::serialized_json_len;
 use crate::runner_http::{EnqueueRunnerSkillError, RunnerFeature};
@@ -829,6 +829,172 @@ impl ToolRuntime {
             MAX_SKILL_LIST_LIMIT,
             MAX_SKILL_SIDECAR_CATALOG_BYTES,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_skill_resource(
+        &self,
+        project: &ResolvedProject,
+        skill_id: String,
+        path: String,
+        expected_definition_revision: String,
+        expected_package_revision: Option<String>,
+        executable: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
+        purpose: Option<ExecutionPurpose>,
+        session_id: Option<String>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if !valid_skill_id(&skill_id) {
+            return skill_execution_error("skill_id_invalid", Some(json!({"skill_id": skill_id})));
+        }
+        let resource_path = match validate_resource_path(&path) {
+            Ok(path) => path,
+            Err(kind) => return skill_execution_error(kind, Some(json!({"skill_id": skill_id}))),
+        };
+        if !resource_path.starts_with("scripts/") {
+            return skill_execution_error(
+                "skill_resource_not_executable",
+                Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+            );
+        }
+        if !is_lower_sha256(&expected_definition_revision) {
+            return skill_execution_error(
+                "skill_definition_revision_invalid",
+                Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+            );
+        }
+        if expected_package_revision
+            .as_deref()
+            .is_some_and(|revision| !valid_package_revision(revision))
+        {
+            return skill_execution_error(
+                "skill_package_revision_invalid",
+                Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+            );
+        }
+
+        let resolved = match self.resolve_exact_skill(project, auth, &skill_id).await {
+            Ok(Some(ExactSkillCandidate::Runner(resolved))) => resolved,
+            Ok(Some(ExactSkillCandidate::Project { .. })) => {
+                return skill_execution_error(
+                    "skill_execution_trust_denied",
+                    Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+                )
+            }
+            Ok(None) => {
+                return skill_execution_error(
+                    "skill_not_found",
+                    Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+                )
+            }
+            Err(_) => return skill_execution_error("skill_catalog_unavailable", None),
+        };
+
+        match resolved.source() {
+            RunnerSkillSource::Configured => {
+                if expected_package_revision.is_some() {
+                    return skill_execution_error(
+                        "skill_package_revision_not_supported",
+                        Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+                    );
+                }
+                if expected_definition_revision != resolved.definition_revision() {
+                    return skill_execution_error(
+                        "skill_definition_changed",
+                        Some(json!({
+                            "skill_id": skill_id,
+                            "skill_path": resource_path,
+                            "skill_definition_revision": resolved.definition_revision(),
+                        })),
+                    );
+                }
+            }
+            RunnerSkillSource::Managed if expected_package_revision.is_none() => {
+                return skill_execution_error(
+                    "skill_package_revision_required",
+                    Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+                );
+            }
+            RunnerSkillSource::Managed => {}
+        }
+
+        let read = self
+            .read_runner_skill(
+                project,
+                auth,
+                &resolved,
+                &resource_path,
+                1,
+                MAX_SKILL_READ_LINES,
+                expected_package_revision.as_deref(),
+                Some(&expected_definition_revision),
+            )
+            .await;
+        if !read.success {
+            let kind = read
+                .output
+                .get("error_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("skill_resource_unavailable")
+                .to_string();
+            return skill_execution_error(
+                &kind,
+                Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+            );
+        }
+        let Some(read_output) = read.output.as_object() else {
+            return skill_execution_error("skill_resource_unavailable", None);
+        };
+        if read_output.get("has_more").and_then(Value::as_bool) == Some(true) {
+            return skill_execution_error(
+                "skill_resource_too_large_for_execution",
+                Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+            );
+        }
+        let Some(script) = read_output.get("text").and_then(Value::as_str) else {
+            return skill_execution_error("skill_resource_unavailable", None);
+        };
+        let metadata = json!({
+            "skill_id": skill_id,
+            "skill_name": read_output.get("name").cloned().unwrap_or(Value::Null),
+            "skill_path": resource_path,
+            "skill_sha256": read_output.get("sha256").cloned().unwrap_or(Value::Null),
+            "skill_trust": read_output.get("trust").cloned().unwrap_or(Value::Null),
+            "skill_definition_revision": read_output.get("definition_revision").cloned().unwrap_or(Value::Null),
+            "skill_package_revision": read_output.get("package_revision").cloned().unwrap_or(Value::Null),
+        });
+
+        let mut result = self
+            .run_process_with_contract_for_resource(
+                project.resolved_id.clone(),
+                executable,
+                args,
+                Some(script.to_string()),
+                timeout_secs,
+                sync_wait_secs,
+                cwd,
+                purpose,
+                None,
+                session_id,
+                None,
+                auth,
+            )
+            .await;
+        if let Some(output) = result.output.as_object_mut() {
+            if let Some(metadata) = metadata.as_object() {
+                output.extend(metadata.clone());
+            }
+            output.insert(
+                "execution_source".to_string(),
+                Value::String("run_skill_resource".to_string()),
+            );
+            output.remove("suggested_call");
+        }
+        result
     }
 
     pub(crate) async fn skill_load(
@@ -2060,6 +2226,26 @@ fn catalog_page_envelope(
         "diagnostics": diagnostics,
         "discovery_truncated": discovery_truncated,
     })
+}
+
+fn skill_execution_error(kind: &str, extra: Option<Value>) -> ToolResult {
+    let mut output = json!({
+        "execution_state": "not_started",
+        "command_started": false,
+        "command_completed": false,
+        "command_ok": false,
+        "exit_code": null,
+        "failure_kind": kind,
+        "tool_failure": true,
+        "state_changed": false,
+    });
+    if let (Some(target), Some(extra)) = (
+        output.as_object_mut(),
+        extra.and_then(|value| value.as_object().cloned()),
+    ) {
+        target.extend(extra);
+    }
+    ToolResult::err_with_output(kind.to_string(), output)
 }
 
 fn skill_error(kind: &'static str, project: &str, extra: Option<Value>) -> ToolResult {

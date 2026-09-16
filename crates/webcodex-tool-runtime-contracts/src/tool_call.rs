@@ -1341,6 +1341,31 @@ pub enum ToolCall {
         session_id: Option<String>,
     },
 
+    /// Execute one trusted Runner Skill script through the existing structured
+    /// process contract. The selected resource is supplied to the interpreter
+    /// over stdin; native Skill package paths are never exposed.
+    RunSkillResource {
+        project: String,
+        skill_id: String,
+        path: String,
+        expected_definition_revision: String,
+        #[serde(default)]
+        expected_package_revision: Option<String>,
+        executable: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        sync_wait_secs: Option<u64>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        purpose: Option<ExecutionPurpose>,
+    },
+
     /// Fresh bounded discovery of project-scoped Agent Skills. This tool is
     /// model-hidden globally and exposed only by capable Stateless MCP Full
     /// Operator surfaces.
@@ -3082,6 +3107,7 @@ impl ToolCall {
             Self::GoTest { .. } => "go_test",
             Self::ReadFiles { .. } => "read_files",
             Self::SkillLoad { .. } => "skill_load",
+            Self::RunSkillResource { .. } => "run_skill_resource",
             Self::SkillList { .. } => "skill_list",
             Self::SkillReadFile { .. } => "skill_read_file",
             Self::SkillVersions { .. } => "skill_versions",
@@ -3211,6 +3237,7 @@ impl ToolCall {
             | Self::GoTest { session_id, .. }
             | Self::ReadFiles { session_id, .. }
             | Self::SkillLoad { session_id, .. }
+            | Self::RunSkillResource { session_id, .. }
             | Self::SkillList { session_id, .. }
             | Self::SkillReadFile { session_id, .. }
             | Self::SkillVersions { session_id, .. }
@@ -3303,6 +3330,7 @@ impl ToolCall {
             Self::RunProcess { cwd, .. }
             | Self::RunDetachedProcess { cwd, .. }
             | Self::RunScript { cwd, .. }
+            | Self::RunSkillResource { cwd, .. }
                 if cwd.is_none() =>
             {
                 *cwd = execution_context.default_cwd.clone();
@@ -3350,6 +3378,7 @@ impl ToolCall {
             | Self::GoTest { project, .. }
             | Self::ReadFiles { project, .. }
             | Self::SkillLoad { project, .. }
+            | Self::RunSkillResource { project, .. }
             | Self::SkillList { project, .. }
             | Self::SkillReadFile { project, .. }
             | Self::SkillVersions { project, .. }
