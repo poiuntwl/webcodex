@@ -839,7 +839,6 @@ impl ToolRuntime {
         path: String,
         expected_definition_revision: String,
         expected_package_revision: Option<String>,
-        executable: String,
         args: Vec<String>,
         cwd: Option<String>,
         timeout_secs: Option<u64>,
@@ -861,6 +860,15 @@ impl ToolRuntime {
                 Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
             );
         }
+        let (executable, process_args) = match skill_resource_interpreter(&resource_path, args) {
+            Ok(command) => command,
+            Err(kind) => {
+                return skill_execution_error(
+                    kind,
+                    Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+                )
+            }
+        };
         if !is_lower_sha256(&expected_definition_revision) {
             return skill_execution_error(
                 "skill_definition_revision_invalid",
@@ -972,7 +980,7 @@ impl ToolRuntime {
             .run_process_with_contract_for_resource(
                 project.resolved_id.clone(),
                 executable,
-                args,
+                process_args,
                 Some(script.to_string()),
                 timeout_secs,
                 sync_wait_secs,
@@ -1011,11 +1019,12 @@ impl ToolRuntime {
             Ok(catalog) => catalog,
             Err(_) => return skill_error("skill_catalog_unavailable", &project.resolved_id, None),
         };
-        let matches = catalog
-            .skills
-            .iter()
-            .filter(|skill| skill.descriptor.name.eq_ignore_ascii_case(&name))
-            .collect::<Vec<_>>();
+        let matches = match exact_skill_name_matches(&catalog, &name) {
+            Ok(matches) => matches,
+            Err(kind) => {
+                return skill_error(kind, &project.resolved_id, Some(json!({"name": name})))
+            }
+        };
         if matches.is_empty() {
             return skill_error(
                 "skill_not_found",
@@ -2228,6 +2237,32 @@ fn catalog_page_envelope(
     })
 }
 
+fn skill_resource_interpreter(
+    resource_path: &str,
+    args: Vec<String>,
+) -> Result<(String, Vec<String>), &'static str> {
+    let extension = std::path::Path::new(resource_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "py" => {
+            let mut process_args = Vec::with_capacity(args.len() + 1);
+            process_args.push("-".to_string());
+            process_args.extend(args);
+            Ok(("python".to_string(), process_args))
+        }
+        "sh" => {
+            let mut process_args = Vec::with_capacity(args.len() + 2);
+            process_args.extend(["-s".to_string(), "--".to_string()]);
+            process_args.extend(args);
+            Ok(("sh".to_string(), process_args))
+        }
+        _ => Err("skill_resource_interpreter_unsupported"),
+    }
+}
+
 fn skill_execution_error(kind: &str, extra: Option<Value>) -> ToolResult {
     let mut output = json!({
         "execution_state": "not_started",
@@ -2401,6 +2436,24 @@ fn recompute_name_conflicts(skills: &mut [CatalogSkill]) {
             .unwrap_or_default()
             > 1;
     }
+}
+
+fn skill_names_equal(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
+}
+
+fn exact_skill_name_matches<'a>(
+    catalog: &'a SkillCatalog,
+    name: &str,
+) -> Result<Vec<&'a CatalogSkill>, &'static str> {
+    if catalog.discovery_truncated {
+        return Err("skill_catalog_incomplete");
+    }
+    Ok(catalog
+        .skills
+        .iter()
+        .filter(|skill| skill_names_equal(&skill.descriptor.name, name))
+        .collect())
 }
 
 fn validate_skill_load_name(name: String) -> Result<String, &'static str> {
@@ -2753,6 +2806,59 @@ mod tests {
         assert!(family_only.output.get("suggested_call").is_none());
         assert!(family_only.output.get("recovery_tool").is_none());
         assert_eq!(family_only.output["retry_same_idempotency_key"], true);
+    }
+
+    #[test]
+    fn skill_resource_interpreter_is_server_owned_and_extension_scoped() {
+        assert_eq!(
+            skill_resource_interpreter("scripts/probe.py", vec!["arg".to_string()]).unwrap(),
+            (
+                "python".to_string(),
+                vec!["-".to_string(), "arg".to_string()]
+            )
+        );
+        assert_eq!(
+            skill_resource_interpreter("scripts/probe.sh", vec!["arg".to_string()]).unwrap(),
+            (
+                "sh".to_string(),
+                vec!["-s".to_string(), "--".to_string(), "arg".to_string()]
+            )
+        );
+        assert_eq!(
+            skill_resource_interpreter("scripts/probe.rb", Vec::new()),
+            Err("skill_resource_interpreter_unsupported")
+        );
+    }
+
+    #[test]
+    fn exact_skill_name_matching_is_unicode_aware_and_requires_complete_discovery() {
+        let skill = CatalogSkill {
+            descriptor: SkillDescriptor {
+                skill_id: skill_id("agent:test:demo", "unicode"),
+                name: "Ångström".to_string(),
+                description: "Unicode name".to_string(),
+                definition_revision: "a".repeat(64),
+                package_revision: None,
+                source_scope: "project",
+                trust: "project_content",
+                name_conflict: false,
+            },
+            order_key: "unicode".to_string(),
+        };
+        let mut catalog = SkillCatalog {
+            catalog_revision: catalog_revision(std::slice::from_ref(&skill), 0, &[], false),
+            skills: vec![skill],
+            invalid_count: 0,
+            diagnostics: Vec::new(),
+            discovery_truncated: false,
+        };
+        let matches = exact_skill_name_matches(&catalog, "ÅNGSTRÖM").unwrap();
+        assert_eq!(matches.len(), 1);
+        catalog.discovery_truncated = true;
+        assert_eq!(
+            exact_skill_name_matches(&catalog, "ÅNGSTRÖM").unwrap_err(),
+            "skill_catalog_incomplete"
+        );
     }
 
     #[test]

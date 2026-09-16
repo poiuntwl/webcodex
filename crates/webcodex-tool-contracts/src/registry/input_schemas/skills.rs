@@ -64,14 +64,13 @@ pub fn run_skill_resource_input_schema() -> Value {
         "pattern": "^wc_skillpkg_[A-Za-z0-9_-]{43}$",
         "description": "Required for operator-installed Skills and forbidden for configured live Skills. Pins the immutable installed package revision."
     }));
-    properties["executable"]["description"] = json!("Interpreter executable resolved through the Runner execution environment. The trusted Skill script is supplied on stdin; include the interpreter's stdin marker in args when required (for example python -). Shell command modes remain rejected by the structured process contract.");
-    properties["args"]["description"] = json!("Ordered literal interpreter argv. The Skill script body is not present in model arguments; WebCodex supplies it on stdin after revision/trust validation.");
+    properties.remove("executable");
+    properties["args"]["description"] = json!("Ordered literal script arguments. WebCodex selects the interpreter and stdin-reading invocation from the trusted Skill resource extension, then appends these values after the interpreter's script marker. The Skill script body is never present in model arguments.");
     schema["required"] = json!([
         "project",
         "skill_id",
         "path",
-        "expected_definition_revision",
-        "executable"
+        "expected_definition_revision"
     ]);
     schema
 }
@@ -81,7 +80,7 @@ pub fn skill_load_input_schema() -> Value {
         "type": "object",
         "properties": {
             "project": {"type": "string", "minLength": 1, "description": "Required authorized runtime Project id."},
-            "name": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_NAME_CHARS, "description": "Exact Skill name to load. Matching is case-insensitive; substring and fuzzy matching are not used."},
+            "name": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_NAME_CHARS, "description": "Exact Skill name to load. Matching uses Unicode lowercase mapping; substring and fuzzy matching are not used."},
             "session_id": {"type": "string", "description": "Optional explicit Workflow Session for this tool call. No implicit current-Session fallback is used."}
         },
         "required": ["project", "name"],

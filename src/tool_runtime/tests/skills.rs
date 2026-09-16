@@ -187,6 +187,24 @@ async fn skill_load_is_exact_case_insensitive_and_fails_closed_on_ambiguity() {
     );
     assert!(loaded.output["catalog_revision"].as_str().is_some());
 
+    write_skill(
+        root.path(),
+        "unicode-name",
+        "Ångström",
+        "Unicode Skill name",
+        "unicode body\n",
+    );
+    let (unicode, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_load",
+        json!({"project": project, "name": "ÅNGSTRÖM"}),
+        true,
+    )
+    .await;
+    assert!(unicode.success, "{:?}", unicode.error);
+    assert_eq!(unicode.output["name"], "Ångström");
+
     let (substring, _) = call_kernel_with_local_agent(
         &runtime,
         "skill-load-project",
@@ -2195,8 +2213,7 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
             "skill_id": skill_id,
             "path": "scripts/probe.py",
             "expected_definition_revision": definition_revision,
-            "executable": "python",
-            "args": ["-", "arg"],
+            "args": ["arg"],
             "timeout_secs": 30,
             "sync_wait_secs": 30,
             "purpose": "diagnostic"
@@ -2221,6 +2238,27 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
         .iter()
         .any(|kind| kind != "skill:resolve" && kind != "skill:read" && !kind.starts_with("file_")));
 
+    let (unsupported, unsupported_kinds) = call_kernel_with_fake_operator_store(
+        &runtime,
+        client_id,
+        "run_skill_resource",
+        json!({
+            "project": project,
+            "skill_id": skill_id,
+            "path": "scripts/probe.rb",
+            "expected_definition_revision": definition_revision,
+        }),
+        operator.clone(),
+    )
+    .await;
+    assert!(!unsupported.success);
+    assert_eq!(
+        unsupported.output["failure_kind"],
+        "skill_resource_interpreter_unsupported"
+    );
+    assert_eq!(unsupported.output["command_started"], false);
+    assert!(unsupported_kinds.is_empty());
+
     let stale_revision = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
     let (stale, stale_kinds) = call_kernel_with_fake_operator_store(
         &runtime,
@@ -2231,8 +2269,6 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
             "skill_id": skill_id,
             "path": "scripts/probe.py",
             "expected_definition_revision": stale_revision,
-            "executable": "python",
-            "args": ["-"],
         }),
         operator,
     )
@@ -2299,9 +2335,7 @@ async fn run_skill_resource_denies_project_content_and_requires_managed_package_
             "project": project,
             "skill_id": local_skill_id,
             "path": "scripts/probe.py",
-            "expected_definition_revision": local_revision,
-            "executable": "python",
-            "args": ["-"]
+            "expected_definition_revision": local_revision
         }),
         operator,
     )
@@ -2338,9 +2372,7 @@ async fn run_skill_resource_denies_project_content_and_requires_managed_package_
             "project": project,
             "skill_id": managed_id,
             "path": "scripts/probe.py",
-            "expected_definition_revision": managed_definition,
-            "executable": "python",
-            "args": ["-"]
+            "expected_definition_revision": managed_definition
         }),
         managed,
     )

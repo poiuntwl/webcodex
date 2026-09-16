@@ -507,6 +507,9 @@ fn skill_runtime_tools_are_stateless_full_operator_only_and_schema_static() {
     assert!(run_skill_resource["inputSchema"]["properties"]
         .get("stdin")
         .is_none());
+    assert!(run_skill_resource["inputSchema"]["properties"]
+        .get("executable")
+        .is_none());
     assert_eq!(
         run_skill_resource["inputSchema"]["properties"]["path"]["pattern"],
         "^scripts/"

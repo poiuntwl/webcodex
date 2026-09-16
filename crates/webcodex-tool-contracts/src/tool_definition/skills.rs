@@ -71,7 +71,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Load one uniquely named Skill by exact case-insensitive name for an authorized Project. Returns the selected descriptor plus bounded SKILL.md text and revision metadata in one read-only call. Ambiguous names fail closed; scripts and other Skill resources are never executed.",
+            "Load one uniquely named Skill by exact name using Unicode lowercase matching for an authorized Project. Returns the selected descriptor plus bounded SKILL.md text and revision metadata in one read-only call. Ambiguous names fail closed; scripts and other Skill resources are never executed.",
             skill_load_input_schema,
         ),
         27,
@@ -95,7 +95,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                         super::ToolAuditResultField::value("tool_failure"),
                     ])
                     .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&[
-                        "executable",
                         "args",
                         "process_summary",
                     ])),
@@ -116,10 +115,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     true,
                     super::ToolSessionEvidencePolicy::NONE,
                 ),
-                "Execute one trusted Runner-configured or Runner-installed Skill script without exposing or retransmitting its source through model context. Only scripts/ resources are executable. expected_definition_revision is mandatory; installed Skills also require expected_package_revision. The script is supplied to a Runner interpreter over stdin through the existing structured process/Job contract; project-content Skills are rejected.",
+                "Execute one trusted Runner-configured or Runner-installed Skill script without exposing or retransmitting its source through model context. Only supported scripts/ resources are executable. WebCodex selects the interpreter from the resource extension (.py or .sh), supplies the script over stdin, and appends only caller-provided script arguments after the interpreter's script marker. expected_definition_revision is mandatory; installed Skills also require expected_package_revision; project-content Skills are rejected.",
                 run_skill_resource_input_schema,
             )
-            .with_gpt_action_description("Execute one revision-fenced script from a trusted Runner Skill through structured native process execution. Project-content Skills and non-scripts/ resources are rejected; the script body stays out of model arguments.")
+            .with_gpt_action_description("Execute one revision-fenced .py or .sh script from a trusted Runner Skill through a WebCodex-selected interpreter. Callers supply only script arguments; project-content Skills and unsupported resources are rejected, and the script body stays out of model arguments.")
             .with_execution(super::ToolExecutionContract::new(
                 super::ToolExecutionForm::NativeArgv,
                 super::ToolExecutionLifetime::Runner,

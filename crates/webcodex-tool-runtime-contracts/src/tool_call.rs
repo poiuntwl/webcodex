@@ -1333,7 +1333,7 @@ pub enum ToolCall {
         max_result_bytes: Option<usize>,
     },
 
-    /// Load one Skill definition by unique exact case-insensitive name.
+    /// Load one Skill definition by unique exact name using Unicode lowercase matching.
     SkillLoad {
         project: String,
         name: String,
@@ -1342,8 +1342,9 @@ pub enum ToolCall {
     },
 
     /// Execute one trusted Runner Skill script through the existing structured
-    /// process contract. The selected resource is supplied to the interpreter
-    /// over stdin; native Skill package paths are never exposed.
+    /// process contract. WebCodex selects the interpreter from the resource
+    /// extension and supplies the resource over stdin; callers provide only
+    /// script arguments and native Skill package paths are never exposed.
     RunSkillResource {
         project: String,
         skill_id: String,
@@ -1351,7 +1352,6 @@ pub enum ToolCall {
         expected_definition_revision: String,
         #[serde(default)]
         expected_package_revision: Option<String>,
-        executable: String,
         #[serde(default)]
         args: Vec<String>,
         #[serde(default)]

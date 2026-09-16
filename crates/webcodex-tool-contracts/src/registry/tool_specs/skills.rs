@@ -18,12 +18,12 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
     vec![
         tool_spec(
             "skill_load",
-            "Load one uniquely named Skill by exact case-insensitive name for an authorized Project. Returns the selected descriptor plus bounded SKILL.md text and revision metadata in one read-only call. Ambiguous names fail closed; scripts and other Skill resources are never executed.",
+            "Load one uniquely named Skill by exact name using Unicode lowercase matching for an authorized Project. Returns the selected descriptor plus bounded SKILL.md text and revision metadata in one read-only call. Ambiguous names fail closed; scripts and other Skill resources are never executed.",
             skill_load_input_schema(),
         ),
         tool_spec(
             "run_skill_resource",
-            "Execute one trusted Runner-configured or Runner-installed Skill script without exposing or retransmitting its source through model context. Only scripts/ resources are executable. expected_definition_revision is mandatory; installed Skills also require expected_package_revision. The script is streamed to the selected interpreter over stdin and execution uses the existing structured process/Job contract.",
+            "Execute one trusted Runner-configured or Runner-installed Skill script without exposing or retransmitting its source through model context. Only supported scripts/ resources are executable. WebCodex selects the interpreter from the resource extension (.py or .sh); callers supply only script arguments. expected_definition_revision is mandatory; installed Skills also require expected_package_revision.",
             run_skill_resource_input_schema(),
         ),
         tool_spec(
