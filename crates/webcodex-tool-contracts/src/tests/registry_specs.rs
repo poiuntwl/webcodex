@@ -136,12 +136,26 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "import_conversation_files_to_project: {phrase}"
         );
     }
+    let project_artifact_desc = desc("project_artifact");
+    for phrase in [
+        "metadata=facts",
+        "inspect=fenced segment",
+        "image=mcp image",
+        "export=mcp resourcelink",
+        "not repeated inspect calls",
+        "import_conversation_files_to_project",
+    ] {
+        assert!(
+            project_artifact_desc.contains(phrase),
+            "project_artifact: {phrase}"
+        );
+    }
     let export_artifact_desc = desc("export_project_artifact");
     for phrase in [
+        "compatibility project artifact export specialist",
         "resourcelink",
         "without routing base64 through model output",
-        "preferred project-to-host/user transfer path",
-        "stateless/operator-capable mcp surfaces",
+        "prefer project_artifact(action=export)",
     ] {
         assert!(
             export_artifact_desc.contains(phrase),
@@ -438,7 +452,9 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     assert!(!go_test_desc.contains("preferred structured"));
     let cargo_fmt_desc = desc("cargo_fmt");
     for phrase in [
-        "ensure rust formatting",
+        "final formatting after relevant rust source stabilizes",
+        "do not use cargo_fmt as a per-edit ritual",
+        "read-only formatting validation",
         "precheck",
         "changed/state_changed",
     ] {
@@ -463,25 +479,27 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_shell_desc = desc("run_shell");
     for phrase in [
-        "bounded shell command or short tightly related chain",
+        "bounded shell command or short related chain",
         "shell semantics",
-        "model/tool round trips",
         "predetermined related observations may share one call",
         "adaptive/result-dependent follow-ups stay sequential",
-        "prefer run_process for one native executable with literal argv",
-        "bounded deterministic python heredoc",
-        "one small program expresses a coherent transformation more reliably",
+        "prefer run_process for literal argv",
+        "deterministic python heredoc",
+        "one coherent transformation",
         "project/path/permission policy",
         "avoid unauthorized network",
         "inspect diff",
         "validate final source",
-        "run_script handles supported program-like languages",
-        "does not imply python",
+        "run_script handles program-like languages",
         "failure/permission/validation boundaries",
         "commit, push, deploy, restart",
         "same-process state",
         "one named ssh resource",
         "runner-owned",
+        "timeout_secs is total lifetime",
+        "sync_wait_secs is job-handoff grace",
+        "later observe wait is one observation",
+        "duration does not select the primitive",
         "run_detached_process",
     ] {
         assert!(
@@ -714,11 +732,6 @@ fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema()
         ("goto_definition", &["limit"]),
         ("find_references", &["limit"]),
         ("call_hierarchy", &["limit"]),
-        ("computer_list_windows", &["limit"]),
-        ("computer_list_displays", &["limit"]),
-        ("computer_list_applications", &["limit"]),
-        ("computer_accessibility_tree", &["max_depth", "max_nodes"]),
-        ("computer_find_elements", &["limit"]),
         ("coding_agent_observe", &["wait_secs"]),
         ("list_agent_tasks", &["limit"]),
         ("list_agent_identities", &["limit"]),
@@ -1043,7 +1056,10 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS,
         100
     );
-    assert_eq!(wake["enum"], serde_json::json!(["change", "terminal"]));
+    assert_eq!(
+        wake["enum"],
+        serde_json::json!(["change", "terminal", "all_terminal"])
+    );
     assert_eq!(wake["default"], "change");
     assert!(!spec.input_schema["required"]
         .as_array()
@@ -1070,6 +1086,13 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
     assert!(wait_description.contains("further useful progress depends on terminal outcome"));
     assert!(wait_description.contains("independent work continues"));
     let wake_description = wake["description"].as_str().unwrap();
-    assert!(wake_description.contains("dependent progress is blocked"));
-    assert!(wake_description.contains("not as an unconditional next call"));
+    assert!(wake_description.contains("any terminal result unblocks progress"));
+    assert!(wake_description.contains("predetermined set"));
+    for policy in ["change", "terminal", "all_terminal"] {
+        test_support::validate_schema_instance(
+            &json!({"items": [{"job_id": "job"}], "wake_on": policy}),
+            &spec.input_schema,
+        )
+        .unwrap();
+    }
 }

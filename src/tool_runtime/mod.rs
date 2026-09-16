@@ -8,6 +8,7 @@ mod agent_task;
 mod agent_wait;
 mod cargo;
 mod cargo_tools;
+mod changes;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
 mod coding_agent;
@@ -125,8 +126,8 @@ pub(crate) use session_context::workflow_session_authority_fingerprint;
 pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
 pub use tool_call::{
     AgentWaitEventSelectorCall, HostFileImportProvenance, ObserveJobsItem, ObserveJobsWakeOn,
-    PluginToolCall, ReadFilesItem, SearchPatternMode, SearchProjectTextsQuery, SearchResultMode,
-    SshResourceToolCall, ToolCall,
+    PluginToolCall, ProjectArtifactAction, ReadFilesItem, SearchPatternMode,
+    SearchProjectTextsQuery, SearchResultMode, SshResourceToolCall, ToolCall,
 };
 pub(crate) use tool_call::{
     TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD, TOOL_CALL_WRAPPER_FIELDS,
@@ -158,8 +159,8 @@ pub use tool_spec::ToolSpec;
 pub(crate) use project_resolution::ProjectResolverErrorKind;
 pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverError};
 pub(crate) use registry::{
-    agent_continuation_app_tool_specs, goal_plan_app_tool_specs, registered_tool_specs,
-    stateless_operator_extension_tool_specs, work_result_app_tool_specs,
+    agent_continuation_app_tool_specs, changes_app_tool_specs, goal_plan_app_tool_specs,
+    registered_tool_specs, stateless_operator_extension_tool_specs, work_result_app_tool_specs,
 };
 #[cfg(test)]
 pub(crate) use registry::{

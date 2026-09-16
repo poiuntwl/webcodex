@@ -65,6 +65,20 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "plugin_tool" => {
             args.insert("action".to_string(), json!("list"));
         }
+        "computer_observe" => {
+            args.insert("action".to_string(), json!("targets"));
+        }
+        "computer_control" => {
+            args.insert("action".to_string(), json!("launch_application"));
+            args.insert("client_id".to_string(), json!("oe"));
+            args.insert(
+                "application_id".to_string(),
+                json!("application_qqqqqqqqqqqqqqqq"),
+            );
+        }
+        "project_artifact" => {
+            args.insert("action".to_string(), json!("metadata"));
+        }
         "ssh_resource" => {
             args.insert("action".to_string(), json!("list"));
             args.insert("runner".to_string(), json!("runner-a"));

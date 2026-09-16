@@ -328,6 +328,7 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
             crate::tool_runtime::goal_plan_app_tool_specs()
                 .into_iter()
                 .chain(crate::tool_runtime::work_result_app_tool_specs())
+                .chain(crate::tool_runtime::changes_app_tool_specs())
                 .chain(crate::tool_runtime::agent_continuation_app_tool_specs())
                 .collect(),
             auth,
@@ -372,12 +373,12 @@ pub(super) fn project_connector_tools_list_payload_with_compact(compact: bool) -
     project_connector_tools_list_payload_for_auth(compact, None)
 }
 
-fn adapt_computer_snapshot_output_schema_for_mcp(spec: &mut ToolSpec) {
+fn adapt_computer_observe_output_schema_for_mcp(spec: &mut ToolSpec) {
     let properties = spec
         .output_schema
         .pointer_mut("/properties/output/properties")
         .and_then(Value::as_object_mut)
-        .expect("computer_snapshot output schema properties");
+        .expect("computer_observe output schema properties");
     properties.remove("content_base64");
     properties.insert(
         "content_delivery".to_string(),
@@ -533,8 +534,10 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
     };
     for tool in tools {
         let tool_name = tool.get("name").and_then(Value::as_str);
-        if matches!(tool_name, Some("goal_plan_state" | "work_result_state"))
-            || tool_name.is_some_and(is_agent_continuation_app_tool_name)
+        if matches!(
+            tool_name,
+            Some("goal_plan_state" | "work_result_state" | "changes_file_diff")
+        ) || tool_name.is_some_and(is_agent_continuation_app_tool_name)
         {
             continue;
         }
@@ -831,11 +834,8 @@ fn log_agent_continuation_app_result(
 
 fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> Value {
     let tool_name = spec.name.clone();
-    if matches!(
-        tool_name.as_str(),
-        "computer_snapshot" | "computer_snapshot_display"
-    ) {
-        adapt_computer_snapshot_output_schema_for_mcp(&mut spec);
+    if tool_name == "computer_observe" {
+        adapt_computer_observe_output_schema_for_mcp(&mut spec);
     }
     if tool_name == "read_project_artifact" {
         if let Some(properties) = spec.input_schema["properties"].as_object_mut() {
@@ -896,6 +896,9 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> V
     if app_enabled && presentation::tool_supports_work_result_app(&tool_name) {
         attach_app_metadata(&mut value, resources::MCP_WORK_RESULT_UI_RESOURCE_URI);
     }
+    if app_enabled && presentation::tool_supports_changes_app(&tool_name) {
+        attach_app_metadata(&mut value, resources::MCP_CHANGES_UI_RESOURCE_URI);
+    }
     if app_enabled && presentation::tool_supports_goal_plan_app(&tool_name) {
         attach_app_metadata(&mut value, resources::MCP_GOAL_PLAN_UI_RESOURCE_URI);
     }
@@ -917,9 +920,14 @@ pub(super) fn mcp_runtime_tool_result(
     if tool_name == "export_project_artifact" {
         return mcp_runtime_tool_result_fallback(result);
     }
+    let artifact_presentation = if as_image_requested {
+        resources::ProjectArtifactPresentationMode::Image
+    } else {
+        resources::ProjectArtifactPresentationMode::None
+    };
     match resources::adapt_tool_result(
         tool_name,
-        as_image_requested,
+        artifact_presentation,
         result,
         resources::McpResourceToolCallContext::default(),
     ) {
@@ -1922,10 +1930,13 @@ pub(super) async fn handle_call(
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let work_result_app_surface =
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
+    let changes_app_surface =
+        server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let agent_continuation_app_surface =
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let app_only_goal_plan_state = goal_plan_app_surface && params.name == "goal_plan_state";
     let app_only_work_result_state = work_result_app_surface && params.name == "work_result_state";
+    let app_only_changes_file_diff = changes_app_surface && params.name == "changes_file_diff";
     let app_only_agent_continuation =
         agent_continuation_app_surface && is_agent_continuation_app_tool_name(&params.name);
     let surface_denied = match model_surface {
@@ -1933,6 +1944,7 @@ pub(super) async fn handle_call(
         ModelSurface::AdaptiveRuntime => {
             !app_only_goal_plan_state
                 && !app_only_work_result_state
+                && !app_only_changes_file_diff
                 && !app_only_agent_continuation
                 && !via_adaptive_runtime_gateway
                 && !is_adaptive_runtime_direct_tool(&params.name)
@@ -1962,25 +1974,32 @@ pub(super) async fn handle_call(
     // shared ToolRuntime kernel; preserve those failed attempts in generic
     // telemetry without creating a second record for normal kernel calls.
     let mut pre_kernel_model_ergonomics = ModelErgonomicsTimer::start(&params.name);
-    let resource_tool_call =
-        match resources::prepare_tool_call(&params.name, stateless_2026, model_surface, auth) {
-            Ok(context) => context,
-            Err(error) => {
-                if error.records_model_ergonomics_failure() {
-                    if let (Some(slot), Some(timer)) = (
-                        model_ergonomics_out.as_deref_mut(),
-                        pre_kernel_model_ergonomics.take(),
-                    ) {
-                        *slot = Some(
-                            timer
-                                .finish()
-                                .record_for_pre_result_failure("invalid_arguments"),
-                        );
-                    }
+    let artifact_presentation =
+        resources::project_artifact_presentation_mode(&params.name, &params.arguments);
+    let resource_tool_call = match resources::prepare_tool_call(
+        &params.name,
+        artifact_presentation,
+        stateless_2026,
+        model_surface,
+        auth,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            if error.records_model_ergonomics_failure() {
+                if let (Some(slot), Some(timer)) = (
+                    model_ergonomics_out.as_deref_mut(),
+                    pre_kernel_model_ergonomics.take(),
+                ) {
+                    *slot = Some(
+                        timer
+                            .finish()
+                            .record_for_pre_result_failure("invalid_arguments"),
+                    );
                 }
-                return McpOutcome::BadRequest(rpc_error(id, -32602, error.message()));
             }
-        };
+            return McpOutcome::BadRequest(rpc_error(id, -32602, error.message()));
+        }
+    };
     let mut session_id = match strip_recording_session_id(&mut params.arguments) {
         Ok(session_id) => session_id,
         Err(message) => {
@@ -2001,12 +2020,15 @@ pub(super) async fn handle_call(
             return McpOutcome::BadRequest(rpc_error(id, -32602, message));
         }
     };
-    // Work Result refresh is an App-only observation of the exact business
-    // Session carried inside the tool's own arguments. Never let the generic
-    // Stateless recording wrapper turn a user-driven refresh into a write to
-    // that or any other Workflow Session, even if a caller hand-crafts an
-    // unadvertised recording_session_id field.
-    if params.name == "work_result_state" {
+    // App-only presentation reads observe the exact business Session carried
+    // inside their own arguments. Never let the generic Stateless recording
+    // wrapper turn a user-driven refresh/expand action into a write to that or
+    // any other Workflow Session, even if a caller hand-crafts an unadvertised
+    // recording_session_id field.
+    if matches!(
+        params.name.as_str(),
+        "work_result_state" | "changes_file_diff"
+    ) {
         session_id = None;
     }
     let ack_session_message_ids = if stateless_2026 {
@@ -2079,6 +2101,7 @@ pub(super) async fn handle_call(
     let trace_diagnostics_capable = stateless_2026 && model_surface.supports_operator_extensions();
     let goal_plan_app_capable = goal_plan_app_surface;
     let work_result_app_capable = work_result_app_surface;
+    let changes_app_capable = changes_app_surface;
     let agent_continuation_app_capable = agent_continuation_app_surface;
     let context_request = if context_sidecar_capable {
         match strip_stateless_context_request(&mut params.arguments) {
@@ -2120,8 +2143,6 @@ pub(super) async fn handle_call(
     if let Some(lc) = lifecycle.as_deref() {
         lc.capture_payload("effective_arguments", &params.arguments);
     }
-    let as_image_requested = params.name == "read_project_artifact"
-        && params.arguments.get("as_image").and_then(Value::as_bool) == Some(true);
     let outcome = runtime
         .call_tool_with_invocation_metadata(
             KernelToolCallRequest {
@@ -2151,6 +2172,7 @@ pub(super) async fn handle_call(
                 trace_diagnostics: trace_diagnostics_capable,
                 goal_plan_app: goal_plan_app_capable,
                 work_result_app: work_result_app_capable,
+                changes_app: changes_app_capable,
                 agent_continuation_app: agent_continuation_app_capable,
             },
         )
@@ -2211,7 +2233,7 @@ pub(super) async fn handle_call(
     }
     let mut result = match resources::adapt_tool_result(
         &params.name,
-        as_image_requested,
+        artifact_presentation,
         result,
         resource_tool_call,
     ) {

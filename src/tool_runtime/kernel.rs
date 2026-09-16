@@ -102,6 +102,9 @@ pub(crate) struct ToolProtocolCapabilities {
     /// Protocol-surface support for the ModelHidden Work Result App explicit
     /// refresh read. Exact Project + Session authority is still checked per call.
     pub(crate) work_result_app: bool,
+    /// Protocol-surface support for the ModelHidden Final Changes lazy frozen-diff
+    /// read. Exact Project + Session + snapshot + path authority is rechecked.
+    pub(crate) changes_app: bool,
     /// Protocol-surface support for ModelHidden MCP App Host-continuation
     /// coordination. Canonical communication authorization and exact
     /// process-local Host binding validation remain mandatory in the runtime.
@@ -144,10 +147,21 @@ pub(crate) fn check_runtime_tool_scope(
         // authority policy; it is not a tool-name registry.
         let required_explicit_scope = match policy {
             OAuthToolScopePolicy::RequireAny(scopes) => {
-                return Err(ToolCallErrorStatus::InsufficientScope {
-                    required_scope: None,
-                    description: format!("missing any required scope: {}", scopes.join(", ")),
-                });
+                // RequireAny used to be exclusive to explicit-only Plugin
+                // authority. Computer consolidation also needs an OR policy for
+                // control-vs-launch discovery without changing the legacy
+                // unauthenticated compatibility of the underlying operations.
+                if scopes
+                    .iter()
+                    .copied()
+                    .all(crate::auth::scopes::scope_requires_explicit_unauthenticated_authority)
+                {
+                    return Err(ToolCallErrorStatus::InsufficientScope {
+                        required_scope: None,
+                        description: format!("missing any required scope: {}", scopes.join(", ")),
+                    });
+                }
+                None
             }
             OAuthToolScopePolicy::Require(scope)
                 if matches!(
@@ -275,6 +289,7 @@ impl ToolRuntime {
                 trace_diagnostics: false,
                 goal_plan_app: false,
                 work_result_app: false,
+                changes_app: false,
                 agent_continuation_app: false,
             },
         )
@@ -375,6 +390,19 @@ impl ToolRuntime {
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
                     message: "Work Result App state is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if request.tool_name == "changes_file_diff" && !capabilities.changes_app {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Final Changes App lazy diff is available only on Stateless MCP 2026 App-enabled operator surfaces"
                         .to_string(),
                 }),
                 project: None,
@@ -832,6 +860,10 @@ impl ToolRuntime {
         }
 
         let project = tool_project(&call);
+        // Preserve the concrete business Session only for final presentation. The
+        // generic recorder remains independent provenance and Window affinity
+        // never becomes execution or Session authority.
+        let business_session_id = call.session_id().map(str::to_string);
         // Permission is evaluated once inside dispatch (pre-exec gate). Kernel
         // only reuses the attached decision for the outer recording session —
         // never re-evaluate (no second request id / inconsistent outcome).
@@ -909,16 +941,21 @@ impl ToolRuntime {
             correlation.recorder_gap_session_id.as_deref(),
             correlation.resolved_project.as_deref(),
         ) {
-            if let Some(output) = result.output.as_object_mut() {
-                output.insert(
-                    "workflow_recording_attention".to_string(),
-                    serde_json::json!({
-                        "status": "recording_session_missing",
-                        "candidate_session_id": session_id,
-                        "project": project,
-                        "reason": "same_window_recent_explicit_association"
-                    }),
-                );
+            // The gap remains correlation/audit truth. It is not actionable model
+            // guidance when this exact call already supplied the same authorized
+            // business Session for the same resolved Project.
+            if business_session_id.as_deref() != Some(session_id) {
+                if let Some(output) = result.output.as_object_mut() {
+                    output.insert(
+                        "workflow_recording_attention".to_string(),
+                        serde_json::json!({
+                            "status": "recording_session_missing",
+                            "candidate_session_id": session_id,
+                            "project": project,
+                            "reason": "same_window_recent_explicit_association"
+                        }),
+                    );
+                }
             }
         }
         if request.tool_name == "tool_manifest" {
@@ -1487,275 +1524,45 @@ mod tests {
     }
 
     #[test]
-    fn computer_tools_require_independent_scope() {
+    fn computer_gateway_outer_scopes_are_minimal_and_action_neutral() {
+        assert_eq!(check_runtime_tool_scope(None, "computer_control"), Ok(()));
+        assert!(check_runtime_tool_scope(None, "plugin_tool").is_err());
+
         let denied = oauth(&["runtime:read", "project:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&denied), "computer_snapshot"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                description: "missing required scope: computer:read".to_string(),
-            })
-        );
-        let allowed = oauth(&["computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_list_windows"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_list_applications"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_launch_application"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_LAUNCH),
-                description: "missing required scope: computer:launch".to_string(),
-            })
-        );
-        let control_only = oauth(&["computer:control"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&control_only), "computer_launch_application"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_LAUNCH),
-                ..
-            })
-        ));
-        let launch_only = oauth(&["computer:launch"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&launch_only), "computer_launch_application"),
-            Ok(())
-        );
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&launch_only), "computer_list_applications"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                ..
-            })
-        ));
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_list_targets"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_find_elements"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "computer_element_state"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&allowed), "list_runners"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_RUNTIME_READ),
-                description: "missing required scope: runtime:read".to_string(),
-            })
-        );
-    }
+        assert!(check_runtime_tool_scope(Some(&denied), "computer_observe").is_err());
+        assert!(check_runtime_tool_scope(Some(&denied), "computer_control").is_err());
 
-    #[test]
-    fn computer_display_observation_requires_read_and_display_read() {
-        let read_only = oauth(&["computer:read"]);
+        let observe = oauth(&["computer:read"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&read_only), "computer_list_displays"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_DISPLAY_READ),
-                description: "missing required scope: computer:display_read".to_string(),
-            })
-        );
-        let display_only = oauth(&["computer:display_read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&display_only), "computer_snapshot_display"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                description: "missing required scope: computer:read".to_string(),
-            })
-        );
-        let both = oauth(&["computer:read", "computer:display_read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&both), "computer_list_displays"),
+            check_runtime_tool_scope(Some(&observe), "computer_observe"),
             Ok(())
         );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&both), "computer_snapshot_display"),
-            Ok(())
-        );
-    }
+        assert!(check_runtime_tool_scope(Some(&observe), "computer_control").is_err());
 
-    #[test]
-    fn computer_clipboard_tools_require_independent_dual_scopes() {
-        let read_base = oauth(&["computer:read"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&read_base), "computer_read_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CLIPBOARD_READ),
-                ..
-            })
-        ));
-        let clipboard_read_only = oauth(&["computer:clipboard_read"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&clipboard_read_only), "computer_read_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                ..
-            })
-        ));
-        let read_both = oauth(&["computer:read", "computer:clipboard_read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&read_both), "computer_read_clipboard"),
-            Ok(())
-        );
-        assert!(check_runtime_tool_scope(Some(&read_both), "computer_write_clipboard").is_err());
-
-        let control_base = oauth(&["computer:control"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&control_base), "computer_write_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CLIPBOARD_WRITE),
-                ..
-            })
-        ));
-        let clipboard_write_only = oauth(&["computer:clipboard_write"]);
-        assert!(matches!(
-            check_runtime_tool_scope(Some(&clipboard_write_only), "computer_write_clipboard"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                ..
-            })
-        ));
-        let write_both = oauth(&["computer:control", "computer:clipboard_write"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&write_both), "computer_write_clipboard"),
-            Ok(())
-        );
-        assert!(check_runtime_tool_scope(Some(&write_both), "computer_read_clipboard").is_err());
-    }
-
-    #[test]
-    fn computer_pointer_control_requires_all_four_independent_scopes() {
-        let cases = [
-            (
-                vec![
-                    "computer:display_read",
-                    "computer:control",
-                    "computer:pointer_control",
-                ],
-                crate::auth::SCOPE_COMPUTER_READ,
-            ),
-            (
-                vec![
-                    "computer:read",
-                    "computer:control",
-                    "computer:pointer_control",
-                ],
-                crate::auth::SCOPE_COMPUTER_DISPLAY_READ,
-            ),
-            (
-                vec![
-                    "computer:read",
-                    "computer:display_read",
-                    "computer:pointer_control",
-                ],
-                crate::auth::SCOPE_COMPUTER_CONTROL,
-            ),
-            (
-                vec!["computer:read", "computer:display_read", "computer:control"],
-                crate::auth::SCOPE_COMPUTER_POINTER_CONTROL,
-            ),
-        ];
-        for tool in ["computer_pointer_move", "computer_pointer_click"] {
-            for (scopes, missing) in &cases {
-                let context = oauth(scopes);
-                assert_eq!(
-                    check_runtime_tool_scope(Some(&context), tool),
-                    Err(ToolCallErrorStatus::InsufficientScope {
-                        required_scope: Some(*missing),
-                        description: format!("missing required scope: {missing}"),
-                    }),
-                    "{tool} missing {missing}"
-                );
-            }
-            let all = oauth(&[
-                "computer:read",
-                "computer:display_read",
-                "computer:control",
-                "computer:pointer_control",
-            ]);
-            assert_eq!(check_runtime_tool_scope(Some(&all), tool), Ok(()));
-        }
-    }
-
-    #[test]
-    fn computer_save_snapshot_requires_project_write_and_computer_read() {
-        let read_only = oauth(&["computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&read_only), "computer_save_snapshot"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_PROJECT_WRITE),
-                description: "missing required scope: project:write".to_string(),
-            })
-        );
-        let write_only = oauth(&["project:write"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&write_only), "computer_save_snapshot"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_READ),
-                description: "missing required scope: computer:read".to_string(),
-            })
-        );
-        let both = oauth(&["project:write", "computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&both), "computer_save_snapshot"),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn computer_control_requires_its_own_scope() {
-        let observe_only = oauth(&["computer:read"]);
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_control"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_scroll_to_element"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_key_input"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&observe_only), "computer_input_text"),
-            Err(ToolCallErrorStatus::InsufficientScope {
-                required_scope: Some(crate::auth::SCOPE_COMPUTER_CONTROL),
-                description: "missing required scope: computer:control".to_string(),
-            })
-        );
         let control = oauth(&["computer:control"]);
         assert_eq!(
             check_runtime_tool_scope(Some(&control), "computer_control"),
             Ok(())
         );
+        assert!(check_runtime_tool_scope(Some(&control), "computer_observe").is_err());
+
+        let launch = oauth(&["computer:launch"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&control), "computer_scroll_to_element"),
+            check_runtime_tool_scope(Some(&launch), "computer_control"),
             Ok(())
         );
+        assert!(check_runtime_tool_scope(Some(&launch), "computer_observe").is_err());
+    }
+
+    #[test]
+    fn computer_save_snapshot_requires_project_write_and_computer_read() {
+        let read_only = oauth(&["computer:read"]);
+        assert!(check_runtime_tool_scope(Some(&read_only), "computer_save_snapshot").is_err());
+        let write_only = oauth(&["project:write"]);
+        assert!(check_runtime_tool_scope(Some(&write_only), "computer_save_snapshot").is_err());
+        let both = oauth(&["project:write", "computer:read"]);
         assert_eq!(
-            check_runtime_tool_scope(Some(&control), "computer_key_input"),
-            Ok(())
-        );
-        assert_eq!(
-            check_runtime_tool_scope(Some(&control), "computer_input_text"),
+            check_runtime_tool_scope(Some(&both), "computer_save_snapshot"),
             Ok(())
         );
     }
@@ -1782,7 +1589,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            check_runtime_tool_scope(Some(&shared), "computer_snapshot"),
+            check_runtime_tool_scope(Some(&shared), "computer_observe"),
             Ok(())
         );
         assert_eq!(

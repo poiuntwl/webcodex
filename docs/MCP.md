@@ -394,23 +394,29 @@ payloads through model text:
   them as file parameters. The Control downloads the referenced bytes and
   commits them through the existing bounded artifact-write path; callers should
   not construct download URLs or manually Base64-transfer those files.
-- `export_project_artifact` prepares one bounded project artifact for download
-  and returns a short-lived authenticated MCP `ResourceLink` plus metadata.
-  `tools/call` does not contain the complete binary. The host follows
-  `resources/read` to obtain the binary resource; authentication and current
-  project-read authority are checked again, and the artifact metadata is
-  revalidated before the bytes are returned.
-- The resource URI is not standalone bearer authority. Export handles are
-  short-lived process-local presentation state, and the normal project artifact
-  size, MIME, path, and authorization bounds remain in force.
+- `project_artifact` is the preferred Project-to-model/host read surface. Use
+  `action=metadata` for existence/size/MIME/digest/image/archive facts,
+  `action=inspect` for one bounded snapshot-fenced Base64 segment,
+  `action=image` for native MCP image delivery, and `action=export` for complete
+  host/user delivery. Do not loop `inspect` chunks to transfer a complete file.
+- `action=export` reuses the existing artifact export authority and returns a
+  short-lived authenticated MCP `ResourceLink` plus metadata. `tools/call` does
+  not contain the complete binary. The host follows `resources/read` to obtain
+  the binary resource; authentication and current project-read authority are
+  checked again, and the artifact metadata is revalidated before the bytes are
+  returned. The resource URI is not standalone bearer authority; export handles
+  are short-lived process-local presentation state, and the normal size, MIME,
+  path, and authorization bounds remain in force.
 
-`read_project_artifact` remains the bounded chunk-inspection API; it is not the
-large-file download path. On the local coding and Adaptive Runtime surfaces it
-is exposed directly so MCP clients can request `as_image=true` and receive a
-bounded PNG, JPEG, or WebP as native image content. Office artifacts such as
-DOCX/PPTX/XLSX and PDFs use the same artifact transport and can therefore move
-between a project and a supporting ChatGPT host without a model manually
-carrying their Base64.
+The older `read_project_artifact_metadata` and `export_project_artifact` tools
+remain compatibility/operator primitives. `read_project_artifact` remains the
+bounded chunk-inspection specialist and is still exposed directly on Local
+Coding and Adaptive Runtime so MCP clients can request `as_image=true` and
+receive a bounded PNG, JPEG, or WebP as native image content. New model-facing
+workflows should otherwise prefer `project_artifact`. Office artifacts such as
+DOCX/PPTX/XLSX and PDFs use the same underlying artifact transport and can
+therefore move between a project and a supporting ChatGPT host without a model
+manually carrying their Base64.
 
 When a broader model coding surface exposes `work_on_project`, use the
 [Coding Workflow](CODING_WORKFLOW.md) for the canonical bootstrap, behavioral-role

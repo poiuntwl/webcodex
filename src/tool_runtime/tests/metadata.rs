@@ -14,6 +14,7 @@ use crate::tool_runtime::kernel::{
 use crate::tool_runtime::project_resolution::{
     ProjectKnowledgeSourceResolution, ProjectKnowledgeUnavailableReason,
 };
+use crate::tool_runtime::tool_call::ComputerObserveToolCall;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -281,6 +282,32 @@ async fn register_pointer_target_for_auth(
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn computer_gateway_rejects_missing_exact_action_capability_before_dispatch() {
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("computer-capability-fence");
+    register_pointer_target_for_auth(&runtime, "pointer-only", "Pointer Only", &auth).await;
+
+    let result = runtime
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
+                client_id: "pointer-only".to_string(),
+                display_id: "display_iavN7wEjRWeJq83v".to_string(),
+                max_width: None,
+                max_height: None,
+            }),
+            Some(&auth),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "capability_unavailable");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("computer_display_observe"));
+}
+
 async fn register_clipboard_target_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -1079,6 +1106,7 @@ async fn repository_knowledge_association_revalidates_identity_availability_and_
                         command: "pwd".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1276,6 +1304,7 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
             command: "pwd".to_string(),
             session_id: None,
             timeout_secs: Some(30),
+            sync_wait_secs: None,
             cwd: None,
             purpose: None,
             shell: None,
@@ -1360,6 +1389,7 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
                         command: "pwd".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1443,6 +1473,7 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
                     command: "pwd".to_string(),
                     session_id: None,
                     timeout_secs: Some(30),
+                    sync_wait_secs: None,
                     cwd: None,
                     purpose: None,
                     shell: None,
@@ -1701,6 +1732,7 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
                         command: "echo hi".to_string(),
                         session_id: None,
                         timeout_secs: Some(1),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1771,6 +1803,7 @@ async fn runner_capability_rejection_matrix_names_required_capability() {
                 command: "echo hi".to_string(),
                 session_id: None,
                 timeout_secs: None,
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -1807,6 +1840,7 @@ async fn runner_tool_unknown_client_returns_unknown_project_error() {
                 command: "echo hi".to_string(),
                 session_id: None,
                 timeout_secs: None,
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -2183,7 +2217,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         "search_project_texts",
         "read_files",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "show_changes",
         "apply_text_edits",
         "apply_unified_diff",
@@ -3169,7 +3203,10 @@ async fn computer_list_targets_is_minimal_capability_filtered_and_auth_scoped() 
     .await;
 
     let result = runtime
-        .dispatch_with_auth(ToolCall::ComputerListTargets, Some(&shared_a))
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Targets),
+            Some(&shared_a),
+        )
         .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["count"], 8);

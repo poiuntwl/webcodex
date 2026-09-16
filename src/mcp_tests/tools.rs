@@ -1368,9 +1368,9 @@ fn ordinary_artifact_result_keeps_existing_text_and_structured_base64_shape() {
 }
 
 #[tokio::test]
-async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
-    // Local coding must expose the native image path directly so ordinary
-    // project work can inspect screenshots and other bounded images.
+async fn project_artifact_image_call_returns_native_image_for_remote_agent_project() {
+    // Local coding exposes the unified facade directly; exercise it through the
+    // real MCP dispatch and native-image framing path.
     let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
     let client_id = "mcp-vision-agent";
     let runner_instance_id = "inst-mcp-vision";
@@ -1450,11 +1450,11 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
                     "tools/call",
                     Some(json!(77)),
                     json!({
-                        "name": "read_project_artifact",
+                        "name": "project_artifact",
                         "arguments": {
                             "project": project,
                             "path": path,
-                            "as_image": true
+                            "action": "image"
                         }
                     }),
                 ),
@@ -1539,7 +1539,7 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
 }
 
 #[test]
-fn computer_snapshot_frames_native_image_without_structured_base64() {
+fn computer_observe_snapshot_frames_native_image_without_structured_base64() {
     let image_bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46];
     let image_base64 = general_purpose::STANDARD.encode(&image_bytes);
     let result = ToolResult::ok(json!({
@@ -1560,7 +1560,7 @@ fn computer_snapshot_frames_native_image_without_structured_base64() {
         "content_base64": image_base64
     }));
 
-    let value = crate::mcp::mcp_runtime_tool_result("computer_snapshot", false, result);
+    let value = crate::mcp::mcp_runtime_tool_result("computer_observe", false, result);
     assert_eq!(value["isError"], false);
     let content = value["content"].as_array().expect("native content");
     assert_eq!(content.len(), 2);

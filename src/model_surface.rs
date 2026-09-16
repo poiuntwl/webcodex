@@ -376,7 +376,7 @@ mod tests {
         "search_project_texts",
         "read_files",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "read_project_artifact",
         "apply_text_edits",
         "run_process",
@@ -392,6 +392,7 @@ mod tests {
         "workspace_hygiene_check",
         "finish_coding_task",
         "present_work_result",
+        "present_changes",
     ];
 
     #[test]
@@ -506,16 +507,30 @@ mod tests {
     }
 
     #[test]
-    fn ergonomics_promotions_do_not_expand_local_coding_or_project_connector() {
+    fn artifact_surface_preserves_unified_facade_and_direct_image_specialist() {
+        assert!(is_adaptive_runtime_direct_tool(
+            "import_conversation_files_to_project"
+        ));
+        assert!(!LOCAL_CODING_TOOL_NAMES.contains(&"import_conversation_files_to_project"));
+
+        for direct_artifact in ["project_artifact", "read_project_artifact"] {
+            assert!(is_adaptive_runtime_direct_tool(direct_artifact));
+            assert!(LOCAL_CODING_TOOL_NAMES.contains(&direct_artifact));
+        }
+        for legacy in ["read_project_artifact_metadata", "export_project_artifact"] {
+            assert!(!LOCAL_CODING_TOOL_NAMES.contains(&legacy));
+            assert!(!is_adaptive_runtime_direct_tool(legacy));
+            assert_eq!(
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(legacy),
+                (TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)),
+                "legacy artifact specialist {legacy} should remain reachable through the Adaptive gateway"
+            );
+        }
         for tool_name in [
             "import_conversation_files_to_project",
-            "export_project_artifact",
+            "project_artifact",
+            "read_project_artifact",
         ] {
-            assert!(is_adaptive_runtime_direct_tool(tool_name), "{tool_name}");
-            assert!(
-                !LOCAL_CODING_TOOL_NAMES.contains(&tool_name),
-                "{tool_name} must not expand local_coding"
-            );
             assert!(
                 !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&tool_name),
                 "{tool_name} must not expand project_connector"
@@ -538,24 +553,8 @@ mod tests {
             .map(|spec| spec.name.as_str())
             .collect::<Vec<_>>();
         for name in [
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_list_displays",
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
+            "computer_observe",
             "computer_control",
-            "computer_scroll_to_element",
-            "computer_key_input",
-            "computer_pointer_move",
-            "computer_pointer_click",
-            "computer_input_text",
-            "computer_snapshot",
-            "computer_snapshot_display",
             "computer_save_snapshot",
         ] {
             assert!(
@@ -573,6 +572,40 @@ mod tests {
             assert!(
                 !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&name),
                 "{name} must not expand project_connector"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_computer_tool_names_are_not_model_visible() {
+        let names = registered_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<std::collections::HashSet<_>>();
+        for legacy in [
+            "computer_list_targets",
+            "computer_list_windows",
+            "computer_list_displays",
+            "computer_list_applications",
+            "computer_launch_application",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_find_elements",
+            "computer_element_state",
+            "computer_activate_window",
+            "computer_scroll_to_element",
+            "computer_key_input",
+            "computer_input_text",
+            "computer_pointer_move",
+            "computer_pointer_click",
+            "computer_read_clipboard",
+            "computer_write_clipboard",
+            "computer_snapshot",
+            "computer_snapshot_display",
+        ] {
+            assert!(
+                !names.contains(legacy),
+                "legacy Computer tool leaked: {legacy}"
             );
         }
     }
