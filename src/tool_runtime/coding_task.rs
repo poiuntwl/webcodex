@@ -249,6 +249,28 @@ fn registration_scope_denied(auth: Option<&AuthContext>, operation: &str) -> Opt
         })
 }
 
+fn runner_coding_capability_error(client_id: &str, error: String) -> ToolResult {
+    if error.contains("unknown shell client") {
+        return ToolResult::err_with_output(
+            format!("Runner client_id is unknown or not visible: {client_id}"),
+            json!({
+                "error_kind": "unknown_runner",
+                "failure_kind": "unknown_runner",
+                "client_id": client_id,
+                "state_changed": false,
+                "suggested_call": {
+                    "tool": "list_runners",
+                    "arguments": {
+                        "include_projects": false,
+                        "summary_only": true,
+                    }
+                }
+            }),
+        );
+    }
+    ToolResult::err(error)
+}
+
 fn attach_permission(
     mut result: ToolResult,
     permission: Option<&PermissionDecision>,
@@ -287,14 +309,14 @@ impl ToolRuntime {
             .runner_registry
             .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_SHELL, access.as_ref())
             .await
-            .map_err(ToolResult::err)?;
+            .map_err(|error| runner_coding_capability_error(client_id, error))?;
         let supports_git = if supports_shell {
             false
         } else {
             self.runner_registry
                 .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_GIT, access.as_ref())
                 .await
-                .map_err(ToolResult::err)?
+                .map_err(|error| runner_coding_capability_error(client_id, error))?
         };
         if supports_shell || supports_git {
             Ok(())
@@ -2256,6 +2278,8 @@ struct WorkOnProjectRequiredNullable<T>(Option<T>);
 #[derive(Deserialize)]
 struct WorkOnProjectWorkspaceProjection {
     status: String,
+    #[serde(default)]
+    root: Option<String>,
     git_available: WorkOnProjectRequiredNullable<bool>,
     branch: WorkOnProjectRequiredNullable<String>,
     head: WorkOnProjectRequiredNullable<String>,
@@ -2345,6 +2369,7 @@ fn sparse_work_on_project_instruction_source(
 fn sparse_work_on_project_workspace(workspace: WorkOnProjectWorkspaceProjection) -> Value {
     let WorkOnProjectWorkspaceProjection {
         status,
+        root,
         git_available,
         branch,
         head,
@@ -2353,6 +2378,9 @@ fn sparse_work_on_project_workspace(workspace: WorkOnProjectWorkspaceProjection)
     } = workspace;
     let status_unavailable = status == "unavailable";
     let mut projected = json!({"status": status});
+    if let Some(root) = root {
+        projected["root"] = json!(root);
+    }
     if git_available.0 == Some(false) {
         projected["git_available"] = json!(false);
     }

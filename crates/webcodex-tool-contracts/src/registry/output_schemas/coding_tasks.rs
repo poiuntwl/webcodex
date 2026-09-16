@@ -456,6 +456,10 @@ fn startup_workspace_schema() -> Value {
         "type": "object",
         "properties": {
             "status": {"type": "string", "enum": ["clean", "dirty", "blocked", "unavailable"]},
+            "root": {
+                "type": "string",
+                "description": "Canonical Runner-resolved workspace root for path or managed-worktree bootstrap; omitted for ordinary project-id bootstrap."
+            },
             "git_available": nullable_schema("boolean", "Whether bounded Git inspection was available."),
             "branch": nullable_schema("string", "Current branch when observed."),
             "head": nullable_schema("string", "Current full HEAD commit when observed."),
@@ -1117,9 +1121,13 @@ fn work_on_project_instruction_source_schema() -> Value {
 fn work_on_project_output_schema() -> Value {
     let compact_workspace = json!({
         "type": "object",
-        "description": "Sparse workspace state. status is always present; null/default facts are omitted, branch/head are included when observed, git_available is emitted only when false, and conflicts only when non-zero.",
+        "description": "Sparse workspace state. status is always present; path/worktree bootstrap also includes the canonical Runner-resolved root. Null/default facts are omitted, branch/head are included when observed, git_available is emitted only when false, and conflicts only when non-zero.",
         "properties": {
             "status": {"type": "string", "enum": ["clean", "dirty", "blocked", "unavailable"]},
+            "root": {
+                "type": "string",
+                "description": "Canonical Runner-resolved workspace root for path or managed-worktree bootstrap; omitted for ordinary project-id bootstrap."
+            },
             "git_available": nullable_schema("boolean", "Emitted when bounded Git inspection is explicitly unavailable; omission means no exceptional Git-unavailable fact."),
             "branch": nullable_schema("string", "Current branch when observed."),
             "head": nullable_schema("string", "Current full HEAD commit when observed."),
@@ -1301,6 +1309,27 @@ fn work_on_project_output_schema() -> Value {
                 schema["description"] = json!("Non-blocking startup warnings; omitted when empty. Deliberately disabled current-window binding is not a warning.");
                 schema
             },
+        ),
+        (
+            "suggested_call",
+            json!({
+                "type": "object",
+                "description": "Parser-ready recovery observation emitted when work_on_project can identify one exact safe next call.",
+                "properties": {
+                    "tool": {"type": "string", "const": "list_runners"},
+                    "arguments": {
+                        "type": "object",
+                        "properties": {
+                            "include_projects": {"type": "boolean", "const": false},
+                            "summary_only": {"type": "boolean", "const": true}
+                        },
+                        "required": ["include_projects", "summary_only"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["tool", "arguments"],
+                "additionalProperties": false
+            }),
         ),
         (
             "suggested_next_actions",
