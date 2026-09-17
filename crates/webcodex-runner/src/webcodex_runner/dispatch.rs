@@ -3,14 +3,15 @@ use super::lsp::{handle_lsp_operation, LspSupervisor};
 use super::transport::ResultSubmission;
 use super::validation::handle_validation_request;
 use super::{
-    handle_computer_operation, handle_prepare_managed_worktree_operation,
+    handle_browser_operation, handle_computer_operation, handle_prepare_managed_worktree_operation,
     handle_project_lifecycle_operation, handle_project_operation,
     handle_resolve_or_register_project_operation, handle_runner_skill_request,
     run_internal_posix_script_with_profiles_and_execution_state,
     run_internal_search_script_with_profiles_and_execution_state,
     run_process_with_profiles_and_execution_state, run_script_with_profiles_and_execution_state,
-    run_shell_with_profiles_and_execution_state, run_ssh_shell_with_execution_state, CommandResult,
-    HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
+    run_shell_with_profiles_and_execution_state,
+    run_skill_resource_with_profiles_and_execution_state, run_ssh_shell_with_execution_state,
+    CommandResult, HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
     ShellCommandResult, SubmitResultError,
 };
 use crate::runner_protocol::{
@@ -221,7 +222,8 @@ fn submit_decode_failure(
         | "start_validation_job"
         | "start_process_job"
         | "start_detached_process_job"
-        | "start_script_job" => {
+        | "start_script_job"
+        | "start_skill_resource_job" => {
             if submit_invalid_job_start(sink, &request, error.clone()) {
                 Ok(true)
             } else {
@@ -294,7 +296,7 @@ fn submit_decode_failure(
                 runtime,
             )
             .map(|_| true),
-        "run_process" | "run_script" | "run_internal_posix_script" => sink
+        "run_process" | "run_script" | "run_internal_posix_script" | "skill_resource_execution" => sink
             .submit_shell_result_with_metadata(
                 request_id,
                 ShellCommandResult::not_started(invalid_command(format!(
@@ -338,6 +340,7 @@ pub(crate) fn dispatch_request_with_outcome(
     persistent_shells: &PersistentShellManager,
     project_registry_dir: &Path,
     lsp: &LspSupervisor,
+    browser: &webcodex_browser::BrowserSupervisor,
     request: RunnerRequest,
 ) -> Result<RunnerDispatchOutcome, SubmitResultError> {
     if runner_tool_trace_enabled() {
@@ -442,6 +445,30 @@ pub(crate) fn dispatch_request_with_outcome(
         }
         RunnerOperation::Computer(operation) => {
             let result = handle_computer_operation(&operation);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::RunSkillResource(operation) => {
+            let result = run_skill_resource_with_profiles_and_execution_state(
+                config.generation,
+                &config.skills,
+                runtime.client_id(),
+                runtime.server_url(),
+                policy,
+                shell,
+                project_registry_dir,
+                &jobs.prepared_profiles,
+                operation.cwd.as_deref(),
+                &operation.request,
+                operation.timeout_secs,
+                Some(runtime.shutdown_flag()),
+                None,
+            );
+            sink.submit_shell_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::Browser(operation) => {
+            let result = handle_browser_operation(browser, &operation);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -663,6 +690,9 @@ pub(crate) fn dispatch_request_with_outcome(
                         policy: policy.clone(),
                         shell: shell.clone(),
                         ssh: config.ssh.clone(),
+                        skills: config.skills.clone(),
+                        client_id: runtime.client_id().to_string(),
+                        server_url: runtime.server_url().to_string(),
                         project_registry_dir: project_registry_dir.to_path_buf(),
                         metadata: invocation_metadata,
                         operation,
@@ -697,6 +727,7 @@ pub(crate) fn dispatch_request(
         persistent_shells,
         project_registry_dir,
         lsp,
+        &webcodex_browser::BrowserSupervisor::new(),
         request,
     )
     .map(|outcome| outcome.handled)

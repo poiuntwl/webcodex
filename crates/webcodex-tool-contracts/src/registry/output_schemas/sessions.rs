@@ -4,15 +4,12 @@ use webcodex_core::workflow_session_contract::{
     MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
 };
 
-use super::super::input_schemas::{
-    session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
-    session_mode_schema,
-};
 use super::common::{
     array_schema, cargo_test_count_assertion_schema, continuation_feedback_schema,
     evidence_history_schema, evidence_integrity_schema, handoff_brief_schema,
     job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
-    schema_type, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
+    schema_type, session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
+    session_mode_schema, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -220,6 +217,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("string", "Created wc_msg_* message id."),
             ),
             ("message", open_object_schema("Created session message.")),
+        ])),
+        "post_peer_message" => Some(wrapped_output_schema(vec![
+            ("success", schema_type("boolean", "Always true on success.")),
+            ("message_id", schema_type("string", "Created durable wc_msg_* peer message id.")),
+            ("sender_peer_id", schema_type("string", "Principal-scoped sender window identity.")),
+            ("recipient_peer_id", schema_type("string", "Principal-scoped recipient window identity.")),
+            ("requires_ack", schema_type("boolean", "Whether omission of the request-scoped ACK causes re-projection.")),
         ])),
         "list_session_messages" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),

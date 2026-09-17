@@ -30,21 +30,10 @@ fn mcp_gateway_tool_call_params_do_not_retain_outer_meta() {
 }
 
 fn test_runtime() -> ToolRuntime {
-    test_runtime_with_surface(ModelSurface::LocalCoding)
+    ToolRuntime::new_for_tests()
 }
 
-fn test_runtime_with_exposure(runtime_exposure: RuntimeExposure) -> ToolRuntime {
-    ToolRuntime::new_for_tests().with_runtime_exposure(runtime_exposure)
-}
-
-fn test_runtime_with_surface(model_surface: ModelSurface) -> ToolRuntime {
-    test_runtime_with_exposure(RuntimeExposure::Runtime(model_surface))
-}
-
-fn test_runtime_with_surface_and_public_url(
-    model_surface: ModelSurface,
-    public_url: &str,
-) -> ToolRuntime {
+fn test_runtime_with_public_url(public_url: &str) -> ToolRuntime {
     let runtime_info = crate::tool_runtime::RuntimeInfo {
         configured_public_url: Some(public_url.to_string()),
         ..Default::default()
@@ -53,7 +42,6 @@ fn test_runtime_with_surface_and_public_url(
         std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
         std::sync::Arc::new(runtime_info),
     )
-    .with_runtime_exposure(RuntimeExposure::Runtime(model_surface))
 }
 
 fn start_authorized_test_session(
@@ -77,50 +65,6 @@ fn start_authorized_test_session(
         .unwrap()
 }
 
-/// Run one synchronous operation with a temporary model-surface env value.
-/// The previous value is restored while the shared env lock is still held,
-/// including during unwinding. Async request tests receive an already-built
-/// runtime so process-global env state never needs to span an await.
-fn with_model_surface_env<T>(value: Option<&str>, operation: impl FnOnce() -> T) -> T {
-    struct Restore {
-        previous: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(previous) => {
-                    std::env::set_var(crate::model_surface::MCP_MODEL_SURFACE_ENV, previous)
-                }
-                None => std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV),
-            }
-        }
-    }
-
-    let guard = crate::admin_cli::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = std::env::var_os(crate::model_surface::MCP_MODEL_SURFACE_ENV);
-    match value {
-        Some(value) => std::env::set_var(crate::model_surface::MCP_MODEL_SURFACE_ENV, value),
-        None => std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV),
-    }
-    let _restore = Restore {
-        previous,
-        _guard: guard,
-    };
-    operation()
-}
-
-fn test_runtime_from_model_surface_env(value: Option<&str>) -> ToolRuntime {
-    with_model_surface_env(value, || {
-        let runtime_exposure = crate::model_surface::resolve_runtime_exposure(None)
-            .expect("test runtime exposure configuration");
-        test_runtime_with_exposure(runtime_exposure)
-    })
-}
-
 fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
     JsonRpcRequest {
         jsonrpc: Some("2.0".to_string()),
@@ -128,6 +72,13 @@ fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
         params,
         id,
     }
+}
+
+fn adaptive_runtime_gateway_params(tool: &str, arguments: Value) -> Value {
+    json!({
+        "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        "arguments": {"tool": tool, "arguments": arguments}
+    })
 }
 
 fn mcp_2026_params(mut params: Value) -> Value {
@@ -142,38 +93,6 @@ fn mcp_2026_params(mut params: Value) -> Value {
             }),
         );
     params
-}
-
-fn mcp_2026_tasks_params(mut params: Value) -> Value {
-    params
-        .as_object_mut()
-        .expect("MCP params must be an object")
-        .insert(
-            "_meta".to_string(),
-            json!({
-                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
-                "io.modelcontextprotocol/clientCapabilities": {
-                    "extensions": {
-                        MCP_TASKS_EXTENSION: {}
-                    }
-                }
-            }),
-        );
-    params
-}
-
-#[test]
-fn mcp_2026_tasks_capability_is_request_scoped_and_shape_strict() {
-    assert!(!request_supports_tasks(&mcp_2026_params(json!({}))));
-    assert!(request_supports_tasks(&mcp_2026_tasks_params(json!({}))));
-
-    let mut malformed = mcp_2026_params(json!({}));
-    malformed["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
-        "extensions": {
-            MCP_TASKS_EXTENSION: true
-        }
-    });
-    assert!(!request_supports_tasks(&malformed));
 }
 
 fn mcp_2026_ui_params(mut params: Value) -> Value {
@@ -224,6 +143,8 @@ mod file_import;
 mod goal_plan_app;
 #[path = "mcp_tests/http_transport.rs"]
 mod http_transport;
+#[path = "mcp_tests/job_terminal_continuation_app.rs"]
+mod job_terminal_continuation_app;
 #[path = "mcp_tests/model_ergonomics.rs"]
 mod model_ergonomics;
 #[path = "mcp_tests/model_surface.rs"]
@@ -234,8 +155,6 @@ mod oauth_scope;
 mod plugin_check;
 #[path = "mcp_tests/plugin_tools.rs"]
 mod plugin_tools;
-#[path = "mcp_tests/project_connector.rs"]
-mod project_connector;
 #[path = "mcp_tests/protocol.rs"]
 mod protocol;
 #[path = "mcp_tests/result_app.rs"]
@@ -298,9 +217,6 @@ fn build_test_router(
         .hoop(affix_state::inject(config))
         .hoop(affix_state::inject(db))
         .hoop(affix_state::inject(runtime))
-        .hoop(affix_state::inject(
-            crate::connector_runtime::ConnectorRuntimeSlot::default(),
-        ))
         .push(
             Router::with_path("mcp")
                 .hoop(crate::AuthMiddleware)

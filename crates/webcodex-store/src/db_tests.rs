@@ -76,13 +76,12 @@ fn store_connection_domains_and_metric_names_are_closed_and_stable() {
             "audit",
             "communication",
             "core",
-            "executions",
             "goal",
             "job_receipts",
+            "job_terminal_wait",
             "memory",
             "oauth",
             "schema",
-            "task_kernel",
             "window_activity",
         ]
     );

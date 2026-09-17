@@ -31,10 +31,11 @@ use webcodex_core::plugin::{
     PluginGatewayResponse,
 };
 use webcodex_core::runner_operation::{
-    RunnerComputerOperation, RunnerComputerOperationKind, RunnerFileOperation,
-    RunnerInvocationMetadata, RunnerOperation, RunnerPersistentShellOperation,
-    RunnerProcessOperation, RunnerProjectOperation, RunnerProjectOperationKind,
-    RunnerScriptOperation, RunnerShellOperation,
+    RunnerBrowserOperation, RunnerBrowserOperationKind, RunnerComputerOperation,
+    RunnerComputerOperationKind, RunnerFileOperation, RunnerInvocationMetadata, RunnerOperation,
+    RunnerPersistentShellOperation, RunnerProcessOperation, RunnerProjectOperation,
+    RunnerProjectOperationKind, RunnerScriptOperation, RunnerShellOperation,
+    RunnerSkillResourceOperation,
 };
 use webcodex_core::runner_protocol::{
     shell_computer_request_payload_max_bytes, PersistentShellRequest, PersistentShellResult,
@@ -52,7 +53,7 @@ use webcodex_core::runner_protocol::{
     RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT, RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
     RUNNER_CONFIG_REQUEST_MAX_BYTES,
 };
-use webcodex_core::runner_skill::RunnerSkillRequest;
+use webcodex_core::runner_skill::{RunnerSkillExecutionRequest, RunnerSkillRequest};
 use webcodex_core::ssh_resource::{SshResourceRequest, SSH_RESOURCE_REQUEST_MAX_BYTES};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1170,6 +1171,71 @@ impl RunnerRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_skill_resource_execution(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        request: RunnerSkillExecutionRequest,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        request
+            .validate()
+            .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+        if !(webcodex_core::runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS
+            ..=webcodex_core::runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
+            .contains(&timeout_secs)
+            || wait_timeout_secs == 0
+            || wait_timeout_secs > timeout_secs
+        {
+            return Err("invalid Runner Skill execution timeout".to_string());
+        }
+        let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
+        if normalized_cwd.as_deref().is_some_and(|cwd| {
+            cwd.len() > webcodex_core::runner_protocol::PROCESS_CWD_MAX_BYTES || cwd.contains('\0')
+        }) {
+            return Err("invalid Runner Skill execution cwd".to_string());
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let runner_request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            requested_by,
+            RunnerOperation::RunSkillResource(RunnerSkillResourceOperation {
+                cwd: normalized_cwd,
+                request,
+                timeout_secs,
+            }),
+        )?;
+        let mut inner = self.inner.lock().await;
+        let Some(runner) = inner.runners.get(&client_id) else {
+            return Err(format!("unknown shell client: {client_id}"));
+        };
+        if !runner
+            .runner_features
+            .supports(RunnerFeature::SkillResourceExecution)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support {}",
+                webcodex_core::runner_protocol::RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION
+            ));
+        }
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            runner_request,
+            Some(tx),
+            None,
+        )?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_script(
         &self,
         client_id: String,
@@ -2145,6 +2211,76 @@ impl RunnerRegistry {
         {
             return Err(format!(
                 "runner {client_id} does not support {}",
+                required_feature.as_wire_name()
+            ));
+        }
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue one precise Browser Runner operation. Capability admission is
+    /// rechecked under the registry lock so an older/re-registered Runner can
+    /// never receive an unknown Browser kind or fall through to another family.
+    pub async fn enqueue_browser(
+        &self,
+        client_id: String,
+        kind: &'static str,
+        payload: String,
+        requested_by: String,
+        auth: Option<&crate::RunnerAccess>,
+        timeout_secs: u64,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_id(&client_id, "client_id")?;
+        let required_feature = match kind {
+            "browser_list_browsers"
+            | "browser_list_pages"
+            | "browser_snapshot"
+            | "browser_screenshot" => RunnerFeature::BrowserObserve,
+            "browser_launch" => RunnerFeature::BrowserLaunch,
+            "browser_new_page" | "browser_navigate" | "browser_click" | "browser_input_text"
+            | "browser_key" | "browser_close_page" | "browser_close" => {
+                RunnerFeature::BrowserControl
+            }
+            _ => return Err("invalid browser request kind".to_string()),
+        };
+        const MAX_BROWSER_REQUEST_PAYLOAD_BYTES: usize = 32 * 1024;
+        if payload.len() > MAX_BROWSER_REQUEST_PAYLOAD_BYTES || payload.contains('\0') {
+            return Err("browser request payload is invalid or too large".to_string());
+        }
+        let operation_kind = RunnerBrowserOperationKind::from_wire(kind)
+            .ok_or_else(|| "invalid browser request kind".to_string())?;
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            requested_by,
+            RunnerOperation::Browser(RunnerBrowserOperation {
+                kind: operation_kind,
+                payload,
+                timeout_secs: timeout_secs.max(1),
+            }),
+        )?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let current = inner
+            .runners
+            .get(&client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+        assert_runner_access(auth, current)?;
+        if !current.runner_features.supports(required_feature) {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support {}",
                 required_feature.as_wire_name()
             ));
         }

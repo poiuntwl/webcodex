@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn tool_definition_source_has_no_module_wide_dead_code_allowance() {
+    let source = include_str!("../tool_definition.rs");
+    assert!(
+        !source.contains("#![allow(dead_code)]"),
+        "tool_definition.rs must not use a module-wide dead_code allowance"
+    );
+}
+
+#[test]
 fn tool_definitions_cover_known_names_and_public_specs() {
     let definition_names = tool_definitions()
         .map(|definition| definition.name)
@@ -42,6 +51,206 @@ fn tool_definitions_cover_known_names_and_public_specs() {
     assert_eq!(spec_names, visible_definition_names);
     assert_eq!(visible_definition_order, spec_order);
     assert_eq!(registered_tool_names(), visible_definition_order);
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn experimental_code_mode_is_visible_read_only_and_feature_scoped() {
+    let definition = lookup_tool_definition("code_mode_exec").expect("code_mode_exec definition");
+    let metadata = definition.metadata();
+    assert!(definition.visibility.is_model_visible());
+    assert_eq!(metadata.effect, ToolEffect::Observe);
+    assert_eq!(metadata.risk, ToolRisk::Read);
+    assert_eq!(metadata.approval, ToolApprovalPolicy::None);
+    assert_eq!(metadata.idempotency, ToolIdempotency::PureRead);
+    assert_eq!(definition.adaptive_runtime_direct_rank(), Some(45));
+    assert!(registered_tool_specs()
+        .iter()
+        .any(|spec| spec.name == "code_mode_exec"));
+    assert!(TOOL_DISCOVERY_GROUPS
+        .iter()
+        .filter(|group| matches!(
+            group.name,
+            TOOL_DISCOVERY_GROUP_INSPECT | TOOL_DISCOVERY_GROUP_RUNTIME
+        ))
+        .all(|group| group.tools.contains(&"code_mode_exec")));
+    for intent in ["coding", "audit", "exploration"] {
+        assert!(
+            TOOL_MANIFEST_INTENTS
+                .iter()
+                .find(|profile| profile.name == intent)
+                .unwrap()
+                .tools
+                .contains(&"code_mode_exec"),
+            "{intent}"
+        );
+    }
+    assert!(is_adaptive_runtime_direct_tool("code_mode_exec"));
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn experimental_code_mode_effectful_has_conservative_e2a_envelope() {
+    let definition = lookup_tool_definition("code_mode_exec_effectful")
+        .expect("code_mode_exec_effectful definition");
+    let metadata = definition.metadata();
+    assert!(definition.visibility.is_model_visible());
+    assert_eq!(metadata.effect, ToolEffect::Execute);
+    assert_eq!(metadata.risk, ToolRisk::JobRun);
+    assert_eq!(metadata.approval, ToolApprovalPolicy::Standard);
+    assert_eq!(metadata.idempotency, ToolIdempotency::NonIdempotent);
+    assert_eq!(definition.adaptive_runtime_direct_rank(), Some(46));
+    assert!(definition.requires_explicit_business_session());
+    assert_eq!(
+        runtime_tool_composition_policy("code_mode_exec_effectful"),
+        ToolCompositionPolicy::Denied,
+        "Code Mode must never recursively compose itself"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .any(|spec| spec.name == "code_mode_exec_effectful"));
+    assert!(TOOL_DISCOVERY_GROUPS
+        .iter()
+        .find(|group| group.name == TOOL_DISCOVERY_GROUP_RUNTIME)
+        .expect("runtime discovery group")
+        .tools
+        .contains(&"code_mode_exec_effectful"));
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn experimental_code_mode_mutating_has_conservative_e2b_envelope() {
+    let definition = lookup_tool_definition("code_mode_exec_mutating")
+        .expect("code_mode_exec_mutating definition");
+    let metadata = definition.metadata();
+    assert!(definition.visibility.is_model_visible());
+    assert_eq!(metadata.effect, ToolEffect::Mutate);
+    assert_eq!(metadata.risk, ToolRisk::ProjectWrite);
+    assert_eq!(metadata.approval, ToolApprovalPolicy::Standard);
+    assert_eq!(metadata.idempotency, ToolIdempotency::NonIdempotent);
+    assert!(
+        metadata.destructive,
+        "E2b can create/edit/delete/rename through apply_text_edits"
+    );
+    assert_eq!(
+        metadata.authority,
+        ToolAuthorityPolicy::Require(PROJECT_WRITE)
+    );
+    assert_eq!(definition.permission_risk(), PERMISSION_RISK_WRITE);
+    assert_eq!(definition.adaptive_runtime_direct_rank(), Some(47));
+    assert!(definition.requires_explicit_business_session());
+    assert_eq!(
+        runtime_tool_composition_policy("code_mode_exec_mutating"),
+        ToolCompositionPolicy::Denied,
+        "Code Mode must never recursively compose itself"
+    );
+    assert!(registered_tool_specs()
+        .iter()
+        .any(|spec| spec.name == "code_mode_exec_mutating"));
+    assert!(TOOL_DISCOVERY_GROUPS
+        .iter()
+        .find(|group| group.name == TOOL_DISCOVERY_GROUP_RUNTIME)
+        .expect("runtime discovery group")
+        .tools
+        .contains(&"code_mode_exec_mutating"));
+    assert!(CODING_INTENT_TOOL_NAMES.contains(&"code_mode_exec_mutating"));
+    assert!(is_adaptive_runtime_direct_tool("code_mode_exec_mutating"));
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn code_mode_composition_policy_is_canonical_closed_and_independent_from_frontend_admission() {
+    const E1_TOOLS: &[&str] = &[
+        "read_files",
+        "search_project_texts",
+        "project_overview",
+        "list_project_tracked_files",
+        "git_status",
+        "git_log",
+        "git_diff_hunks",
+        "git_review_summary",
+        "show_changes",
+    ];
+    for name in E1_TOOLS {
+        let definition = lookup_tool_definition(name).unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(
+            runtime_tool_composition_policy(name),
+            ToolCompositionPolicy::Parallel,
+            "{name}"
+        );
+        let metadata = definition.metadata();
+        assert_eq!(metadata.effect, ToolEffect::Observe, "{name}");
+        assert_eq!(metadata.risk, ToolRisk::Read, "{name}");
+    }
+
+    for name in ["cargo_check", "cargo_test", "apply_text_edits"] {
+        assert_eq!(
+            runtime_tool_composition_policy(name),
+            ToolCompositionPolicy::Sequential,
+            "{name}"
+        );
+    }
+
+    for name in [
+        "cargo_fmt",
+        "run_process",
+        "run_script",
+        "run_shell",
+        "run_job",
+        "run_detached_process",
+        "observe_jobs",
+        "apply_patch",
+        "write_project_file",
+        "code_mode_exec",
+        "code_mode_exec_effectful",
+        "code_mode_exec_mutating",
+    ] {
+        assert_eq!(
+            runtime_tool_composition_policy(name),
+            ToolCompositionPolicy::Denied,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        runtime_tool_composition_policy("future_unknown_tool"),
+        ToolCompositionPolicy::Denied
+    );
+}
+
+#[cfg(not(feature = "experimental-code-mode"))]
+#[test]
+fn experimental_code_mode_is_absent_without_feature() {
+    for name in [
+        "code_mode_exec",
+        "code_mode_exec_effectful",
+        "code_mode_exec_mutating",
+    ] {
+        assert!(lookup_tool_definition(name).is_none(), "{name}");
+        assert!(!known_tool_names().any(|known| known == name), "{name}");
+        assert!(
+            !registered_tool_specs().iter().any(|spec| spec.name == name),
+            "{name}"
+        );
+        assert!(
+            TOOL_DISCOVERY_GROUPS
+                .iter()
+                .all(|group| !group.tools.contains(&name)),
+            "{name}"
+        );
+        assert!(
+            TOOL_MANIFEST_INTENTS
+                .iter()
+                .all(|intent| !intent.tools.contains(&name)),
+            "{name}"
+        );
+        assert!(
+            TOOL_RECOMMENDED_FLOWS
+                .iter()
+                .all(|flow| !flow.tools.contains(&name)),
+            "{name}"
+        );
+        assert!(!is_adaptive_runtime_direct_tool(name), "{name}");
+    }
 }
 
 #[test]
@@ -118,6 +327,11 @@ fn tool_definitions_are_activity_semantics_ssot() {
         "agent_continuation_wake_prepare",
         "agent_continuation_wake_finish",
         "agent_continuation_unbind",
+        "job_terminal_continuation_bind",
+        "job_terminal_continuation_state",
+        "job_terminal_continuation_prepare",
+        "job_terminal_continuation_finish",
+        "job_terminal_continuation_unbind",
     ] {
         assert_eq!(
             runtime_tool_activity_interaction(name),
@@ -589,4 +803,76 @@ fn operator_extension_families_are_definition_owned_and_registry_derived() {
 
     assert_eq!(runtime_tool_operator_extension_family("run_shell"), None);
     assert_eq!(runtime_tool_operator_extension_family("unknown_tool"), None);
+}
+
+#[test]
+fn run_skill_resource_contract_distinguishes_live_configured_and_managed_fences() {
+    let specs = registered_tool_specs();
+    let run_spec = spec_named(&specs, "run_skill_resource")
+        .description
+        .to_ascii_lowercase();
+    for phrase in [
+        "configured skills are live resources",
+        "expected_definition_revision",
+        "resource bytes are read at execution",
+        "expected_package_revision",
+        "immutable package",
+        "package-relative helpers",
+        "__file__",
+        "requested project cwd",
+    ] {
+        assert!(
+            run_spec.contains(phrase),
+            "run_skill_resource ToolSpec must describe {phrase:?}: {run_spec}"
+        );
+    }
+    assert!(
+        !run_spec.contains("revision-fenced script"),
+        "configured resources must not be described as pre-pinned immutable scripts: {run_spec}"
+    );
+
+    let extension_specs = stateless_operator_extension_tool_specs();
+    let list_spec = spec_named(&extension_specs, "skill_list")
+        .description
+        .to_ascii_lowercase();
+    assert!(list_spec.contains("webcodex does not modify configured skill roots"));
+    assert!(list_spec.contains("run_skill_resource"));
+    assert!(!list_spec.contains("configured live read-only skills"));
+
+    let definition =
+        lookup_tool_definition("run_skill_resource").expect("run_skill_resource definition");
+    let model_description = definition
+        .model_spec
+        .expect("run_skill_resource model spec")
+        .description
+        .to_ascii_lowercase();
+    for phrase in [
+        "configured skills are live resources",
+        "expected_definition_revision",
+        "resource bytes are read at execution",
+        "expected_package_revision",
+        "immutable package",
+        "package-relative helpers",
+        "__file__",
+        "requested project cwd",
+    ] {
+        assert!(
+            model_description.contains(phrase),
+            "run_skill_resource ToolDefinition must describe {phrase:?}: {model_description}"
+        );
+    }
+    let action_description = definition
+        .gpt_action_description()
+        .expect("run_skill_resource GPT Action description")
+        .to_ascii_lowercase();
+    for phrase in [
+        "configured skills are live",
+        "expected_definition_revision",
+        "managed skills additionally require expected_package_revision",
+    ] {
+        assert!(
+            action_description.contains(phrase),
+            "run_skill_resource GPT Action description must describe {phrase:?}: {action_description}"
+        );
+    }
 }

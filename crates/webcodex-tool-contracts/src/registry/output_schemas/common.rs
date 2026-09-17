@@ -1,13 +1,16 @@
-use serde_json::{json, Value};
+use schemars::JsonSchema;
+use serde_json::{json, Map, Value};
 
 use webcodex_core::runtime_contract::{
     ContinuationCarrier, ContinuationKind, CONTINUATION_CARRIER_VALUES, CONTINUATION_KIND_VALUES,
     RECOVERY_KIND_VALUES,
 };
 use webcodex_core::workflow_session_contract::{
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
 };
 
+use crate::input_property_schema_for_tool;
+use crate::schema_generation::typed_host_schema;
 use crate::tool_definition::exploration_tool_names;
 
 pub fn schema_type(kind: &str, description: &str) -> Value {
@@ -25,6 +28,45 @@ pub fn nullable_schema(kind: &str, description: &str) -> Value {
         ],
         "description": description,
     })
+}
+
+pub(super) fn session_mode_schema(description: &str) -> Value {
+    input_property_schema_for_tool("start_session", "mode", description)
+}
+
+pub(super) fn session_guards_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "deny_write_tools": {"type": "boolean"},
+            "deny_shell_tools": {"type": "boolean"}
+        },
+        "required": ["deny_write_tools", "deny_shell_tools"]
+    })
+}
+
+pub(super) fn session_execution_context_schema(description: &str) -> Value {
+    input_property_schema_for_tool("start_session", "execution_context", description)
+}
+
+pub(super) fn session_lifecycle_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["active", "closed"],
+        "description": description,
+    })
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+pub(super) fn checkpoint_validation_schema(description: &str) -> Value {
+    input_property_schema_for_tool("workspace_checkpoint_create", "validation", description)
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+pub(super) fn checkpoint_labels_schema(description: &str) -> Value {
+    input_property_schema_for_tool("workspace_checkpoint_create", "labels", description)
 }
 
 pub fn continuation_semantics_schema(
@@ -64,6 +106,41 @@ pub fn suggested_tool_call_schema(
         },
         "required": ["tool", "arguments"]
     })
+}
+
+/// Recognize the canonical schema shape for one parser-ready SuggestedToolCall.
+///
+/// This is intentionally structural rather than a model-visible marker keyword:
+/// adapters use it to project only formally declared action edges and never scan
+/// arbitrary tool output for user/plugin objects that happen to contain `tool`
+/// and `arguments` keys.
+pub fn suggested_tool_call_schema_target(schema: &Value) -> Option<&str> {
+    if schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.len() != 2
+        || !properties.contains_key("tool")
+        || !properties.contains_key("arguments")
+    {
+        return None;
+    }
+    let required = schema.get("required")?.as_array()?;
+    if required.len() != 2
+        || !required.iter().any(|field| field.as_str() == Some("tool"))
+        || !required
+            .iter()
+            .any(|field| field.as_str() == Some("arguments"))
+    {
+        return None;
+    }
+    let tool = properties.get("tool")?;
+    if tool.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    tool.get("const").and_then(Value::as_str)
 }
 
 pub fn job_activity_schema() -> Value {
@@ -401,7 +478,7 @@ pub(super) fn session_hint_schema() -> Value {
         "properties": {
             "has_open_messages": {
                 "type": "boolean",
-                "description": "True when any counted open session-local message exists."
+                "description": "True when any counted open Session message exists or an otherwise uncounted open message requires acknowledgement."
             },
             "open_counts": {
                 "type": "object",
@@ -423,17 +500,17 @@ pub(super) fn session_hint_schema() -> Value {
             "attention_required": {
                 "type": "boolean",
                 "const": true,
-                "description": "Counts-only fallback marker for open high-priority guidance requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the urgent guidance set."
+                "description": "Counts-only fallback marker for an open Session message requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the required message set."
             },
             "attention_reason": {
                 "type": "string",
-                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON],
-                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the urgent guidance set."
+                "enum": [SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON],
+                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the ACK-required message set."
             },
             "attention_instruction": {
                 "type": "string",
-                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION],
-                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the urgent guidance set."
+                "enum": [SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION],
+                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the ACK-required message set."
             },
             "suggested_next_tool": {
                 "type": "string",
@@ -460,23 +537,50 @@ pub fn recovery_kind_schema() -> Value {
 }
 
 pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
-    let mut output_properties = output_properties;
-    output_properties.extend([
+    let properties = output_properties
+        .into_iter()
+        .map(|(name, schema)| (name.to_string(), schema))
+        .collect::<Map<_, _>>();
+    wrapped_output_schema_from_properties(properties)
+}
+
+/// Build the existing sparse ToolResult envelope from a canonical typed payload.
+///
+/// The DTO owns property names, nested shapes, enums, and structural bounds. Its
+/// `required` list is intentionally not lifted into `ToolResult.output`: runtime
+/// failures/not-started/outcome-unknown projections remain sparse, and generic
+/// runtime decorations remain legal. Overrides are reserved for explicit model
+/// projection boundaries such as intentionally-open nested LSP payloads.
+pub fn wrapped_typed_output_schema<T: JsonSchema>(overrides: Vec<(&str, Value)>) -> Value {
+    let schema = typed_host_schema::<T>();
+    let mut properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .expect("typed output payload JsonSchema must be an object");
+    for (name, replacement) in overrides {
+        assert!(
+            properties.contains_key(name),
+            "typed output payload has no property {name}"
+        );
+        properties.insert(name.to_string(), replacement);
+    }
+    wrapped_output_schema_from_properties(properties)
+}
+
+fn wrapped_output_schema_from_properties(mut properties: Map<String, Value>) -> Value {
+    properties.extend([
         (
-            "trace_ref",
+            "trace_ref".to_string(),
             schema_type(
                 "string",
                 "Opaque operator diagnostic reference emitted only on eligible failed calls while full tracing is enabled. Read with read_tool_trace; on Adaptive Runtime invoke that target through call_runtime_tool. Never a native path.",
             ),
         ),
-        ("session_hint", session_hint_schema()),
-        ("permission", permission_decision_schema()),
-        ("recovery_kind", recovery_kind_schema()),
+        ("session_hint".to_string(), session_hint_schema()),
+        ("permission".to_string(), permission_decision_schema()),
+        ("recovery_kind".to_string(), recovery_kind_schema()),
     ]);
-    let properties = output_properties
-        .into_iter()
-        .map(|(name, schema)| (name.to_string(), schema))
-        .collect::<serde_json::Map<_, _>>();
     json!({
         "type": "object",
         "properties": {

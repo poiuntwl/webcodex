@@ -65,6 +65,13 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "plugin_tool" => {
             args.insert("action".to_string(), json!("list"));
         }
+        "browser_observe" => {
+            args.insert("action".to_string(), json!("targets"));
+        }
+        "browser_act" => {
+            args.insert("action".to_string(), json!("launch"));
+            args.insert("client_id".to_string(), json!("oe"));
+        }
         "computer_observe" => {
             args.insert("action".to_string(), json!("targets"));
         }
@@ -94,6 +101,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "command" => json!("true"),
         "executable" => json!("git"),
         "language" => json!("sh"),
+        "source" => json!("text(\"ok\")"),
         "script" => json!("true"),
         "patch" => json!("diff --git a/a b/a\n"),
         "paths" => json!(["old.txt"]),
@@ -182,7 +190,10 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "completion_key" => json!("sample-completion-key"),
         "expected_assignment_fence" => json!(format!("wsa2_{}", "A".repeat(22))),
         "message_id" => json!("wc_msg_0001"),
+        "peer_id" => json!(format!("wc_peer_{}", "a".repeat(32))),
         "execution_context" => json!({}),
+        "skill_id" => json!("wc_skill_EREREREREREREREREREREQ"),
+        "expected_definition_revision" => json!("a".repeat(64)),
         other => panic!("missing sample value for required field {other}"),
     }
 }

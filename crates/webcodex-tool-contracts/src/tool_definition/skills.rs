@@ -1,4 +1,4 @@
-use super::RunnerCapabilityRequirement::{FileRead, SkillManagement, StructuredProcess};
+use super::RunnerCapabilityRequirement::{FileRead, SkillManagement};
 use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     adaptive_runtime_direct, def, model_spec, require_all_scopes, ToolDefinition,
@@ -9,7 +9,6 @@ use crate::metadata::{
     ToolRisk::{JobRun, Read, SkillManage},
     ADMIN, JOB_RUN, PROJECT_READ, TOOL_PROVIDER_RUNNER,
 };
-use crate::registry::input_schemas::{run_skill_resource_input_schema, skill_load_input_schema};
 
 /// Project Skill runtime tools. `skill_load` is the narrow direct model path;
 /// the broader discovery/read compatibility tools remain hidden operator
@@ -23,7 +22,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     super::ToolAuditResultField::value("project"),
                     super::ToolAuditResultField::value("catalog_revision"),
                     super::ToolAuditResultField::value("skill_id"),
-                    super::ToolAuditResultField::value("name"),
                     super::ToolAuditResultField::value("source_scope"),
                     super::ToolAuditResultField::value("trust"),
                     super::ToolAuditResultField::value("package_revision"),
@@ -37,10 +35,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     super::ToolAuditResultField::value("error_kind"),
                     super::ToolAuditResultField::value("state_changed"),
                 ])
+                .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&["name"]))
                 .context(super::ToolAuditContextPolicy::Fields(&[
                     super::ToolAuditResultField::value("catalog_revision"),
                     super::ToolAuditResultField::value("skill_id"),
-                    super::ToolAuditResultField::value("name"),
                     super::ToolAuditResultField::value("source_scope"),
                     super::ToolAuditResultField::value("trust"),
                     super::ToolAuditResultField::value("package_revision"),
@@ -71,8 +69,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Load one uniquely named Skill by exact name using Unicode lowercase matching for an authorized Project. Returns the selected descriptor plus bounded SKILL.md text and revision metadata in one read-only call. Ambiguous names fail closed; scripts and other Skill resources are never executed.",
-            skill_load_input_schema,
+            "Load one uniquely named Skill by exact Unicode case folding. Returns its descriptor, bounded SKILL.md, and revisions in one read-only Project call. Missing, ambiguous, or truncated discovery fails closed; scripts and other Skill resources are never executed.",
         ),
         27,
     ),
@@ -83,7 +80,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     "run_skill_resource",
                     super::ToolAuditPolicy::typed_fields(&[
                         super::ToolAuditResultField::value("skill_id"),
-                        super::ToolAuditResultField::value("skill_name"),
                         super::ToolAuditResultField::value("skill_path"),
                         super::ToolAuditResultField::value("skill_sha256"),
                         super::ToolAuditResultField::value("skill_trust"),
@@ -100,7 +96,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     ])),
                     ModelVisible,
                     TOOL_CATEGORY_RUNTIME,
-                    Some(StructuredProcess),
+                    Some(super::RunnerCapabilityRequirement::SkillResourceExecution),
                     TOOL_PROVIDER_RUNNER,
                     super::ToolSemanticContract {
                         effect: super::ToolEffect::Execute,
@@ -115,10 +111,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     true,
                     super::ToolSessionEvidencePolicy::NONE,
                 ),
-                "Execute one trusted Runner-configured or Runner-installed Skill script without exposing or retransmitting its source through model context. Only supported scripts/ resources are executable. WebCodex selects the interpreter from the resource extension (.py or .sh), supplies the script over stdin, and appends only caller-provided script arguments after the interpreter's script marker. expected_definition_revision is mandatory; installed Skills also require expected_package_revision; project-content Skills are rejected.",
-                run_skill_resource_input_schema,
+                "Execute one supported scripts/*.py or scripts/*.sh resource from a trusted Runner-configured live Skill or Runner-installed managed Skill without exposing or retransmitting its source through model context. Configured Skills are live resources: expected_definition_revision fences the selected SKILL.md definition, while resource bytes are read at execution and package-relative helpers remain live; skill_sha256 reports the exact main-script bytes executed. Managed installed Skills additionally require expected_package_revision and execute against a Runner-owned immutable package snapshot. The Runner preserves the selected Skill script/package identity for __file__, Python sibling imports, and shell $0-relative helpers while keeping the requested Project cwd; project-content Skills are rejected.",
             )
-            .with_gpt_action_description("Execute one revision-fenced .py or .sh script from a trusted Runner Skill through a WebCodex-selected interpreter. Callers supply only script arguments; project-content Skills and unsupported resources are rejected, and the script body stays out of model arguments.")
+            .with_gpt_action_description("Execute a trusted Runner Skill script. Configured Skills are live and definition-fenced by expected_definition_revision; managed Skills additionally require expected_package_revision. WebCodex selects the .py/.sh interpreter; project-content Skills are rejected.")
             .with_execution(super::ToolExecutionContract::new(
                 super::ToolExecutionForm::NativeArgv,
                 super::ToolExecutionLifetime::Runner,

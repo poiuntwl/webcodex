@@ -521,7 +521,7 @@ fn urgent_guidance_attention_is_bounded_safe_and_also_decorates_failure_results(
     assert_eq!(failed.output["session_hint"]["attention_required"], true);
     assert_eq!(
         failed.output["session_hint"]["attention_reason"],
-        "high_priority_guidance_requires_ack"
+        "session_message_requires_ack"
     );
     let body_bytes: usize = attention["messages"]
         .as_array()
@@ -887,6 +887,25 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
         .get_assignment(&coordinator.session_id, &todo_id)
         .unwrap()
         .assignment_fence;
+    let forged_author_error = super::super::ToolCall::from_tool_name(
+        "complete_session_message",
+        json!({
+            "session_id": coordinator.session_id,
+            "message_id": todo_id,
+            "answer": "No findings. Revalidated the authoritative synthetic source after review.",
+            "completion_key": "worker-review-v1",
+            "expected_assignment_fence": assignment_fence.clone(),
+            "tags": ["review", "done"],
+            "priority": "normal",
+            "author_session_id": "wc_sess_forged_should_be_ignored"
+        }),
+    )
+    .expect_err("caller-controlled completion author must fail closed");
+    assert!(
+        forged_author_error.contains("unknown field `author_session_id`"),
+        "{forged_author_error}"
+    );
+
     let completed = call_with_recorder(
         &runtime,
         "complete_session_message",
@@ -898,7 +917,6 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
             "expected_assignment_fence": assignment_fence.clone(),
             "tags": ["review", "done"],
             "priority": "normal",
-            "author_session_id": "wc_sess_forged_should_be_ignored"
         }),
         Some(&worker.session_id),
         &auth,

@@ -75,12 +75,12 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
         "model_protocol": {
             "session_context_ack": "Checkpoint/recovery tools may expose session_context_revision. Echo the latest retained revision in ack_session_context_revision only where exposed; never invent it. If unknown, omit; use the advertised Session handoff recovery path. ACK is nonblocking.",
             "session_recording": "When work_on_project creates or resumes, pass recording_session_id for recorder provenance only. business session_id may target another Session; it grants no authority.",
-            "session_message_ack": "For retained session_attention requires_ack guidance, echo ack_session_message_ids. This request-scoped model-context proof neither resolves messages, grants authority, nor gates execution.",
-            "session_message_resolution": "For a handled non-todo, send session_message_resolution on the next ordinary call with recording_session_id; ACK guidance also needs ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
+            "session_message_ack": "For retained session_attention with requires_ack, echo ack_session_message_ids. This proves model-context retention only; it never resolves messages, grants authority, or gates execution.",
+            "session_message_resolution": "For a handled non-todo, send session_message_resolution on the next ordinary call with recording_session_id; if requires_ack, also send ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
             "context_sidecar": "context_request adds bounded context after the main tool and never authorizes effects. Recover lost project.instructions with an observation call before dependent mutation.",
             "runner_targeting": "For exact Runner client_id, use runtime_status(client_id=...) or list_projects(client_id=...) before treating it as absent.",
             "persistent_shell": "Local: run_process=literal argv; run_shell=shell grammar/short chains; run_script=program-like scripts; specialize for added semantics. Persistent shell only for repeated named-SSH state or local same-process state.",
-            "normal_closeout": "Use finish_coding_task(summary_only=true) for source implementation, validation-bearing coding work, or unresolved Session evidence that affects handoff. Pure read-only, planning, investigation, or artifact work may finalize directly unless project rules require closeout; full closeout only for unresolved evidence or handoff/debug."
+            "normal_closeout": "Source/validation/open evidence: finish_coding_task(summary_only=true). Read/planning/artifact: finalize directly."
         },
         "roles": {
             "independent_review": {
@@ -319,15 +319,7 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
         minimal,
         input.continuation_kind,
     );
-    let mut workspace = workspace_projection(input.git);
-    if input
-        .project_resolution
-        .get("source")
-        .and_then(Value::as_str)
-        .is_some_and(|source| matches!(source, "path" | "managed_worktree"))
-    {
-        workspace["root"] = json!(input.resolved.config.path.clone());
-    }
+    let workspace = workspace_projection(input.git);
     let semantic_navigation = semantic_navigation_projection(input.semantic_navigation);
     let repository = repository_projection(input.repository);
     let (blockers, warnings) = startup_issues(

@@ -97,6 +97,7 @@ use webcodex_runner::{is_transport_failure, SshConfig, SshConnectionPool};
 use webcodex_runner::{
     run_process_with_profiles_and_execution_state_with_start_hook,
     run_script_with_profiles_and_execution_state_with_start_hook,
+    run_skill_resource_with_profiles_and_execution_state,
 };
 
 const JOB_UPDATE_INTERVAL_MS: u64 = 250;
@@ -225,6 +226,9 @@ struct PendingJobStart {
     policy: RunnerPolicy,
     shell: ShellConfig,
     ssh: SshConfig,
+    skills: webcodex_runner::config::SkillsConfig,
+    client_id: String,
+    server_url: String,
     project_registry_dir: PathBuf,
     metadata: RunnerInvocationMetadata,
     operation: RunnerJobOperation,
@@ -240,6 +244,7 @@ impl PendingJobStart {
         project_registry_dir: PathBuf,
         request: RunnerRequest,
     ) -> Self {
+        let client_id = request.client_id.clone();
         let invocation = request
             .decode_invocation()
             .expect("test Job wire request must decode to a canonical invocation");
@@ -255,6 +260,9 @@ impl PendingJobStart {
             policy,
             shell,
             ssh,
+            skills: webcodex_runner::config::SkillsConfig::default(),
+            client_id,
+            server_url: "http://127.0.0.1:1".to_string(),
             project_registry_dir,
             metadata: invocation.metadata,
             operation,
@@ -1245,6 +1253,7 @@ struct PollingDispatch {
     persistent_shells: webcodex_runner::PersistentShellManager,
     project_registry_dir: PathBuf,
     lsp: webcodex_runner::LspSupervisor,
+    browser: webcodex_browser::BrowserSupervisor,
     request: RunnerRequest,
 }
 
@@ -1258,6 +1267,7 @@ impl PollingDispatch {
             &self.persistent_shells,
             &self.project_registry_dir,
             &self.lsp,
+            &self.browser,
             self.request,
         )
     }
@@ -2041,6 +2051,7 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // Configured live roots and managed active Skills share one Runner-local runtime
     // boundary; managed lifecycle authority remains independently advertised.
     capabilities.skill_runtime = true;
+    capabilities.skill_resource_execution = true;
     capabilities.skill_management = true;
     // Native Tool Plugins are a separate Runner-local gateway capability. Keep
     // this explicit even when zero Plugins are configured so cross-platform
@@ -2060,6 +2071,13 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // Default production behavior is unchanged: only the explicit opt-out
     // disables it, and the server already rejects inventory without the
     // capability and vice-versa.
+    // Browser capabilities are registration-required and depend on the actual
+    // Runner-local Chromium-family discovery result. The Server must never infer
+    // them from OS, protocol generation, shell, or Computer capabilities.
+    let browser_available = webcodex_browser::discover_chromium_executable().is_some();
+    capabilities.browser_observe = browser_available;
+    capabilities.browser_control = browser_available;
+    capabilities.browser_launch = browser_available;
     // Native read-only desktop observation is implemented only on macOS and
     // Windows. Unsupported platforms advertise false and fail closed.
     capabilities.computer_observe = cfg!(any(target_os = "macos", windows));
@@ -2561,14 +2579,30 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
-/// Join the output reader threads until `deadline`. Returns the number of
-/// readers that had not finished by the deadline and were detached (their
-/// `JoinHandle`s dropped without joining).
-fn join_reader_threads_until(
+fn drain_output_chunks(rx: &mpsc::Receiver<OutputChunk>, stdout: &mut String, stderr: &mut String) {
+    while let Ok(chunk) = rx.try_recv() {
+        match chunk {
+            OutputChunk::Stdout(text) => stdout.push_str(&text),
+            OutputChunk::Stderr(text) => stderr.push_str(&text),
+        }
+    }
+}
+
+/// Drain the bounded output channel while joining reader threads until
+/// `deadline`. Draining and joining must progress together: a reader can be
+/// blocked in `SyncSender::send` after the child exits, so waiting for the
+/// reader before draining the channel creates a terminal-output race and can
+/// drop the final validation summary. Returns the number of readers detached
+/// after the existing bounded cleanup deadline.
+fn drain_and_join_reader_threads_until(
     mut readers: Vec<std::thread::JoinHandle<()>>,
+    rx: &mpsc::Receiver<OutputChunk>,
+    stdout: &mut String,
+    stderr: &mut String,
     deadline: Instant,
 ) -> usize {
     loop {
+        drain_output_chunks(rx, stdout, stderr);
         let mut index = 0;
         while index < readers.len() {
             if readers[index].is_finished() {
@@ -2579,6 +2613,9 @@ fn join_reader_threads_until(
             }
         }
         if readers.is_empty() {
+            // A finished reader may have sent its final chunk just before the
+            // join became observable.
+            drain_output_chunks(rx, stdout, stderr);
             return 0;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2586,6 +2623,7 @@ fn join_reader_threads_until(
             // Dropping a JoinHandle detaches it. The output channel is bounded,
             // so an abnormal pipe holder cannot retain unbounded runner memory
             // or block process shutdown.
+            drain_output_chunks(rx, stdout, stderr);
             return readers.len();
         }
         std::thread::sleep(Duration::from_millis(10).min(remaining));
@@ -2934,7 +2972,8 @@ fn job_prestart_lifecycle(operation: &RunnerJobOperation) -> Option<ShellCommand
         RunnerJobOperation::StartShell(_)
         | RunnerJobOperation::StartProcess(_)
         | RunnerJobOperation::StartDetachedProcess(_)
-        | RunnerJobOperation::StartScript(_) => Some(ShellCommandExecutionState::NotStarted),
+        | RunnerJobOperation::StartScript(_)
+        | RunnerJobOperation::StartSkillResource(_) => Some(ShellCommandExecutionState::NotStarted),
         RunnerJobOperation::StartValidation(_) | RunnerJobOperation::Stop { .. } => None,
     }
 }
@@ -2947,7 +2986,11 @@ pub(crate) fn decode_failure_prestart_lifecycle(
 ) -> Option<ShellCommandExecutionState> {
     matches!(
         request.kind.as_str(),
-        "start_job" | "start_process_job" | "start_detached_process_job" | "start_script_job"
+        "start_job"
+            | "start_process_job"
+            | "start_detached_process_job"
+            | "start_script_job"
+            | "start_skill_resource_job"
     )
     .then_some(ShellCommandExecutionState::NotStarted)
 }
@@ -3396,6 +3439,20 @@ fn validate_runner_job_context_operation(
                 &operation.script,
                 operation.stdin.as_deref(),
                 operation.cwd.as_deref(),
+                operation.timeout_secs,
+            )?;
+        }
+        RunnerJobOperation::StartSkillResource(operation) => {
+            if context.ssh_resource.is_some() {
+                return Err("typed Skill resource Job request shape is invalid".to_string());
+            }
+            operation
+                .request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_runner_structured_common(
+                operation.cwd.as_deref(),
+                None,
                 operation.timeout_secs,
             )?;
         }
@@ -4317,9 +4374,9 @@ impl JobManager {
         }
         match &start.operation {
             RunnerJobOperation::StartDetachedProcess(_) => self.start_detached_process_job(start),
-            RunnerJobOperation::StartProcess(_) | RunnerJobOperation::StartScript(_) => {
-                self.start_structured_job(start)
-            }
+            RunnerJobOperation::StartProcess(_)
+            | RunnerJobOperation::StartScript(_)
+            | RunnerJobOperation::StartSkillResource(_) => self.start_structured_job(start),
             RunnerJobOperation::StartShell(_) | RunnerJobOperation::StartValidation(_) => {
                 self.start_shell_job(start)
             }
@@ -4538,6 +4595,9 @@ impl JobManager {
             generation,
             policy,
             shell,
+            skills,
+            client_id,
+            server_url,
             project_registry_dir,
             operation,
             ..
@@ -4545,9 +4605,11 @@ impl JobManager {
         let job_id = operation.job_id().to_string();
         if !matches!(
             operation,
-            RunnerJobOperation::StartProcess(_) | RunnerJobOperation::StartScript(_)
+            RunnerJobOperation::StartProcess(_)
+                | RunnerJobOperation::StartScript(_)
+                | RunnerJobOperation::StartSkillResource(_)
         ) {
-            unreachable!("structured Job starter received non process/script operation");
+            unreachable!("structured Job starter received non structured operation");
         }
         let stop_requested = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
@@ -4614,7 +4676,24 @@ impl JobManager {
                         Some(&on_started),
                     )
                 }
-                _ => unreachable!("structured Job starter received non process/script operation"),
+                RunnerJobOperation::StartSkillResource(request) => {
+                    run_skill_resource_with_profiles_and_execution_state(
+                        generation,
+                        &skills,
+                        &client_id,
+                        &server_url,
+                        &policy,
+                        &shell,
+                        &project_registry_dir,
+                        &manager.prepared_profiles,
+                        request.cwd.as_deref(),
+                        &request.request,
+                        request.timeout_secs,
+                        Some(stop_requested.as_ref()),
+                        Some(&on_started),
+                    )
+                }
+                _ => unreachable!("structured Job starter received non structured operation"),
             };
             let execution_state = result.execution_state;
             let stopped = stop_requested.load(Ordering::SeqCst)
@@ -4658,6 +4737,7 @@ impl JobManager {
             project_registry_dir,
             metadata: _,
             operation,
+            ..
         } = start;
         let (job_id, cwd, raw_command, steps, timeout_secs, context, validation) = match &operation
         {
@@ -5028,15 +5108,15 @@ impl JobManager {
                 // its own, then force-terminate whatever remains before the
                 // bounded reader join, so cleanup cannot wait forever on EOF.
                 cleanup_managed_tree(&child);
-                join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
                 let mut out = String::new();
                 let mut err = String::new();
-                while let Ok(chunk) = rx.try_recv() {
-                    match chunk {
-                        OutputChunk::Stdout(text) => out.push_str(&text),
-                        OutputChunk::Stderr(text) => err.push_str(&text),
-                    }
-                }
+                drain_and_join_reader_threads_until(
+                    readers,
+                    &rx,
+                    &mut out,
+                    &mut err,
+                    Instant::now() + Duration::from_secs(1),
+                );
                 observe_cargo_test_count_chunks(&mut test_count_accumulator, &out, &err);
                 if step_status.0 == "completed" && step_index + 1 < step_count {
                     step_index += 1;
@@ -5475,15 +5555,15 @@ impl JobManager {
                 };
                 result.err()
             });
-            join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
             let mut final_out = String::new();
             let mut final_err = String::new();
-            while let Ok(chunk) = rx.try_recv() {
-                match chunk {
-                    OutputChunk::Stdout(text) => final_out.push_str(&text),
-                    OutputChunk::Stderr(text) => final_err.push_str(&text),
-                }
-            }
+            drain_and_join_reader_threads_until(
+                readers,
+                &rx,
+                &mut final_out,
+                &mut final_err,
+                Instant::now() + Duration::from_secs(1),
+            );
             if !final_err.is_empty() {
                 append_bounded_tail(&mut transport_stderr, &final_err, 16 * 1024);
             }
@@ -5675,6 +5755,7 @@ fn handle_one_poll(
     project_inventory_page: Option<ShellProjectInventoryPage>,
     runner_instance_id: &str,
     lsp: &webcodex_runner::LspSupervisor,
+    browser: &webcodex_browser::BrowserSupervisor,
     shutdown: &Arc<AtomicBool>,
     dispatches: &ActivityTracker,
     polling_dispatches: &mut PollingDispatchSupervisor,
@@ -5749,6 +5830,7 @@ fn handle_one_poll(
         Err(error) => return Err(PollError::new(PollErrorKind::Config, error)),
     };
     let lsp = lsp.clone();
+    let browser = browser.clone();
     let dispatch = PollingDispatch {
         request_id: request.request_id.clone(),
         sink,
@@ -5758,6 +5840,7 @@ fn handle_one_poll(
         persistent_shells,
         project_registry_dir,
         lsp,
+        browser,
         request,
     };
     if !once {

@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -293,6 +294,9 @@ pub const RUNNER_CAPABILITY_MANAGED_WORKTREE: &str = "managed_worktree";
 /// Runner-global Skill catalog observation, exact resolution, and source-pinned read.
 /// Configured and managed sources share this cross-process runtime capability.
 pub const RUNNER_CAPABILITY_SKILL_RUNTIME: &str = "skill_runtime";
+/// Runner-owned package-context execution for trusted Skill resources.
+/// Missing on older Runners is false; never infer it from generic process support.
+pub const RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION: &str = "skill_resource_execution";
 /// Runner-global managed Skill lifecycle and revision inventory. This is an
 /// independent consequential capability and is never inferred from Skill runtime access.
 pub const RUNNER_CAPABILITY_SKILL_MANAGEMENT: &str = "skill_management";
@@ -300,6 +304,14 @@ pub const RUNNER_CAPABILITY_SKILL_MANAGEMENT: &str = "skill_management";
 /// reconnects. Missing on older runners and therefore defaults to `false`.
 /// Read-only native desktop/window observation. Missing on older Runners and
 /// false; never inferred from shell or file capabilities.
+pub const RUNNER_CAPABILITY_BROWSER_OBSERVE: &str = "browser_observe";
+/// Runner-owned Browser effects against opaque Browser/Page/Element identities.
+/// Missing on older Runners is false and is never inferred from Browser observation,
+/// Computer control, OS identity, protocol generation, or shell support.
+pub const RUNNER_CAPABILITY_BROWSER_CONTROL: &str = "browser_control";
+/// Runner-owned creation of an ephemeral Chromium-family Browser runtime. Missing
+/// on older Runners is false and is never inferred from executable/platform facts.
+pub const RUNNER_CAPABILITY_BROWSER_LAUNCH: &str = "browser_launch";
 pub const RUNNER_CAPABILITY_COMPUTER_OBSERVE: &str = "computer_observe";
 /// Bounded installed-application discovery. Missing on older Runners is false
 /// and is never inferred from desktop observation or launch authority.
@@ -467,7 +479,11 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION,
     RUNNER_CAPABILITY_MANAGED_WORKTREE,
     RUNNER_CAPABILITY_SKILL_RUNTIME,
+    RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION,
     RUNNER_CAPABILITY_SKILL_MANAGEMENT,
+    RUNNER_CAPABILITY_BROWSER_OBSERVE,
+    RUNNER_CAPABILITY_BROWSER_CONTROL,
+    RUNNER_CAPABILITY_BROWSER_LAUNCH,
     RUNNER_CAPABILITY_COMPUTER_OBSERVE,
     RUNNER_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
     RUNNER_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
@@ -667,9 +683,22 @@ pub struct RunnerCapabilities {
     /// Runner-local Skill catalog observation, exact resolution, and source-pinned reads.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skill_runtime: bool,
+    /// Runner-owned trusted Skill package execution context.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skill_resource_execution: bool,
     /// Managed Skill lifecycle/revision management. Independent from runtime reads.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skill_management: bool,
+    /// Runner-owned Browser observation. Missing on older Runners is false and
+    /// never follows from OS/protocol/shell/Computer capabilities.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub browser_observe: bool,
+    /// Runner-owned Browser control excluding process launch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub browser_control: bool,
+    /// Runner-owned launch of ephemeral Chromium-family runtimes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub browser_launch: bool,
     /// Native read-only desktop/window observation. Missing on older Runners
     /// and therefore fail-closed.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -784,19 +813,62 @@ impl Default for RunnerConfigReloadStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerConfigAction {
     Check,
     Reload,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerConfigExecutionState {
     NotStarted,
     Completed,
     OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerConfigErrorCode {
+    InvalidRequest,
+    ConfigReadFailed,
+    ConfigParseFailed,
+    ConfigValidationFailed,
+    ProviderConfigInvalid,
+    PluginReloadFailed,
+    PluginReloadBusy,
+    ConfigGenerationConflict,
+    RunnerUnavailable,
+    RunnerReplaced,
+    CapabilityUnavailable,
+    InvalidRunnerResponse,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum RunnerConfigErrorField {
+    #[serde(rename = "max_concurrent_jobs")]
+    MaxConcurrentJobs,
+    #[serde(rename = "skills.roots")]
+    SkillsRoots,
+    #[serde(rename = "shell.max_persistent_shells")]
+    ShellMaxPersistentShells,
+    #[serde(rename = "shell.persistent_shell_idle_timeout_secs")]
+    ShellPersistentShellIdleTimeoutSecs,
+    #[serde(rename = "acp.max_concurrent_runs")]
+    AcpMaxConcurrentRuns,
+    #[serde(rename = "acp.permission_timeout_secs")]
+    AcpPermissionTimeoutSecs,
+    #[serde(rename = "mcp.request_timeout_secs")]
+    McpRequestTimeoutSecs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerConfigErrorReason {
+    OutOfRange,
+    InvalidPath,
 }
 
 /// Closed Runner config operation. No filesystem path or raw configuration is
@@ -824,20 +896,45 @@ impl RunnerConfigOperationRequest {
     }
 }
 
+fn runner_config_restart_required_fields_schema(
+    _: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "maxItems": RUNNER_CONFIG_RESTART_REQUIRED_FIELDS.len(),
+        "uniqueItems": true,
+        "items": {
+            "type": "string",
+            "enum": RUNNER_CONFIG_RESTART_REQUIRED_FIELDS,
+        }
+    })
+}
+
 /// Bounded, non-secret result for one exact Runner config operation. Generation
 /// is null only when Control cannot truthfully know the current generation after
 /// a delivery failure or replacement; successful Runner responses always carry it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfigOperationResponse {
+    /// Exact config operation attempted by the Runner.
     pub action: RunnerConfigAction,
+    /// Whether execution was definitely not started, completed, or has an unknown outcome.
     pub execution_state: RunnerConfigExecutionState,
+    /// Candidate validity when validation completed; absent when no trustworthy validation exists.
     pub valid: Option<bool>,
+    /// Active Runner config generation when known.
+    #[schemars(range(min = 1))]
     pub current_generation: Option<u64>,
-    pub error_code: Option<String>,
-    pub error_field: Option<String>,
-    pub error_reason: Option<String>,
+    /// Closed, non-secret operation failure code.
+    pub error_code: Option<RunnerConfigErrorCode>,
+    /// Closed config field identifier for safely classifiable validation failures.
+    pub error_field: Option<RunnerConfigErrorField>,
+    /// Closed reason paired with `error_field`.
+    pub error_reason: Option<RunnerConfigErrorReason>,
+    /// Whether some accepted candidate fields require process restart to take effect.
     pub restart_required: bool,
+    /// Sorted unique startup-only fields whose candidate values require restart.
+    #[schemars(schema_with = "runner_config_restart_required_fields_schema")]
     pub restart_required_fields: Vec<String>,
 }
 
@@ -859,41 +956,14 @@ impl RunnerConfigOperationResponse {
             }
             previous = Some(field);
         }
-        match (self.error_field.as_deref(), self.error_reason.as_deref()) {
+        match (self.error_field, self.error_reason) {
             (None, None) => {}
-            (Some(field), Some("out_of_range"))
-                if matches!(
-                    field,
-                    "max_concurrent_jobs"
-                        | "skills.roots"
-                        | "shell.max_persistent_shells"
-                        | "shell.persistent_shell_idle_timeout_secs"
-                        | "acp.max_concurrent_runs"
-                        | "acp.permission_timeout_secs"
-                        | "mcp.request_timeout_secs"
-                ) => {}
-            (Some("skills.roots"), Some("invalid_path")) => {}
+            (Some(_), Some(RunnerConfigErrorReason::OutOfRange)) => {}
+            (
+                Some(RunnerConfigErrorField::SkillsRoots),
+                Some(RunnerConfigErrorReason::InvalidPath),
+            ) => {}
             _ => return Err("invalid config error diagnostic"),
-        }
-        if let Some(code) = self.error_code.as_deref() {
-            if !matches!(
-                code,
-                "invalid_request"
-                    | "config_read_failed"
-                    | "config_parse_failed"
-                    | "config_validation_failed"
-                    | "provider_config_invalid"
-                    | "plugin_reload_failed"
-                    | "plugin_reload_busy"
-                    | "config_generation_conflict"
-                    | "runner_unavailable"
-                    | "runner_replaced"
-                    | "capability_unavailable"
-                    | "invalid_runner_response"
-                    | "outcome_unknown"
-            ) {
-                return Err("unknown Runner config error code");
-            }
         }
         match self.execution_state {
             RunnerConfigExecutionState::Completed => {
@@ -968,7 +1038,11 @@ impl Default for RunnerCapabilities {
             project_path_registration: false,
             managed_worktree: false,
             skill_runtime: false,
+            skill_resource_execution: false,
             skill_management: false,
+            browser_observe: false,
+            browser_control: false,
+            browser_launch: false,
             computer_observe: false,
             computer_application_discovery: false,
             computer_application_launch: false,
@@ -1571,7 +1645,7 @@ pub struct ShellProcessArgv {
 /// contract. The Runner owns the mapping from this semantic language to a
 /// concrete interpreter; no executable path or custom shell grammar is
 /// accepted from the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellScriptLanguage {
     Sh,
@@ -2243,10 +2317,31 @@ mod envelope_tests {
         };
         assert!(valid.validate().is_ok());
 
-        let mut leaked_error = valid.clone();
-        leaked_error.error_code = Some("/private/path?token=secret".to_string());
-        leaked_error.valid = Some(false);
-        assert!(leaked_error.validate().is_err());
+        let leaked_error = serde_json::json!({
+            "action": "check",
+            "execution_state": "completed",
+            "valid": false,
+            "current_generation": 1,
+            "error_code": "/private/path?token=secret",
+            "error_field": null,
+            "error_reason": null,
+            "restart_required": false,
+            "restart_required_fields": []
+        });
+        assert!(serde_json::from_value::<RunnerConfigOperationResponse>(leaked_error).is_err());
+
+        let skills_path = RunnerConfigOperationResponse {
+            action: RunnerConfigAction::Check,
+            execution_state: RunnerConfigExecutionState::Completed,
+            valid: Some(false),
+            current_generation: Some(1),
+            error_code: Some(RunnerConfigErrorCode::ConfigValidationFailed),
+            error_field: Some(RunnerConfigErrorField::SkillsRoots),
+            error_reason: Some(RunnerConfigErrorReason::InvalidPath),
+            restart_required: false,
+            restart_required_fields: Vec::new(),
+        };
+        assert!(skills_path.validate().is_ok());
 
         let mut unbounded_field = valid;
         unbounded_field.restart_required = true;
@@ -2481,7 +2576,11 @@ mod envelope_tests {
                 project_path_registration: false,
                 managed_worktree: false,
                 skill_runtime: false,
+                skill_resource_execution: false,
                 skill_management: false,
+                browser_observe: false,
+                browser_control: false,
+                browser_launch: false,
                 computer_observe: false,
                 computer_application_discovery: false,
                 computer_application_launch: false,
@@ -3707,7 +3806,11 @@ mod envelope_tests {
                 "project_path_registration",
                 "managed_worktree",
                 "skill_runtime",
+                "skill_resource_execution",
                 "skill_management",
+                "browser_observe",
+                "browser_control",
+                "browser_launch",
                 "computer_observe",
                 "computer_application_discovery",
                 "computer_application_launch",

@@ -5,6 +5,7 @@
 //! generate prose summaries, parse validation output, or hide underlying tool
 //! payloads.
 
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -547,6 +548,12 @@ impl ToolRuntime {
                 if let Some(result) = registration_scope_denied(auth, "project path registration") {
                     return result;
                 }
+                if let Err(result) = self
+                    .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+                    .await
+                {
+                    return result;
+                }
                 let permission = super::permissions::evaluate_permission_for_tool(
                     &self.permission_evaluator,
                     "register_project",
@@ -1066,7 +1073,6 @@ impl ToolRuntime {
                     "server_transport": {"status": "not_observed"},
                     "server_registration": {"status": "not_observed"},
                     "project_registry": {"status": "resolved", "resolved_project": resolved.resolved_id},
-                    "connector_endpoint": {"status": "not_observed"},
                     "last_successful_tool_call": {"status": "not_observed"},
                 })
             });
@@ -3263,7 +3269,7 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
         == Some(false)
     {
         if output
-            .pointer("/changes/show_changes/diff_review_handoff/recovery/tool")
+            .pointer("/changes/show_changes/diff_review_handoff/next_call/tool")
             .and_then(Value::as_str)
             == Some("git_diff_hunks")
         {
@@ -3381,7 +3387,7 @@ mod startup_runner_tests {
             "changes": {
                 "show_changes": {
                     "diff_review_handoff": {
-                        "recovery": {"tool": "git_diff_hunks", "arguments": {}}
+                        "next_call": {"tool": "git_diff_hunks", "arguments": {}}
                     }
                 }
             },
@@ -3393,12 +3399,9 @@ mod startup_runner_tests {
         assert!(actions
             .iter()
             .any(|action| action == "continue the diff review with git_diff_hunks"));
-        assert!(
-            crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
-                output["changes"]["show_changes"]["diff_review_handoff"]["recovery"]["tool"]
-                    .as_str()
-                    .unwrap()
-            )
+        assert_eq!(
+            output["changes"]["show_changes"]["diff_review_handoff"]["next_call"]["tool"],
+            "git_diff_hunks"
         );
         assert!(!actions
             .iter()

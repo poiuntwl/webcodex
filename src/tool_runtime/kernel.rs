@@ -3,7 +3,10 @@ use super::sessions::{
     strip_tool_call_expectation_metadata, SessionContextRevisionAck, SessionTransport,
     ToolCallRecorderMetadata, ToolCallSessionMessageResolution,
 };
-use super::tool_audit::{session_log_arguments_for_tool_request, session_log_result_for_tool};
+use super::tool_audit::{
+    session_log_arguments_for_tool_request, session_log_arguments_for_typed_call,
+    session_log_result_for_tool,
+};
 use super::tool_definition::{runtime_tool_operator_extension_family, ToolOperatorExtensionFamily};
 use super::{session_context, HostFileImportProvenance, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::scopes::OAuthToolScopePolicy;
@@ -363,7 +366,7 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Tool trace diagnostics are available only on Stateless MCP 2026 operator surfaces"
+                    message: "Tool trace diagnostics are available only on Stateless MCP 2026"
                         .to_string(),
                 }),
                 project: None,
@@ -376,7 +379,7 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Goal Plan App state is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                    message: "Goal Plan App state is available only on Stateless MCP 2026 requests with Goal Plan App capability"
                         .to_string(),
                 }),
                 project: None,
@@ -389,7 +392,7 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Work Result App state is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                    message: "Work Result App state is available only on Stateless MCP 2026 requests with Work Result App capability"
                         .to_string(),
                 }),
                 project: None,
@@ -402,7 +405,7 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Final Changes App lazy diff is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                    message: "Final Changes App lazy diff is available only on Stateless MCP 2026 requests with Changes App capability"
                         .to_string(),
                 }),
                 project: None,
@@ -426,7 +429,28 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Agent continuation App coordination is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                    message: "Agent continuation App coordination is available only on Stateless MCP 2026 requests with Agent Continuation App capability"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if matches!(
+            request.tool_name.as_str(),
+            "job_terminal_continuation_bind"
+                | "job_terminal_continuation_state"
+                | "job_terminal_continuation_prepare"
+                | "job_terminal_continuation_finish"
+                | "job_terminal_continuation_unbind"
+        ) && !capabilities.agent_continuation_app
+        {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Job terminal continuation App coordination is available only on Stateless MCP 2026 requests with MCP App continuation capability"
                         .to_string(),
                 }),
                 project: None,
@@ -435,7 +459,7 @@ impl ToolRuntime {
             };
         }
         // Project Memory tools are kernel-known but globally model-hidden. One
-        // explicit protocol-surface capability gates all six fixed tools; their
+        // explicit protocol capability gates all six fixed tools; their
         // canonical ToolDefinition authority decides caller access below.
         if matches!(
             operator_extension_family,
@@ -449,8 +473,7 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Memory tools are available only on Stateless MCP 2026 Full Operator"
-                        .to_string(),
+                    message: "Memory tools are available only on Stateless MCP 2026".to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
@@ -458,9 +481,8 @@ impl ToolRuntime {
             };
         }
         // Phase-3 Skill tools are kernel-known only so ToolCall parsing stays
-        // typed, but execution is authoritative-surface-gated. A private tool
-        // name from REST, legacy MCP, Local Coding, or Connector cannot enable
-        // this runtime.
+        // typed, but execution is gated by explicit protocol capability. A private
+        // tool name from REST or legacy MCP cannot enable this runtime.
         if matches!(
             operator_extension_family,
             Some(ToolOperatorExtensionFamily::SkillRuntime)
@@ -470,9 +492,8 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message:
-                        "Skill runtime tools are available only on Stateless MCP 2026 Full Operator"
-                            .to_string(),
+                    message: "Skill runtime tools are available only on Stateless MCP 2026"
+                        .to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
@@ -488,9 +509,8 @@ impl ToolRuntime {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message:
-                        "Skill management tools are available only on Stateless MCP 2026 Full Operator"
-                            .to_string(),
+                    message: "Skill management tools are available only on Stateless MCP 2026"
+                        .to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
@@ -518,9 +538,21 @@ impl ToolRuntime {
         }
         // Action-dependent gateways resolve exact policy before the generic
         // static Session/permission lifecycle and own one specialized ledger.
-        if let Some(outcome) =
+        if let Some(mut outcome) =
             super::specialized::try_dispatch_specialized_gateway(self, &request, context).await
         {
+            if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
+                let peer_project = outcome.project.clone();
+                if let Some(result) = outcome.result.as_mut() {
+                    self.add_peer_collaboration_projection(
+                        result,
+                        context.auth,
+                        context.window,
+                        peer_project.as_deref(),
+                        &recorder_metadata.ack_session_message_ids,
+                    );
+                }
+            }
             return outcome;
         }
         let concrete_arguments = strip_tool_call_expectation_metadata(request.arguments.clone());
@@ -732,8 +764,15 @@ impl ToolRuntime {
             }
         }
 
-        let session_log_arguments =
-            session_log_arguments_for_tool_request(&request.tool_name, &concrete_arguments);
+        // Parse the business request once. Successful typed input drives both
+        // pre-execution audit projection and later dispatch. Malformed input is
+        // recorded with an empty request projection rather than reparsed through
+        // a schema-filter fallback.
+        let parsed_call = ToolCall::from_tool_name(&request.tool_name, concrete_arguments);
+        let session_log_arguments = parsed_call
+            .as_ref()
+            .map(|call| session_log_arguments_for_typed_call(&request.tool_name, call))
+            .unwrap_or_else(|_| Value::Object(Default::default()));
         let mut session_event = self.sessions.record_tool_call_started_with_metadata(
             context.session_id,
             context.transport.into(),
@@ -770,7 +809,7 @@ impl ToolRuntime {
             }
         }
 
-        let mut call = match ToolCall::from_tool_name(&request.tool_name, concrete_arguments) {
+        let mut call = match parsed_call {
             Ok(call) => call,
             Err(message) => {
                 self.sessions.record_tool_call_finished(
@@ -994,6 +1033,19 @@ impl ToolRuntime {
             if let Some(output) = result.output.as_object_mut() {
                 output.remove("workflow_recording_attention");
             }
+        }
+        if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
+            let peer_project = correlation
+                .resolved_project
+                .as_deref()
+                .or(recorder_metadata.recording_session_project.as_deref());
+            self.add_peer_collaboration_projection(
+                &mut result,
+                context.auth,
+                context.window,
+                peer_project,
+                &recorder_metadata.ack_session_message_ids,
+            );
         }
         if request.tool_name == "observe_jobs" {
             super::observe_jobs::sparsify_observe_jobs_model_result(&mut result);

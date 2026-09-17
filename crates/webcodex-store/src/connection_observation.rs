@@ -19,19 +19,18 @@ pub(crate) enum StoreDomain {
     Audit,
     Communication,
     Core,
-    Executions,
     Goal,
     JobReceipts,
+    JobTerminalWait,
     Memory,
     OAuth,
     Schema,
-    TaskKernel,
     WindowActivity,
 }
 
 impl StoreDomain {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::Accounts,
         Self::Activity,
         Self::AdminProjectLifecycle,
@@ -41,13 +40,12 @@ impl StoreDomain {
         Self::Audit,
         Self::Communication,
         Self::Core,
-        Self::Executions,
         Self::Goal,
         Self::JobReceipts,
+        Self::JobTerminalWait,
         Self::Memory,
         Self::OAuth,
         Self::Schema,
-        Self::TaskKernel,
         Self::WindowActivity,
     ];
 
@@ -62,13 +60,12 @@ impl StoreDomain {
             Self::Audit => "audit",
             Self::Communication => "communication",
             Self::Core => "core",
-            Self::Executions => "executions",
             Self::Goal => "goal",
             Self::JobReceipts => "job_receipts",
+            Self::JobTerminalWait => "job_terminal_wait",
             Self::Memory => "memory",
             Self::OAuth => "oauth",
             Self::Schema => "schema",
-            Self::TaskKernel => "task_kernel",
             Self::WindowActivity => "window_activity",
         }
     }

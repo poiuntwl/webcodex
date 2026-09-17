@@ -8,8 +8,11 @@
 mod agent_tasks;
 mod agent_waits;
 mod artifacts;
+mod browser;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode;
 mod coding_agents;
 mod communication;
 mod computer;
@@ -36,12 +39,11 @@ use super::metadata::{
     ToolIdempotency, ToolMetadata, ToolPathHint, ToolRisk, ToolSemanticContract, RUNTIME_READ,
     TOOL_PROVIDER_CONTROL,
 };
-use super::registry::input_schemas::list_tools_input_schema;
 #[cfg(any(test, feature = "root-test-support"))]
 pub use super::tool_catalog::TOOL_MANIFEST_INTENTS;
 pub use super::tool_catalog::{
     available_tool_manifest_intent_names, resolve_tool_manifest_intent, CODING_INTENT_TOOL_NAMES,
-    LOCAL_CODING_TOOL_NAMES, TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
+    TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
 };
 #[cfg(any(test, feature = "root-test-support"))]
 pub use super::tool_catalog::{
@@ -87,7 +89,8 @@ use webcodex_core::runner_protocol::{
     RUNNER_CAPABILITY_LSP_CALL_HIERARCHY, RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     RUNNER_CAPABILITY_PERSISTENT_SHELL, RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL,
     RUNNER_CAPABILITY_SHELL, RUNNER_CAPABILITY_SKILL_MANAGEMENT,
-    RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV, RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+    RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION, RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 
 /// Runner capability or owner-boundary requirement that must hold before a
@@ -102,6 +105,9 @@ pub enum RunnerCapabilityRequirement {
     /// General native process + argv execution. This must never be inferred
     /// from shell or structured-validation support.
     StructuredProcess,
+    /// Runner-owned trusted Skill resource execution with package identity.
+    /// Never infer this from generic structured process or Skill read support.
+    SkillResourceExecution,
     /// Durable detached native process Jobs. This explicit authority is never
     /// inferred from ordinary structured process execution.
     DetachedProcess,
@@ -174,6 +180,7 @@ impl RunnerCapabilityRequirement {
             Self::OwnerOnly => "owner boundary",
             Self::Shell => RUNNER_CAPABILITY_SHELL,
             Self::StructuredProcess => RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+            Self::SkillResourceExecution => RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION,
             Self::DetachedProcess => RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS,
             Self::StructuredScript => RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
             Self::InternalPosixScript => RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
@@ -210,6 +217,7 @@ impl RunnerCapabilityRequirement {
             Self::OwnerOnly => &[],
             Self::Shell => &[RUNNER_CAPABILITY_SHELL],
             Self::StructuredProcess => &[RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV],
+            Self::SkillResourceExecution => &[RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION],
             Self::DetachedProcess => &[RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS],
             Self::StructuredScript => &[RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD],
             Self::InternalPosixScript => &[RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT],
@@ -275,12 +283,9 @@ impl ToolVisibility {
     }
 }
 
-pub type ToolInputSchemaFactory = fn() -> serde_json::Value;
-
 #[derive(Debug, Clone, Copy)]
 pub struct ToolModelSpecDeclaration {
     pub description: &'static str,
-    pub input_schema: ToolInputSchemaFactory,
     /// Optional GPT Actions presentation copy. Canonical/MCP descriptions stay
     /// unchanged; this exists only when the Action importer's 300-character
     /// operation-description ceiling needs a deliberately shorter rendering.
@@ -294,24 +299,6 @@ pub enum ToolGptActionExposure {
     /// This tool depends on MCP-only protocol semantics and must not be exposed
     /// directly or through the GPT Actions gateway.
     Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolModelSurfaceDeclaration {
-    /// Stable ordering for tools exposed directly by the adaptive runtime
-    /// surface. `None` is the default and means a model-visible runtime tool
-    /// belongs to the adaptive long tail behind `call_runtime_tool`.
-    pub adaptive_runtime_direct_rank: Option<u16>,
-    /// GPT Actions inherits Adaptive Runtime unless a concrete protocol
-    /// incompatibility is declared on the canonical ToolDefinition.
-    pub gpt_action_exposure: ToolGptActionExposure,
-}
-
-impl ToolModelSurfaceDeclaration {
-    const DEFAULT: Self = Self {
-        adaptive_runtime_direct_rank: None,
-        gpt_action_exposure: ToolGptActionExposure::Inherit,
-    };
 }
 
 /// Declarative privacy contract for the bounded Tool Audit / Session-ledger
@@ -513,6 +500,8 @@ impl ToolAuditResultField {
 pub enum ToolAuditSemanticResultPolicy {
     /// Project heterogeneous Computer observation results into the same sparse,
     /// privacy-preserving metadata retained by the pre-gateway read tools.
+    BrowserObservation,
+    BrowserControl,
     ComputerObservation,
     /// Project heterogeneous Computer control results into the sparse lifecycle
     /// metadata retained by the pre-gateway effect tools.
@@ -925,15 +914,31 @@ pub struct ToolActivitySemantics {
     pub kind: ToolActivityKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCompositionPolicy {
+    Denied,
+    Sequential,
+    Parallel,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolDefinition {
     pub name: &'static str,
     pub audit: ToolAuditPolicy,
     pub model_spec: Option<ToolModelSpecDeclaration>,
-    pub model_surface: ToolModelSurfaceDeclaration,
+    /// Stable direct-call ordering for the one canonical Adaptive Runtime.
+    /// `None` means a model-visible tool belongs to the long tail behind
+    /// `call_runtime_tool`.
+    pub adaptive_runtime_direct_rank: Option<u16>,
+    /// GPT Actions follows canonical Adaptive routing unless the tool declares
+    /// concrete protocol incompatibility.
+    pub gpt_action_exposure: ToolGptActionExposure,
     pub operator_extension_family: Option<ToolOperatorExtensionFamily>,
     /// Optional canonical selection semantics for ordinary execution tools.
     pub execution: Option<ToolExecutionContract>,
+    /// Canonical scheduling policy for nested orchestration. This grants no
+    /// authority; orchestration frontends retain their own explicit admission.
+    pub composition: ToolCompositionPolicy,
     pub visibility: ToolVisibility,
     pub category: &'static str,
     pub metadata: ToolMetadata,
@@ -960,6 +965,11 @@ impl ToolDefinition {
         self
     }
 
+    pub const fn with_composition_policy(mut self, policy: ToolCompositionPolicy) -> Self {
+        self.composition = policy;
+        self
+    }
+
     /// Override only GPT Actions presentation text. This never changes the
     /// canonical ToolSpec schema, semantic contract, authority, or MCP copy.
     pub const fn with_gpt_action_description(mut self, description: &'static str) -> Self {
@@ -971,9 +981,9 @@ impl ToolDefinition {
     }
 
     /// Mark a canonical model-visible tool as incompatible with GPT Actions
-    /// transport while leaving every other model/runtime surface unchanged.
+    /// transport while leaving canonical runtime admission unchanged.
     pub const fn with_gpt_action_unsupported(mut self) -> Self {
-        self.model_surface.gpt_action_exposure = ToolGptActionExposure::Unsupported;
+        self.gpt_action_exposure = ToolGptActionExposure::Unsupported;
         self
     }
 
@@ -998,6 +1008,7 @@ pub const TOOL_CATEGORY_AGENT_WAIT: &str = "agent_wait";
 pub const TOOL_CATEGORY_ARTIFACT: &str = "artifact";
 pub const TOOL_CATEGORY_CHECKPOINT: &str = "checkpoint";
 pub const TOOL_CATEGORY_CODING_AGENT: &str = "coding_agent";
+pub const TOOL_CATEGORY_BROWSER: &str = "browser";
 pub const TOOL_CATEGORY_COMPUTER: &str = "computer";
 pub const TOOL_CATEGORY_COMMUNICATION: &str = "communication";
 pub const TOOL_CATEGORY_CLEANUP: &str = "cleanup";
@@ -1014,6 +1025,7 @@ pub const TOOL_CATEGORY_SESSION: &str = "session";
 pub const TOOL_CATEGORY_VALIDATION: &str = "validation";
 
 pub const PERMISSION_RISK_ARTIFACT_WRITE: &str = "artifact_write";
+pub const PERMISSION_RISK_BROWSER_CONTROL: &str = "browser_control";
 pub const PERMISSION_RISK_DESTRUCTIVE: &str = "destructive";
 pub const PERMISSION_RISK_JOB: &str = "job";
 pub const PERMISSION_RISK_PATCH: &str = "patch";
@@ -1133,9 +1145,11 @@ const fn def(
         name,
         audit,
         model_spec: None,
-        model_surface: ToolModelSurfaceDeclaration::DEFAULT,
+        adaptive_runtime_direct_rank: None,
+        gpt_action_exposure: ToolGptActionExposure::Inherit,
         operator_extension_family: None,
         execution: None,
+        composition: ToolCompositionPolicy::Denied,
         visibility,
         category,
         metadata: make_tool_metadata(
@@ -1155,15 +1169,10 @@ const fn def(
     }
 }
 
-const fn model_spec(
-    definition: ToolDefinition,
-    description: &'static str,
-    input_schema: ToolInputSchemaFactory,
-) -> ToolDefinition {
+const fn model_spec(definition: ToolDefinition, description: &'static str) -> ToolDefinition {
     ToolDefinition {
         model_spec: Some(ToolModelSpecDeclaration {
             description,
-            input_schema,
             gpt_action_description: None,
         }),
         ..definition
@@ -1172,10 +1181,7 @@ const fn model_spec(
 
 const fn adaptive_runtime_direct(definition: ToolDefinition, rank: u16) -> ToolDefinition {
     ToolDefinition {
-        model_surface: ToolModelSurfaceDeclaration {
-            adaptive_runtime_direct_rank: Some(rank),
-            ..definition.model_surface
-        },
+        adaptive_runtime_direct_rank: Some(rank),
         ..definition
     }
 }
@@ -1293,6 +1299,9 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     #[cfg(feature = "workspace-checkpoints")]
     checkpoints::DEFINITIONS,
     coding_agents::DEFINITIONS,
+    #[cfg(feature = "experimental-code-mode")]
+    code_mode::DEFINITIONS,
+    browser::DEFINITIONS,
     computer::DEFINITIONS,
     diagnostics::DEFINITIONS,
     discovery::DEFINITIONS,
@@ -1339,5 +1348,4 @@ const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_reobservable(model_spe
         ToolActivityInteraction::NonMeaningful,
     ),
     "List runtime tools. Full output includes schemas and may be large; use summary_only with category, features, or limit for bounded GPT Action discovery.",
-    list_tools_input_schema,
 ))];

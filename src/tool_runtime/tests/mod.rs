@@ -10,6 +10,10 @@ mod builtin_coding_workflow;
 mod changes;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode_e2b;
 mod coding_task;
 mod coding_task_semantic_navigation;
 mod collaboration;
@@ -27,11 +31,13 @@ mod goals;
 mod handoff;
 mod handoff_brief;
 mod hygiene;
+mod job_terminal_wait;
 mod jobs;
 mod lsp;
 mod memory;
 mod metadata;
 mod observe_jobs;
+mod peer_collaboration;
 mod permission_gate;
 mod process;
 mod read_files;

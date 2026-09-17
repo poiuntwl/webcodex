@@ -1,18 +1,30 @@
 //! Audit-safe argument summaries for runtime tool calls.
 
-#[cfg(test)]
-use super::tool_call::ComputerSnapshotRegion;
-use super::tool_call::{ComputerControlToolCall, ComputerObserveToolCall, ToolCall};
-#[cfg(feature = "workspace-checkpoints")]
-use super::tool_inputs::{is_checkpoint_kind, is_checkpoint_validation_status};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use webcodex_core::audit_preview::{command_preview, process_preview};
 use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_filter};
 use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
+#[cfg(test)]
+use webcodex_tool_contracts::tool_call::ComputerSnapshotRegion;
+use webcodex_tool_contracts::tool_call::{
+    BrowserActToolCall, BrowserObserveToolCall, ComputerControlToolCall, ComputerObserveToolCall,
+    ToolCall,
+};
+#[cfg(feature = "workspace-checkpoints")]
+use webcodex_tool_contracts::tool_inputs::{is_checkpoint_kind, is_checkpoint_validation_status};
 use webcodex_workflow_session::SessionExecutionContext;
 
 pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value) -> Value {
+    let Ok(call) = ToolCall::from_tool_name(tool_name, arguments.clone()) else {
+        // Malformed requests fail closed. Raw input is never filtered, retried,
+        // or used as an audit fallback.
+        return empty_audit_projection();
+    };
+    session_log_arguments_for_typed_call(tool_name, &call)
+}
+
+pub fn session_log_arguments_for_typed_call(tool_name: &str, call: &ToolCall) -> Value {
     let Some(definition) = webcodex_tool_contracts::lookup_tool_definition(tool_name) else {
         return empty_audit_projection();
     };
@@ -25,9 +37,7 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
         return empty_audit_projection();
     }
 
-    let Some(call) = audit_tool_call_from_request(definition, tool_name, arguments) else {
-        return empty_audit_projection();
-    };
+    debug_assert_eq!(call.tool_name(), tool_name);
     let mut projected = call.session_log_arguments();
     if request_policy == webcodex_tool_contracts::ToolAuditRequestPolicy::TypedDropNullValues {
         if let Some(projected) = projected.as_object_mut() {
@@ -39,6 +49,100 @@ pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value
 
 fn empty_audit_projection() -> Value {
     serde_json::json!({})
+}
+
+fn browser_observe_audit_projection(call: &BrowserObserveToolCall) -> Value {
+    serde_json::to_value(call).unwrap_or_else(|_| {
+        serde_json::json!({
+            "action": call.action_name()
+        })
+    })
+}
+
+fn browser_act_audit_projection(call: &BrowserActToolCall) -> Value {
+    match call {
+        BrowserActToolCall::Launch { client_id } => serde_json::json!({
+            "action": "launch",
+            "client_id": client_id,
+        }),
+        BrowserActToolCall::NewPage {
+            client_id,
+            browser_id,
+        } => serde_json::json!({
+            "action": "new_page",
+            "client_id": client_id,
+            "browser_id": browser_id,
+        }),
+        BrowserActToolCall::Navigate {
+            client_id,
+            browser_id,
+            page_id,
+            ..
+        } => serde_json::json!({
+            "action": "navigate",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "url_present": true,
+        }),
+        BrowserActToolCall::Click {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+        } => serde_json::json!({
+            "action": "click",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+        }),
+        BrowserActToolCall::InputText {
+            client_id,
+            browser_id,
+            page_id,
+            element_id,
+            text,
+        } => serde_json::json!({
+            "action": "input_text",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "element_id": element_id,
+            "text_present": true,
+            "text_bytes": text.len(),
+        }),
+        BrowserActToolCall::Key {
+            client_id,
+            browser_id,
+            page_id,
+            key,
+        } => serde_json::json!({
+            "action": "key",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+            "key": key.as_str(),
+        }),
+        BrowserActToolCall::ClosePage {
+            client_id,
+            browser_id,
+            page_id,
+        } => serde_json::json!({
+            "action": "close_page",
+            "client_id": client_id,
+            "browser_id": browser_id,
+            "page_id": page_id,
+        }),
+        BrowserActToolCall::CloseBrowser {
+            client_id,
+            browser_id,
+        } => serde_json::json!({
+            "action": "close_browser",
+            "client_id": client_id,
+            "browser_id": browser_id,
+        }),
+    }
 }
 
 fn computer_observe_audit_projection(call: &ComputerObserveToolCall) -> Value {
@@ -77,35 +181,6 @@ fn computer_control_audit_projection(call: &ComputerControlToolCall) -> Value {
         }
     }
     projection
-}
-
-fn audit_tool_call_from_request(
-    definition: &webcodex_tool_contracts::ToolDefinition,
-    tool_name: &str,
-    arguments: &Value,
-) -> Option<ToolCall> {
-    if let Ok(call) = ToolCall::from_tool_name(tool_name, arguments.clone()) {
-        return Some(call);
-    }
-
-    // Audit happens before the authoritative concrete parser so pre-execution
-    // denials can still be recorded. For model-visible tools, retry after
-    // dropping undeclared top-level fields using the canonical ToolDefinition
-    // schema. This preserves existing privacy summaries for malformed requests
-    // without ever persisting the unknown fields themselves.
-    let schema = definition.model_spec?.input_schema;
-    let schema = schema();
-    let allowed = schema.get("properties")?.as_object()?;
-    let source = arguments.as_object()?;
-    let filtered = source
-        .iter()
-        .filter(|(key, _)| allowed.contains_key(*key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<serde_json::Map<_, _>>();
-    if filtered.len() == source.len() {
-        return None;
-    }
-    ToolCall::from_tool_name(tool_name, Value::Object(filtered)).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -997,6 +1072,12 @@ pub fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Value {
             project_declared_result_fields(fields, output)
         }
         webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::BrowserObservation,
+        ) => browser_observation_result_audit(output),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
+            webcodex_tool_contracts::ToolAuditSemanticResultPolicy::BrowserControl,
+        ) => browser_control_result_audit(output),
+        webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
             webcodex_tool_contracts::ToolAuditSemanticResultPolicy::ComputerObservation,
         ) => computer_observation_result_audit(output),
         webcodex_tool_contracts::ToolAuditResultPolicy::Semantic(
@@ -1094,6 +1175,55 @@ fn copy_existing_audit_value(
     if let Some(value) = output.get(key) {
         projected.insert(key.to_string(), value.clone());
     }
+}
+
+fn browser_observation_result_audit(output: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    for key in [
+        "execution_state",
+        "state_changed",
+        "error_kind",
+        "count",
+        "total_count",
+        "truncated",
+        "browser_id",
+        "page_id",
+        "snapshot_generation",
+        "node_count",
+        "mime_type",
+        "width",
+        "height",
+        "file_bytes",
+        "sha256",
+    ] {
+        copy_existing_audit_value(&mut projected, output, key);
+    }
+    for (source, target) in [
+        ("targets", "target_count"),
+        ("browsers", "browser_count"),
+        ("pages", "page_count"),
+        ("nodes", "projected_node_count"),
+    ] {
+        if let Some(count) = output.get(source).and_then(Value::as_array).map(Vec::len) {
+            projected.insert(target.to_string(), Value::from(count));
+        }
+    }
+    Value::Object(projected)
+}
+
+fn browser_control_result_audit(output: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    for key in [
+        "execution_state",
+        "state_changed",
+        "error_kind",
+        "browser_id",
+        "page_id",
+        "page_count",
+    ] {
+        copy_existing_audit_value(&mut projected, output, key);
+    }
+    Value::Object(projected)
 }
 
 fn computer_observation_result_audit(output: &Value) -> Value {
@@ -1837,6 +1967,80 @@ mod computer_privacy_tests {
     }
 
     #[test]
+    fn job_terminal_continuation_app_audit_omits_binding_and_private_message() {
+        let wait_id = "wc_job_wait_q6urq6urq6urq6ur";
+        let binding_id = format!(
+            "wc_host_binding_{}",
+            webcodex_core::compact::encode([0xc1; 16])
+        );
+        let attempt_id = format!(
+            "wc_job_delivery_{}",
+            webcodex_core::compact::encode([0xc2; 12])
+        );
+        let prepare_input = json!({
+            "wait_id": wait_id,
+            "binding_id": binding_id
+        });
+        let prepare_args = session_log_arguments_for_tool_request(
+            "job_terminal_continuation_prepare",
+            &prepare_input,
+        );
+        let prepare_args_text = serde_json::to_string(&prepare_args).unwrap();
+        assert_eq!(prepare_args["wait_id"], wait_id);
+        assert!(!prepare_args_text.contains(&binding_id));
+        assert!(!prepare_args_text.contains("binding_id"));
+        assert!(!prepare_args_text.contains("attempt_id"));
+
+        let finish_input = json!({
+            "wait_id": wait_id,
+            "binding_id": binding_id,
+            "attempt_id": attempt_id,
+            "outcome": "dispatch_accepted"
+        });
+        let finish_args = session_log_arguments_for_tool_request(
+            "job_terminal_continuation_finish",
+            &finish_input,
+        );
+        let finish_args_text = serde_json::to_string(&finish_args).unwrap();
+        assert_eq!(finish_args["wait_id"], wait_id);
+        assert_eq!(finish_args["attempt_id"], attempt_id);
+        assert_eq!(finish_args["outcome"], "dispatch_accepted");
+        assert!(!finish_args_text.contains(&binding_id));
+        assert!(!finish_args_text.contains("binding_id"));
+
+        let result = json!({
+            "wait_id": wait_id,
+            "job_id": "wc_job_private",
+            "delivery_state": "prepared",
+            "attempt_id": attempt_id,
+            "dispatch_observation": "dispatch_prepared",
+            "state_changed": true,
+            "app_protocol": {
+                "automatic_message": "PRIVATE MESSAGE BODY /private/path TOKEN=secret",
+                "binding_id": binding_id
+            }
+        });
+        let projected = session_log_result_for_tool("job_terminal_continuation_prepare", &result);
+        let projected_text = serde_json::to_string(&projected).unwrap();
+        assert_eq!(projected["wait_id"], wait_id);
+        assert_eq!(projected["attempt_id"], attempt_id);
+        assert_eq!(projected["dispatch_observation"], "dispatch_prepared");
+        for forbidden in [
+            "PRIVATE MESSAGE BODY",
+            "/private/path",
+            "TOKEN=secret",
+            "automatic_message",
+            "app_protocol",
+            "binding_id",
+        ] {
+            assert!(
+                !projected_text.contains(forbidden),
+                "Job terminal App audit leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn computer_application_list_ledger_omits_names_ids_and_native_identity() {
         let output = json!({
             "applications": [{
@@ -2230,8 +2434,7 @@ mod computer_privacy_tests {
                 "idempotency_key": PRIVATE_KEY
             }),
         );
-        assert_eq!(request["consume_token_present"], true);
-        assert_eq!(request["expected_controller_generation"], 7);
+        assert_eq!(request, json!({}));
         let typed_request = ToolCall::ConsumeAgentWake {
             agent_id: "wc_dagent_iavN7wEjRWeJq83v".to_string(),
             endpoint_id: "wc_endpoint_iavN7wEjRWeJq83v".to_string(),
@@ -2241,6 +2444,7 @@ mod computer_privacy_tests {
         }
         .session_log_arguments();
         assert_eq!(typed_request["consume_token_present"], true);
+        assert_eq!(typed_request["expected_controller_generation"], 7);
         assert!(!typed_request.to_string().contains(PRIVATE_TOKEN));
         let request_text = request.to_string();
         for private in [
@@ -2436,9 +2640,7 @@ mod computer_privacy_tests {
                 "body": private_body,
             }),
         );
-        assert_eq!(purge_args["memory_scope_id"], scope_id);
-        assert_eq!(purge_args["expected_catalog_revision"], catalog_revision);
-        assert!(purge_args.get("confirm").is_none());
+        assert_eq!(purge_args, json!({}));
         assert!(!purge_args.to_string().contains(private_body));
         let typed_purge = ToolCall::MemoryScopePurge {
             memory_scope_id: scope_id.clone(),
@@ -2447,6 +2649,8 @@ mod computer_privacy_tests {
         }
         .session_log_arguments();
         assert!(typed_purge.get("confirm").is_none());
+        assert_eq!(typed_purge["memory_scope_id"], scope_id);
+        assert_eq!(typed_purge["expected_catalog_revision"], catalog_revision);
 
         let scope_list = session_log_result_for_tool(
             "memory_scope_list",
@@ -2557,8 +2761,15 @@ mod computer_privacy_tests {
             "global_x": -1920
         });
         let request_summary = session_log_arguments_for_tool_request("computer_observe", &request);
-        assert_eq!(request_summary["display_id"], display_id);
-        assert!(request_summary.get("global_x").is_none());
+        assert_eq!(request_summary, json!({}));
+        let typed_request = ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
+            client_id: "msi".to_string(),
+            display_id: display_id.to_string(),
+            max_width: Some(1024),
+            max_height: Some(768),
+        })
+        .session_log_arguments();
+        assert_eq!(typed_request["display_id"], display_id);
 
         let output = json!({
             "display_id": display_id,
@@ -2600,8 +2811,13 @@ mod computer_privacy_tests {
         });
         let read_request_summary =
             session_log_arguments_for_tool_request("computer_observe", &read_request);
+        assert_eq!(read_request_summary, json!({}));
+        let typed_read = ToolCall::ComputerObserve(ComputerObserveToolCall::ReadClipboard {
+            client_id: "msi".to_string(),
+        })
+        .session_log_arguments();
         assert_eq!(
-            read_request_summary,
+            typed_read,
             json!({"action":"read_clipboard", "client_id":"msi"})
         );
 
@@ -2614,12 +2830,15 @@ mod computer_privacy_tests {
         });
         let write_request_summary =
             session_log_arguments_for_tool_request("computer_control", &write_request);
-        assert_eq!(write_request_summary["client_id"], "msi");
-        assert_eq!(write_request_summary["text_bytes"], PRIVATE_TEXT.len());
-        let request_serialized = serde_json::to_string(&write_request_summary).unwrap();
-        for secret in [PRIVATE_TEXT, "PRIVATE_CLIPBOARD_HASH", "PRIVATE_HGLOBAL"] {
-            assert!(!request_serialized.contains(secret));
-        }
+        assert_eq!(write_request_summary, json!({}));
+        let typed_write = ToolCall::ComputerControl(ComputerControlToolCall::WriteClipboard {
+            client_id: "msi".to_string(),
+            text: PRIVATE_TEXT.to_string(),
+        })
+        .session_log_arguments();
+        assert_eq!(typed_write["client_id"], "msi");
+        assert_eq!(typed_write["text_bytes"], PRIVATE_TEXT.len());
+        assert!(!typed_write.to_string().contains(PRIVATE_TEXT));
 
         let read_output = json!({
             "available": true,
@@ -2684,13 +2903,19 @@ mod computer_privacy_tests {
             "native_identity": "PRIVATE_NATIVE_ID"
         });
         let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
-        let request_serialized = serde_json::to_string(&request_summary).unwrap();
-        assert_eq!(request_summary["display_id"], display_id);
-        assert_eq!(request_summary["snapshot_generation"], 11);
-        assert_eq!(request_summary["x"], 321);
-        assert_eq!(request_summary["y"], 654);
-        assert!(!request_serialized.contains("global_x"));
-        assert!(!request_serialized.contains("PRIVATE_NATIVE_ID"));
+        assert_eq!(request_summary, json!({}));
+        let typed_request = ToolCall::ComputerControl(ComputerControlToolCall::PointerClick {
+            client_id: "msi".to_string(),
+            display_id: display_id.to_string(),
+            snapshot_generation: 11,
+            x: 321,
+            y: 654,
+        })
+        .session_log_arguments();
+        assert_eq!(typed_request["display_id"], display_id);
+        assert_eq!(typed_request["snapshot_generation"], 11);
+        assert_eq!(typed_request["x"], 321);
+        assert_eq!(typed_request["y"], 654);
 
         let output = json!({
             "display_id": display_id,
@@ -3022,11 +3247,16 @@ mod computer_privacy_tests {
             "keycode": 123
         });
         let request_summary = session_log_arguments_for_tool_request("computer_control", &request);
-        let request_serialized = serde_json::to_string(&request_summary).unwrap();
-        assert_eq!(request_summary["key"], "tab");
-        assert_eq!(request_summary["modifiers"], json!(["shift"]));
-        assert!(!request_serialized.contains("MUST_NOT_PERSIST"));
-        assert!(request_summary.get("keycode").is_none());
+        assert_eq!(request_summary, json!({}));
+        let typed_request = ToolCall::ComputerControl(ComputerControlToolCall::Key {
+            client_id: "mini".to_string(),
+            surface_id: "surface_safe".to_string(),
+            key: "tab".to_string(),
+            modifiers: Some(vec!["shift".to_string()]),
+        })
+        .session_log_arguments();
+        assert_eq!(typed_request["key"], "tab");
+        assert_eq!(typed_request["modifiers"], json!(["shift"]));
 
         let output = json!({
             "platform": "macos",
@@ -3253,14 +3483,29 @@ mod computer_privacy_tests {
         });
         let request_summary =
             session_log_arguments_for_tool_request("coding_agent_start", &request);
-        let request_serialized = serde_json::to_string(&request_summary).unwrap();
-        assert_eq!(request_summary["instruction_bytes"], PROMPT.len());
-        assert_eq!(request_summary["config_count"], 1);
-        assert_eq!(request_summary["idempotency_key_present"], true);
+        assert_eq!(request_summary, json!({}));
+
+        let typed_request = ToolCall::CodingAgentStart {
+            project: "agent:special:demo".to_string(),
+            provider_id: "codex".to_string(),
+            idempotency_key: IDEMPOTENCY.to_string(),
+            instruction: PROMPT.to_string(),
+            config: Some(std::collections::BTreeMap::from([(
+                "mode".to_string(),
+                webcodex_core::coding_agent::CodingAgentConfigValue::String("agent".to_string()),
+            )])),
+            timeout_secs: Some(60),
+            recording_session_id: Some("wc_sess_safe".to_string()),
+        }
+        .session_log_arguments();
+        let request_serialized = serde_json::to_string(&typed_request).unwrap();
+        assert_eq!(typed_request["instruction_bytes"], PROMPT.len());
+        assert_eq!(typed_request["config_count"], 1);
+        assert_eq!(typed_request["idempotency_key_present"], true);
         assert!(!request_serialized.contains(PROMPT));
         assert!(!request_serialized.contains(IDEMPOTENCY));
         assert!(!request_serialized.contains("agent\""));
-        assert!(request_summary.get("recording_session_id").is_none());
+        assert!(typed_request.get("recording_session_id").is_none());
         assert!(!request_serialized.contains("wc_sess_safe"));
 
         let observe_request = json!({
@@ -3307,9 +3552,139 @@ mod computer_privacy_tests {
     }
 }
 
-impl ToolCall {
-    pub fn session_log_arguments(&self) -> Value {
+#[cfg(test)]
+mod browser_privacy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn browser_effect_request_audit_drops_sensitive_text_and_url() {
+        let text_secret = "PASSWORD_SECRET_123";
+        let text = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"input_text",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "element_id":"element_abcdefghijklmnop",
+                "text": text_secret
+            }),
+        );
+        assert_eq!(text["text_present"], true);
+        assert_eq!(text["text_bytes"], text_secret.len());
+        let serialized = serde_json::to_string(&text).unwrap();
+        assert!(!serialized.contains(text_secret));
+        assert!(text.get("text").is_none());
+
+        let private_url = "https://example.test/path?token=URL_QUERY_SECRET";
+        let navigate = session_log_arguments_for_tool_request(
+            "browser_act",
+            &json!({
+                "action":"navigate",
+                "client_id":"msi",
+                "browser_id":"browser_abcdefghijklmnop",
+                "page_id":"page_abcdefghijklmnop",
+                "url": private_url
+            }),
+        );
+        assert_eq!(navigate["url_present"], true);
+        assert!(!serde_json::to_string(&navigate)
+            .unwrap()
+            .contains(private_url));
+        assert!(navigate.get("url").is_none());
+    }
+
+    #[test]
+    fn browser_observation_audit_keeps_only_bounded_metadata() {
+        let output = json!({
+            "execution_state":"completed",
+            "state_changed":false,
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "node_count":1,
+            "pages":[{"title":"PAGE_BODY_SECRET","url":"https://example.test/?secret=QUERY_SECRET"}],
+            "nodes":[{"role":"textbox","name":"AX_BODY_SECRET","value":"FORM_VALUE_SECRET","element_id":"element_abcdefghijklmnop"}],
+            "content_base64":"BASE64_IMAGE_SECRET",
+            "raw_dom":"RAW_DOM_SECRET",
+            "raw_ax":"RAW_AX_SECRET",
+            "debugger_url":"DEBUGGER_SECRET"
+        });
+        let projected = session_log_result_for_tool("browser_observe", &output);
+        assert_eq!(projected["node_count"], 1);
+        assert_eq!(projected["page_count"], 1);
+        assert_eq!(projected["projected_node_count"], 1);
+        let serialized = serde_json::to_string(&projected).unwrap();
+        for private in [
+            "PAGE_BODY_SECRET",
+            "QUERY_SECRET",
+            "AX_BODY_SECRET",
+            "FORM_VALUE_SECRET",
+            "BASE64_IMAGE_SECRET",
+            "RAW_DOM_SECRET",
+            "RAW_AX_SECRET",
+            "DEBUGGER_SECRET",
+        ] {
+            assert!(!serialized.contains(private), "audit leaked {private}");
+        }
+        assert!(projected.get("pages").is_none());
+        assert!(projected.get("nodes").is_none());
+        assert!(projected.get("content_base64").is_none());
+    }
+
+    #[test]
+    fn browser_control_result_audit_drops_page_text_and_url() {
+        let output = json!({
+            "execution_state":"completed",
+            "state_changed":true,
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "title":"PRIVATE_TITLE",
+            "url":"https://example.test/?secret=PRIVATE_QUERY",
+            "value":"PRIVATE_FORM_VALUE"
+        });
+        let projected = session_log_result_for_tool("browser_act", &output);
+        let serialized = serde_json::to_string(&projected).unwrap();
+        for private in ["PRIVATE_TITLE", "PRIVATE_QUERY", "PRIVATE_FORM_VALUE"] {
+            assert!(!serialized.contains(private));
+        }
+    }
+}
+
+/// Audit-safe projection over the canonical typed request.
+///
+/// This policy intentionally remains outside the structural input contract: it
+/// consumes ToolCall but never reparses raw request JSON or defines accepted fields.
+pub trait ToolCallAuditProjection {
+    fn session_log_arguments(&self) -> Value;
+}
+
+impl ToolCallAuditProjection for ToolCall {
+    fn session_log_arguments(&self) -> Value {
         match self {
+            #[cfg(feature = "experimental-code-mode")]
+            Self::CodeModeExec {
+                project,
+                source,
+                timeout_ms,
+                ..
+            }
+            | Self::CodeModeExecEffectful {
+                project,
+                source,
+                timeout_ms,
+                ..
+            }
+            | Self::CodeModeExecMutating {
+                project,
+                source,
+                timeout_ms,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "source_bytes": source.len(),
+                "timeout_ms": timeout_ms,
+            }),
             Self::RunProcess {
                 project,
                 executable,
@@ -3494,6 +3869,8 @@ impl ToolCall {
                 "session_id": session_id,
                 "shell_id": shell_id,
             }),
+            Self::BrowserObserve(call) => browser_observe_audit_projection(call),
+            Self::BrowserAct(call) => browser_act_audit_projection(call),
             Self::ComputerObserve(call) => computer_observe_audit_projection(call),
             Self::ComputerControl(call) => computer_control_audit_projection(call),
             Self::ComputerSaveSnapshot {
@@ -3542,6 +3919,26 @@ impl ToolCall {
                 "tail_lines": tail_lines,
                 "wait_secs": wait_secs,
                 "wake_on": wake_on,
+            }),
+            Self::WaitForJobTerminal { job_id, .. } => serde_json::json!({
+                "job_id": job_id,
+            }),
+            Self::PresentJobTerminalContinuation { wait_id }
+            | Self::JobTerminalContinuationBind { wait_id, .. }
+            | Self::JobTerminalContinuationState { wait_id, .. }
+            | Self::JobTerminalContinuationPrepare { wait_id, .. }
+            | Self::JobTerminalContinuationUnbind { wait_id, .. } => serde_json::json!({
+                "wait_id": wait_id,
+            }),
+            Self::JobTerminalContinuationFinish {
+                wait_id,
+                attempt_id,
+                outcome,
+                ..
+            } => serde_json::json!({
+                "wait_id": wait_id,
+                "attempt_id": attempt_id,
+                "outcome": outcome,
             }),
             Self::ApplyUnifiedDiff {
                 project,
@@ -4886,6 +5283,22 @@ impl ToolCall {
                 "body_bytes": message.len(),
                 "tags_count": tags.len(),
                 "reply_to": reply_to,
+                "priority": priority,
+                "requires_ack": requires_ack,
+            }),
+            Self::PostPeerMessage {
+                peer_id,
+                kind,
+                message,
+                tags,
+                priority,
+                requires_ack,
+            } => serde_json::json!({
+                "peer_id": peer_id,
+                "kind": kind,
+                "body_present": !message.is_empty(),
+                "body_bytes": message.len(),
+                "tags_count": tags.len(),
                 "priority": priority,
                 "requires_ack": requires_ack,
             }),

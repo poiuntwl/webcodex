@@ -25,12 +25,8 @@ pub(crate) fn public_url() -> String {
 }
 
 #[handler]
-pub async fn openapi_json(depot: &mut Depot, res: &mut Response) {
-    let spec = match crate::connector_runtime::http::runtime(depot) {
-        Some(_) => crate::connector_runtime::surface::build_openapi_spec(public_url()),
-        None => build_openapi_spec(),
-    };
-    res.render(Json(spec));
+pub async fn openapi_json(res: &mut Response) {
+    res.render(Json(build_openapi_spec()));
 }
 
 pub(crate) fn build_openapi_spec() -> Value {
@@ -493,7 +489,7 @@ mod tests {
             schema["properties"]["action"]["enum"],
             json!(["metadata", "inspect"])
         );
-        assert_eq!(schema["allOf"].as_array().unwrap().len(), 2);
+        assert!(schema.get("allOf").is_none());
         let serialized = serde_json::to_string(schema).unwrap();
         assert!(!serialized.contains("\"image\""));
         assert!(!serialized.contains("\"export\""));

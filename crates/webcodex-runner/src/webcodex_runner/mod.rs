@@ -1,4 +1,5 @@
 pub(crate) mod artifacts;
+pub(crate) mod browser;
 #[cfg(feature = "workspace-checkpoints")]
 pub(crate) mod checkpoints;
 pub(crate) mod coding_agent;
@@ -42,6 +43,7 @@ pub(crate) mod validation;
 pub(crate) use artifacts::handle_artifact_file_operation;
 #[cfg(test)]
 pub(crate) use artifacts::is_artifact_request_kind;
+pub(crate) use browser::handle_browser_operation;
 #[cfg(feature = "workspace-checkpoints")]
 pub(crate) use checkpoints::handle_checkpoint_file_request;
 #[cfg(all(test, feature = "workspace-checkpoints"))]
@@ -89,7 +91,9 @@ pub(crate) use projects::{
 pub(crate) use projects::{
     parse_runner_project_toml, runner_project_summary, validate_project_path_policy,
 };
-pub(crate) use runner_skills::handle_runner_skill_request;
+pub(crate) use runner_skills::{
+    handle_runner_skill_request, run_skill_resource_with_profiles_and_execution_state,
+};
 pub(crate) use shell::{
     configured_prepared_shell_job_command, configured_shell_job_command,
     configured_validation_job_command, cwd_allowed, prepare_detached_process_launch,

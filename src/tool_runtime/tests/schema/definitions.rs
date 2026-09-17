@@ -28,9 +28,12 @@ fn git_diff_hunks_rejects_unknown_legacy_fields_compactly() {
         }),
     )
     .unwrap_err();
-    assert!(error.contains("unknown field(s)"), "{error}");
-    assert!(error.contains("mode"), "{error}");
-    assert!(error.contains("max_lines_per_hunk"), "{error}");
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(
+        error.contains("mode") || error.contains("max_lines_per_hunk"),
+        "{error}"
+    );
+    assert!(error.contains("max_hunk_lines"), "{error}");
     assert!(
         !error.contains("properties"),
         "must not dump JSON Schema: {error}"
@@ -97,6 +100,11 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
         "agent_continuation_wake_finish",
         "agent_continuation_unbind",
         "agent_wait_state",
+        "job_terminal_continuation_bind",
+        "job_terminal_continuation_state",
+        "job_terminal_continuation_prepare",
+        "job_terminal_continuation_finish",
+        "job_terminal_continuation_unbind",
         "read_tool_trace",
         "skill_list",
         "skill_read_file",

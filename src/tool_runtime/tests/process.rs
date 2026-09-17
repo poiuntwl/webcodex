@@ -251,7 +251,8 @@ async fn dispatch_typed_process_until_request(
     crate::runner_protocol::RunnerRequest,
 ) {
     let (call, metadata) =
-        ToolCall::from_tool_name_with_recorder_metadata("run_process", arguments).unwrap();
+        crate::tool_runtime::parse_tool_call_with_recorder_metadata("run_process", arguments)
+            .unwrap();
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2350,9 +2351,11 @@ async fn run_process_shell_command_mode_recovery_is_lossless_parser_ready_and_pr
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            let (call, metadata) =
-                ToolCall::from_tool_name_with_recorder_metadata("run_process", arguments.clone())
-                    .unwrap();
+            let (call, metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
+                "run_process",
+                arguments.clone(),
+            )
+            .unwrap();
             let result = runtime
                 .dispatch_with_auth_transport_options_and_metadata(
                     call,

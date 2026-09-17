@@ -250,13 +250,12 @@ async fn mcp_import_runtime(
     root: &std::path::Path,
     owner: Option<&str>,
 ) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
-    mcp_import_runtime_with_surface(root, owner, ModelSurface::FullOperatorRuntime).await
+    mcp_import_runtime_inner(root, owner).await
 }
 
-async fn mcp_import_runtime_with_surface(
+async fn mcp_import_runtime_inner(
     root: &std::path::Path,
     owner: Option<&str>,
-    model_surface: ModelSurface,
 ) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
     use crate::runner_protocol::{RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest};
     let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
@@ -310,10 +309,9 @@ async fn mcp_import_runtime_with_surface(
         }],
     )
     .await;
-    let runtime = Arc::new(
-        ToolRuntime::new_for_tests_with_runner_registry(registry.clone())
-            .with_model_surface(model_surface),
-    );
+    let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
+        registry.clone(),
+    ));
     (runtime, registry)
 }
 
@@ -789,12 +787,7 @@ async fn adaptive_gateway_file_import_preserves_target_aware_host_trust_impl() {
         seed_mcp_import_client(&db, &user, "ChatGPT WebCodex", MCP_IMPORT_TRUSTED_REDIRECT);
     let token = seed_oauth_access_token(&db, &client, &user, "project:write");
     let project_tmp = tempfile::tempdir().unwrap();
-    let (runtime, _registry) = mcp_import_runtime_with_surface(
-        project_tmp.path(),
-        Some("alice"),
-        ModelSurface::AdaptiveRuntime,
-    )
-    .await;
+    let (runtime, _registry) = mcp_import_runtime_inner(project_tmp.path(), Some("alice")).await;
     let service = Service::new(build_test_router(
         mcp_import_config(&[client.client_id.as_str()]),
         db,
@@ -890,6 +883,24 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
     let service = Service::new(build_test_router(config, db, runtime));
     let agent = tokio::spawn(complete_mcp_import_save(registry, pptx.clone()));
     let temporary_url = "https://download.example/temporary-secret-token/stateless-import.pptx";
+    let forged_provenance_error = crate::tool_runtime::ToolCall::from_tool_name(
+        "import_conversation_files_to_project",
+        json!({
+            "project": "agent:importer:demo",
+            "openaiFileIdRefs": [{
+                "download_url": temporary_url,
+                "file_id": "file_stateless_host_rewritten",
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "file_name": "source.pptx"
+            }],
+            "host_file_import_provenance": "GptActionOpenAiHost"
+        }),
+    )
+    .expect_err("caller-controlled host provenance must fail closed at the canonical parser");
+    assert!(
+        forged_provenance_error.contains("unknown field `host_file_import_provenance`"),
+        "{forged_provenance_error}"
+    );
     let (status, body, _) = oauth_mcp_request(
         &service,
         &token,
@@ -906,8 +917,7 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
                 }],
                 "output_dir": "paper/export",
                 "targets": ["stateless-import.pptx"],
-                "overwrite": false,
-                "host_file_import_provenance": "GptActionOpenAiHost"
+                "overwrite": false
             }
         })),
     )

@@ -101,7 +101,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
     let assertion_name = "direct run job validation";
     let expected_identity =
         crate::tool_runtime::tool_audit::assertion_validation_identity(assertion_name);
-    let (call, recorder_metadata) = ToolCall::from_tool_name_with_recorder_metadata(
+    let (call, recorder_metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
         "run_job",
         json!({
             "project": project,
@@ -216,7 +216,7 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
     let assertion_name = "promoted process validation";
     let expected_identity =
         crate::tool_runtime::tool_audit::assertion_validation_identity(assertion_name);
-    let (call, recorder_metadata) = ToolCall::from_tool_name_with_recorder_metadata(
+    let (call, recorder_metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
         "run_process",
         json!({
             "project": project,

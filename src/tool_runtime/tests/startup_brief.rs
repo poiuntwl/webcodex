@@ -137,7 +137,7 @@ fn assert_builtin_workflow(output: &Value) {
     assert!(message_ack_guidance.contains("session_attention"));
     assert!(message_ack_guidance.contains("requires_ack"));
     assert!(message_ack_guidance.contains("ack_session_message_ids"));
-    assert!(message_ack_guidance.contains("request-scoped model-context proof"));
+    assert!(message_ack_guidance.contains("model-context retention"));
     assert!(message_ack_guidance.contains("resolves messages"));
     assert!(message_ack_guidance.contains("grants authority"));
     assert!(message_ack_guidance.contains("gates execution"));
@@ -218,12 +218,10 @@ fn assert_builtin_workflow(output: &Value) {
     let closeout_guidance = workflow["model_protocol"]["normal_closeout"]
         .as_str()
         .expect("normal closeout guidance");
+    assert!(closeout_guidance.contains("Source/validation/open evidence"));
     assert!(closeout_guidance.contains("finish_coding_task(summary_only=true)"));
-    assert!(closeout_guidance.contains("source implementation"));
-    assert!(closeout_guidance.contains("Pure read-only, planning, investigation, or artifact work"));
+    assert!(closeout_guidance.contains("Read/planning/artifact"));
     assert!(closeout_guidance.contains("finalize directly"));
-    assert!(closeout_guidance.contains("project rules require closeout"));
-    assert!(closeout_guidance.contains("full closeout only"));
     let roles = workflow["roles"]
         .as_object()
         .expect("workflow roles object");
@@ -1459,9 +1457,9 @@ async fn worst_case_startup_with_huge_repository_stays_below_hard_limit() {
         )
         .unwrap();
     }
-    for cmd in ["git add -A", "git commit -m 'seed worst-case repo'"] {
+    for cmd in ["git add -A", "git commit -q -m 'seed worst-case repo'"] {
         let (exit_code, stdout, stderr, _) =
-            crate::tool_runtime::helpers::run_command_sync(cmd, root.path(), 30);
+            crate::tool_runtime::helpers::run_command_sync(cmd, root.path(), 5);
         assert_eq!(exit_code, 0, "{stdout}{stderr}");
     }
 

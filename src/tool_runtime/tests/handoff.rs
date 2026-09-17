@@ -3806,7 +3806,7 @@ async fn call_typed_tool_with_metadata(
     auth: Option<&AuthContext>,
 ) -> ToolResult {
     let (call, metadata) =
-        ToolCall::from_tool_name_with_recorder_metadata(tool_name, arguments).unwrap();
+        crate::tool_runtime::parse_tool_call_with_recorder_metadata(tool_name, arguments).unwrap();
     runtime
         .dispatch_with_auth_transport_options_and_metadata(
             call,

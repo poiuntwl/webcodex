@@ -1,10 +1,10 @@
 use serde_json::{json, Value};
 
-use super::super::input_schemas::session_execution_context_schema;
 use super::common::{
     array_schema, continuation_feedback_schema, evidence_history_schema, evidence_integrity_schema,
     handoff_brief_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
-    permission_summary_schema, schema_type, task_outcome_schema, wrapped_output_schema,
+    permission_summary_schema, schema_type, session_execution_context_schema, task_outcome_schema,
+    wrapped_output_schema,
 };
 #[cfg(any(test, feature = "root-test-support"))]
 use super::common::{
@@ -19,6 +19,18 @@ use webcodex_core::runtime_contract::{
     BUILTIN_CODING_WORKFLOW_CONTRACT, BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS,
     BUILTIN_CODING_WORKFLOW_VERSION,
 };
+
+fn finish_changes_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "show_changes output and hunk truncation metadata. The nested show_changes contract is formalized so structured recovery calls remain model-surface projectable; other closeout metadata stays additive.",
+        "properties": {
+            "show_changes": super::git::show_changes_output_value_schema(),
+            "hunks_truncated": schema_type("boolean", "Whether the nested show_changes diff hunks were truncated by limits.")
+        },
+        "additionalProperties": true
+    })
+}
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -50,10 +62,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "workspace",
                 open_object_schema("Workspace cleanliness, changed file count, and warnings."),
             ),
-            (
-                "changes",
-                open_object_schema("show_changes output and hunk truncation metadata."),
-            ),
+            ("changes", finish_changes_schema()),
             (
                 "validation",
                 open_object_schema("Validation closeout evidence. Full closeout preserves bounded historical/resolved/unresolved evidence by stable identity and adds current_evidence for the current attempt after the latest trusted material content change. summary_only keeps final status/reason, historical and current success/failure counts, resolved/unresolved counts, current_status/stale_failure_count, and the zero-test integrity flag."),

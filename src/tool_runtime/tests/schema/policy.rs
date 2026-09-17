@@ -12,6 +12,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::StructuredProcess,
         ),
         (
+            "run_skill_resource",
+            ToolRisk::JobRun,
+            RunnerCapabilityRequirement::SkillResourceExecution,
+        ),
+        (
             "run_detached_process",
             ToolRisk::JobRun,
             RunnerCapabilityRequirement::DetachedProcess,
@@ -178,6 +183,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
         ),
         (
             "read_files",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::FileRead,
+        ),
+        (
+            "skill_load",
             ToolRisk::Read,
             RunnerCapabilityRequirement::FileRead,
         ),

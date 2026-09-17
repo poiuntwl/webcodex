@@ -110,7 +110,6 @@ pub struct ToolRuntime {
     pub(crate) ssh_resource_gateway: Arc<crate::ssh_resource_gateway::SshResourceGatewayRuntime>,
     pub(crate) coding_agent_runs: Arc<super::coding_agent::CodingAgentServerState>,
     pub runtime_info: Arc<RuntimeInfo>,
-    runtime_exposure: crate::model_surface::RuntimeExposure,
     #[cfg(feature = "workspace-checkpoints")]
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
     pub(crate) sessions: sessions::SessionStore,
@@ -120,6 +119,11 @@ pub struct ToolRuntime {
     /// Process-local model-facing handles for exact full-file read snapshots.
     /// Clones share the registry; a Server runtime restart creates a new epoch.
     pub(crate) read_revisions: Arc<super::read_revisions::ReadRevisionRegistry>,
+    /// Process-local Project mutation serialization used only by orchestration
+    /// frontends. Direct first-class mutations deliberately bypass this registry.
+    #[cfg(feature = "experimental-code-mode")]
+    pub(crate) orchestration_mutation_fences:
+        Arc<super::orchestration_host::OrchestrationMutationFenceRegistry>,
     /// One deadline shared by every item in a `read_files` batch.
     pub(crate) read_files_deadline: Duration,
     /// One deadline shared by every query in a `search_project_texts` batch.
@@ -153,9 +157,8 @@ pub struct ToolRuntime {
     /// Sink for the workspace activity ledger (mutating tool executions).
     /// No-op unless the host injects a durable recorder.
     pub(crate) activity: Arc<dyn ActivityRecorder>,
-    /// Cross-surface connection observations (connector endpoint activity,
-    /// last successful meaningful tool call). Shared with the connector
-    /// runtime; never stores payloads or secrets.
+    /// Bounded connection/runtime observations such as endpoint activity and
+    /// last successful meaningful tool call. Never stores payloads or secrets.
     pub(crate) observations: Arc<RuntimeObservations>,
     /// Process-local payload-free view of currently in-flight MCP Window
     /// requests. It is observability only and intentionally resets on restart.
@@ -174,6 +177,15 @@ pub struct ToolRuntime {
     /// AgentTask, and Goal state share this Server SQLite handle while remaining
     /// independent tables, lifecycles, and authority domains.
     pub(crate) communication_db: Option<Arc<crate::Database>>,
+    /// Dedicated generic Job-terminal-attention store. This is intentionally
+    /// independent of Durable Agent communication identity.
+    pub(crate) job_terminal_db: Option<Arc<crate::Database>>,
+    /// Process-local Host delivery seam for already-durable terminal events.
+    pub(crate) job_terminal_continuations:
+        Option<crate::job_terminal_attention::JobTerminalContinuationController>,
+    #[cfg(test)]
+    pub(crate) job_terminal_registration_test_hook:
+        Option<crate::tool_runtime::job_terminal_wait::JobTerminalRegistrationTestHook>,
     /// Optional process-local Host continuation registry/controller. It is
     /// created only when the durable communication database is injected and is
     /// intentionally empty again after process restart.
@@ -191,9 +203,6 @@ impl ToolRuntime {
             ),
             coding_agent_runs: Arc::new(super::coding_agent::CodingAgentServerState::default()),
             runtime_info,
-            runtime_exposure: crate::model_surface::RuntimeExposure::Runtime(
-                crate::model_surface::ModelSurface::LocalCoding,
-            ),
             #[cfg(feature = "workspace-checkpoints")]
             checkpoint_store: checkpoint::CheckpointStore::default(),
             sessions: sessions::SessionStore::default(),
@@ -203,6 +212,10 @@ impl ToolRuntime {
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
             read_revisions: Arc::new(super::read_revisions::ReadRevisionRegistry::new()),
+            #[cfg(feature = "experimental-code-mode")]
+            orchestration_mutation_fences: Arc::new(
+                super::orchestration_host::OrchestrationMutationFenceRegistry::default(),
+            ),
             read_files_deadline: super::read_files::DEFAULT_READ_FILES_DEADLINE,
             search_project_texts_deadline:
                 super::search_project_texts::DEFAULT_SEARCH_PROJECT_TEXTS_DEADLINE,
@@ -224,34 +237,12 @@ impl ToolRuntime {
             window_activity_db: None,
             memory_db: None,
             communication_db: None,
+            job_terminal_db: None,
+            job_terminal_continuations: None,
+            #[cfg(test)]
+            job_terminal_registration_test_hook: None,
             agent_continuations: None,
         }
-    }
-
-    pub(crate) fn with_runtime_exposure(
-        mut self,
-        runtime_exposure: crate::model_surface::RuntimeExposure,
-    ) -> Self {
-        self.runtime_exposure = runtime_exposure;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_model_surface(
-        self,
-        model_surface: crate::model_surface::ModelSurface,
-    ) -> Self {
-        self.with_runtime_exposure(crate::model_surface::RuntimeExposure::Runtime(
-            model_surface,
-        ))
-    }
-
-    pub(crate) fn runtime_exposure(&self) -> crate::model_surface::RuntimeExposure {
-        self.runtime_exposure
-    }
-
-    pub(crate) fn model_surface(&self) -> Option<crate::model_surface::ModelSurface> {
-        self.runtime_exposure.model_surface()
     }
 
     /// Attach a durable workspace-activity recorder (server wiring).
@@ -281,6 +272,25 @@ impl ToolRuntime {
             db.clone(),
         ));
         self.communication_db = Some(db);
+        self
+    }
+
+    pub(crate) fn with_job_terminal_attention(
+        mut self,
+        db: Arc<crate::Database>,
+        controller: crate::job_terminal_attention::JobTerminalContinuationController,
+    ) -> Self {
+        self.job_terminal_db = Some(db);
+        self.job_terminal_continuations = Some(controller);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_job_terminal_registration_test_hook(
+        mut self,
+        hook: crate::tool_runtime::job_terminal_wait::JobTerminalRegistrationTestHook,
+    ) -> Self {
+        self.job_terminal_registration_test_hook = Some(hook);
         self
     }
 

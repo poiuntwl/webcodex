@@ -16,8 +16,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use webcodex_core::runner_skill::{
-    RunnerSkillDescriptor, RunnerSkillListResponse, RunnerSkillReadResponse, RunnerSkillRequest,
-    RunnerSkillResolveResponse, RunnerSkillSource, RUNNER_SKILL_RESPONSE_FORMAT,
+    RunnerSkillDescriptor, RunnerSkillExecutionRequest, RunnerSkillListResponse,
+    RunnerSkillReadResponse, RunnerSkillRequest, RunnerSkillResolveResponse, RunnerSkillSource,
+    RUNNER_SKILL_EXECUTION_REQUEST_KIND, RUNNER_SKILL_RESPONSE_FORMAT,
 };
 
 fn write_skill(root: &Path, package: &str, name: &str, description: &str, body: &str) {
@@ -190,20 +191,20 @@ async fn skill_load_is_exact_case_insensitive_and_fails_closed_on_ambiguity() {
     write_skill(
         root.path(),
         "unicode-name",
-        "Ångström",
-        "Unicode Skill name",
+        "Maße",
+        "Unicode case-fold guidance",
         "unicode body\n",
     );
-    let (unicode, _) = call_kernel_with_local_agent(
+    let (unicode_loaded, _) = call_kernel_with_local_agent(
         &runtime,
         "skill-load-project",
         "skill_load",
-        json!({"project": project, "name": "ÅNGSTRÖM"}),
+        json!({"project": project, "name": "MASSE"}),
         true,
     )
     .await;
-    assert!(unicode.success, "{:?}", unicode.error);
-    assert_eq!(unicode.output["name"], "Ångström");
+    assert!(unicode_loaded.success, "{:?}", unicode_loaded.error);
+    assert_eq!(unicode_loaded.output["name"], "Maße");
 
     let (substring, _) = call_kernel_with_local_agent(
         &runtime,
@@ -236,6 +237,32 @@ async fn skill_load_is_exact_case_insensitive_and_fails_closed_on_ambiguity() {
     assert_eq!(ambiguous.output["candidate_count"], 2);
     assert_eq!(ambiguous.output["candidates"].as_array().unwrap().len(), 2);
     assert!(ambiguous.output.get("text").is_none());
+    assert!(ambiguous.output.get("name").is_none());
+
+    let (listed, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_list",
+        json!({"project": project, "query": "time-tracking", "limit": 10}),
+        true,
+    )
+    .await;
+    assert!(listed.success, "{:?}", listed.error);
+    let collisions = listed.output["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|skill| {
+            matches!(
+                skill["name"].as_str(),
+                Some("time-tracking" | "Time-Tracking")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(collisions.len(), 2);
+    assert!(collisions
+        .iter()
+        .all(|skill| skill["name_conflict"] == true));
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +603,40 @@ async fn call_kernel_with_fake_operator_store(
                     })
                     .await
                     .unwrap();
+            } else if request.kind == RUNNER_SKILL_EXECUTION_REQUEST_KIND {
+                kinds.push(request.kind.clone());
+                let execution = serde_json::from_str::<RunnerSkillExecutionRequest>(
+                    request
+                        .content
+                        .as_deref()
+                        .expect("typed Runner Skill execution request"),
+                )
+                .unwrap();
+                let state = operator.lock().unwrap().clone();
+                let script = match execution.expected_source {
+                    RunnerSkillSource::Configured => state
+                        .configured
+                        .as_ref()
+                        .filter(|skill| skill.skill_id == execution.skill_id)
+                        .map(|skill| skill.resource_text.clone()),
+                    RunnerSkillSource::Managed => state
+                        .managed
+                        .as_ref()
+                        .filter(|skill| skill.skill_id == execution.skill_id)
+                        .map(|skill| skill.resource_text.clone()),
+                }
+                .expect("fake Runner package source for Skill execution");
+                let (exit_code, stdout, stderr) =
+                    run_runner_skill_resource_request_locally(&request, &script);
+                complete_patch_agent_request(
+                    runtime,
+                    client_id,
+                    &request.request_id,
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                )
+                .await;
             } else {
                 kinds.push(request.kind.clone());
                 let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&request);
@@ -1942,7 +2003,7 @@ async fn skill_surface_sidecar_privacy_and_authority_are_fenced() {
         register_runner_project_at_path(&runtime, "skill-fence", "demo", root.path()).await;
 
     let auth = auth_context(None, true);
-    let surface_denied = runtime
+    let protocol_denied = runtime
         .call_tool_with_invocation_metadata(
             ToolCallRequest {
                 tool_name: "skill_list".to_string(),
@@ -1967,18 +2028,18 @@ async fn skill_surface_sidecar_privacy_and_authority_are_fenced() {
             },
         )
         .await;
-    assert!(!surface_denied.success);
-    assert!(surface_denied.result.is_none());
+    assert!(!protocol_denied.success);
+    assert!(protocol_denied.result.is_none());
     assert!(matches!(
-        surface_denied.error_status,
+        protocol_denied.error_status,
         Some(super::super::kernel::ToolCallErrorStatus::InvalidArguments { ref message })
-            if message.contains("Stateless MCP 2026 Full Operator")
+            if message.contains("Stateless MCP 2026")
     ));
     assert!(
         probe_patch_agent_request(&runtime, "skill-fence")
             .await
             .is_none(),
-        "private context marker must not bypass the Skill surface gate"
+        "private context marker must not bypass the Skill protocol capability gate"
     );
 
     let (without_sidecar, without_kinds) = dispatch_with_context_and_local_agent(
@@ -2176,6 +2237,7 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
         RunnerCapabilities {
             file_read: true,
             skill_runtime: true,
+            skill_resource_execution: true,
             shell: true,
             structured_process_argv: true,
             ..Default::default()
@@ -2228,6 +2290,11 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
     assert_eq!(result.output["skill_id"], skill_id);
     assert_eq!(result.output["skill_path"], "scripts/probe.py");
     assert_eq!(result.output["skill_trust"], "operator_configured_guidance");
+    assert_eq!(
+        result.output["skill_definition_revision"],
+        definition_revision
+    );
+    assert!(result.output["skill_package_revision"].is_null());
     assert_eq!(
         result.output["skill_sha256"],
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -2298,6 +2365,7 @@ async fn run_skill_resource_denies_project_content_and_requires_managed_package_
         RunnerCapabilities {
             file_read: true,
             skill_runtime: true,
+            skill_resource_execution: true,
             shell: true,
             structured_process_argv: true,
             ..Default::default()

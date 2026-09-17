@@ -33,6 +33,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "project_overview",
             "list_project_tracked_files",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "run_process",
             "run_script",
             "run_shell",
@@ -55,6 +57,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "workspace_checkpoint_list",
             #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_show",
+            "browser_observe",
+            "browser_act",
             "computer_observe",
             "computer_control",
             "computer_save_snapshot",
@@ -233,6 +237,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "run_job",
             "stop_job",
             "observe_jobs",
+            "wait_for_job_terminal",
+            "present_job_terminal_continuation",
             "list_jobs",
         ],
     },
@@ -246,6 +252,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "update_session_context",
             "close_session",
             "post_session_message",
+            "post_peer_message",
             "list_session_messages",
             "get_session_assignment",
             "observe_session_messages",
@@ -269,7 +276,15 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "runner_config_check",
             "runner_config_reload",
             "tool_manifest",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec_effectful",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec_mutating",
             "plugin_tool",
+            "skill_load",
+            "run_skill_resource",
             "ssh_resource",
         ],
     },
@@ -361,6 +376,8 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         tools: &[
             "search_project_texts",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "run_process",
             "run_script",
             "run_shell",
@@ -415,6 +432,12 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         ],
     },
     ToolRecommendedFlow {
+        name: "browser",
+        summary: "Browser/CDP runtime: discover Browser-capable Runners, launch an owned ephemeral Browser, observe pages/semantic snapshots, act only through opaque identities, then re-observe after navigation or uncertain effects.",
+        manifest_purpose: "Use browser_observe for targets/browsers/pages/snapshot/screenshot and browser_act for the closed launch/new_page/navigate/click/input_text/key/close actions. Browser/Page/Element ids are opaque; navigation stales element ids. Never retry an outcome_unknown effect blindly: follow the returned browser_observe reconciliation call.",
+        tools: &["browser_observe", "browser_act"],
+    },
+    ToolRecommendedFlow {
         name: "computer_observe",
         summary: "Computer observe: one guaranteed read-only gateway for Runner/desktop discovery, accessibility inspection, clipboard read, and window/display snapshots. Choose a closed action; no control effects are admitted.",
         manifest_purpose:
@@ -466,79 +489,22 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
 ];
 
-/// Single ordered, unique source of truth for the fixed `local_coding` MCP
-/// compatibility surface. This list intentionally does not drive Adaptive
-/// Runtime intent discovery.
-pub const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
-    // entry
-    "work_on_project",
-    "list_projects",
-    "plugin_tool",
-    // exact coordinator assignment read + atomic completion
-    "get_session_assignment",
-    "complete_session_message",
-    // delegated ACP coding-agent Runs (explicit coding_agent:run authority)
-    "coding_agent_start",
-    "coding_agent_observe",
-    "coding_agent_cancel",
-    // project discovery + read
-    "project_overview",
-    "list_project_tracked_files",
-    "list_project_files",
-    "search_project_texts",
-    "read_files",
-    "project_artifact",
-    "read_project_artifact",
-    // LSP navigation
-    "lsp_status",
-    "document_symbols",
-    "document_diagnostics",
-    "hover",
-    "workspace_symbols",
-    "goto_definition",
-    "find_references",
-    "call_hierarchy",
-    // guarded edits
-    "apply_text_edits",
-    "apply_patch",
-    "apply_unified_diff",
-    // structured process, shell semantics/scripts, and jobs
-    "run_process",
-    "run_script",
-    "run_shell",
-    "run_job",
-    "observe_jobs",
-    "list_jobs",
-    "stop_job",
-    // validation
-    "cargo_fmt",
-    "cargo_check",
-    "cargo_test",
-    "go_test",
-    "validation_summary",
-    // git review
-    "git_status",
-    "git_log",
-    "git_review_summary",
-    "git_diff_hunks",
-    "show_changes",
-    "workspace_hygiene_check",
-    // finish
-    "finish_coding_task",
-];
-
-/// Ordered selection surface for ordinary coding work under Adaptive Runtime.
+/// Ordered selection for ordinary coding discovery under Adaptive Runtime.
 ///
-/// This is intentionally smaller and more canonical than the fixed Local Coding
-/// compatibility surface. It may include distinct gateway-routed specialists
-/// that are worth explicit discovery, but excludes singular/legacy peers when a
-/// preferred batch, structured review, or Job-continuation path exists.
+/// This ranks useful capabilities for `tool_manifest(intent="coding")`; it does
+/// not define direct admission. ToolDefinition rank remains the direct SSOT.
 pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "work_on_project",
     "project_overview",
     "search_project_texts",
     "read_files",
     "project_artifact",
+    #[cfg(feature = "experimental-code-mode")]
+    "code_mode_exec",
+    #[cfg(feature = "experimental-code-mode")]
+    "code_mode_exec_effectful",
+    #[cfg(feature = "experimental-code-mode")]
+    "code_mode_exec_mutating",
     // Distinct semantic navigation capabilities remain useful even though they
     // are long-tail Adaptive gateway targets.
     "document_symbols",
@@ -588,6 +554,8 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_project_tracked_files",
             "read_files",
             "search_project_texts",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "list_project_files",
             "git_status",
             "git_log",
@@ -612,6 +580,8 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
             "list_project_files",
             "search_project_texts",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "code_mode_exec",
             "git_status",
             "git_log",
             "tool_manifest",

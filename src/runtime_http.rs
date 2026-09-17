@@ -157,6 +157,7 @@ fn prepare_action_tools_call_response(
     project: Option<String>,
     result: crate::tool_runtime::ToolResult,
     model_ergonomics: Option<&ModelErgonomicsCompletion>,
+    correlation: &crate::tool_runtime::ToolCallCorrelation,
 ) -> (StatusCode, crate::tool_runtime::ToolResult) {
     let status = if result.success {
         StatusCode::OK
@@ -171,6 +172,9 @@ fn prepare_action_tools_call_response(
         .and_then(|record| serde_json::to_value(record).ok())
     {
         summary["model_ergonomics"] = telemetry;
+    }
+    if let Some(composition) = correlation.code_mode_composition_audit_summary() {
+        summary["code_mode_composition"] = composition;
     }
     let mut event = ActionAuditRecord::new(tool.to_string(), response.success, status)
         .error(response.error.clone())
@@ -416,6 +420,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 outcome.project,
                 result,
                 model_ergonomics.as_ref(),
+                &outcome.correlation,
             );
             let response_value = guard
                 .enabled()
@@ -663,6 +668,24 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
     }
 }
 
+fn gpt_action_suggested_tool_call_route(
+    target: &str,
+) -> crate::model_surface::SuggestedToolCallRoute {
+    use crate::model_surface::{AdaptiveRuntimeGatewayTargetRoute, SuggestedToolCallRoute};
+
+    if !webcodex_tool_contracts::gpt_action_tool_supported(target) {
+        return SuggestedToolCallRoute::Unavailable;
+    }
+    match crate::model_surface::adaptive_runtime_gateway_target_route(target) {
+        AdaptiveRuntimeGatewayTargetRoute::Direct => SuggestedToolCallRoute::Direct,
+        AdaptiveRuntimeGatewayTargetRoute::Gateway => SuggestedToolCallRoute::Gateway(
+            crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        ),
+        AdaptiveRuntimeGatewayTargetRoute::Recursive
+        | AdaptiveRuntimeGatewayTargetRoute::Unknown => SuggestedToolCallRoute::Unavailable,
+    }
+}
+
 #[handler]
 pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(path_tool) = req.param::<String>("tool_name") else {
@@ -783,12 +806,20 @@ pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut R
             let result = outcome
                 .result
                 .expect("tool kernel outcome without error must include result");
-            let (status, response) = prepare_action_tools_call_response(
+            let (status, mut response) = prepare_action_tools_call_response(
                 &audit,
                 &tool,
                 outcome.project,
                 result,
                 outcome.model_ergonomics.as_ref(),
+                &outcome.correlation,
+            );
+            // ActionAudit above records canonical ToolRuntime truth. Only the
+            // response copy is projected to the callable Adaptive Action route.
+            crate::model_surface::project_tool_result_suggested_calls(
+                &tool,
+                &mut response,
+                &gpt_action_suggested_tool_call_route,
             );
             res.status_code(status);
             res.render(Json(response));

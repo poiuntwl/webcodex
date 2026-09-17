@@ -724,8 +724,8 @@ async fn specialized_recording_session_authority_fails_closed_at_mcp_boundary() 
 }
 
 #[tokio::test]
-async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+async fn plugin_tool_accepts_collaboration_ack_but_rejects_other_stateless_wrappers() {
+    let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[crate::auth::SCOPE_PLUGIN_INSPECT]);
     register_plugin_runner(
         &runtime,
@@ -737,14 +737,40 @@ async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
     )
     .await;
 
-    for (id, arguments) in [
-        (
-            694,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_cached"]
-            }),
+    let ack = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(694)),
+            mcp_2026_params(json!({
+                "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+                "arguments": {
+                    "action":"list",
+                    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_0123456789abcdef"]
+                }
+            })),
         ),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::Ok(ack) = ack else {
+        panic!("specialized plugin_tool must accept the collaboration ACK wrapper");
+    };
+    assert_eq!(ack["result"]["isError"], false, "{ack}");
+    assert!(!serde_json::to_string(&ack)
+        .unwrap()
+        .contains("ack_session_message_ids"));
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-a".to_string(),
+            runner_instance_id: "runner-instance-a".to_string(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    for (id, arguments) in [
         (
             695,
             json!({
@@ -784,7 +810,7 @@ async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
         )
         .await;
         let McpOutcome::BadRequest(value) = outcome else {
-            panic!("specialized plugin_tool must reject generic continuity wrappers");
+            panic!("specialized plugin_tool must reject non-ACK generic continuity wrappers");
         };
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(encoded.contains("unknown field"), "{encoded}");
@@ -1752,58 +1778,44 @@ async fn generic_runtime_plugin_governance_is_action_aware_and_records_one_api_l
 }
 
 #[tokio::test]
-async fn provider_tool_names_never_enter_outer_mcp_inventory_on_any_model_surface() {
+async fn provider_tool_names_never_enter_outer_mcp_inventory() {
     let auth = plugin_auth(true);
-    for surface in [
-        ModelSurface::LocalCoding,
-        ModelSurface::AdaptiveRuntime,
-        ModelSurface::FullOperatorRuntime,
-    ] {
-        let runtime = test_runtime_with_surface(surface);
-        register_plugin_runner(
-            &runtime,
-            "runner-a",
-            "runner-instance-a",
-            "repo-tools-a",
-            "provider-instance-a",
-            vec![plugin_tool("safe_delete"), plugin_tool("runtime_status")],
-        )
-        .await;
-        register_plugin_runner(
-            &runtime,
-            "runner-b",
-            "runner-instance-b",
-            "repo-tools-b",
-            "provider-instance-b",
-            vec![plugin_tool("safe_delete")],
-        )
-        .await;
+    let runtime = test_runtime();
+    register_plugin_runner(
+        &runtime,
+        "runner-a",
+        "runner-instance-a",
+        "repo-tools-a",
+        "provider-instance-a",
+        vec![plugin_tool("safe_delete"), plugin_tool("runtime_status")],
+    )
+    .await;
+    register_plugin_runner(
+        &runtime,
+        "runner-b",
+        "runner-instance-b",
+        "repo-tools-b",
+        "provider-instance-b",
+        vec![plugin_tool("safe_delete")],
+    )
+    .await;
 
-        let value = tools_list(&runtime, &auth, true).await;
-        let names = value["result"]["tools"]
-            .as_array()
-            .unwrap()
+    let value = tools_list(&runtime, &auth, true).await;
+    let names = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&crate::plugin_gateway::PLUGIN_TOOL_NAME));
+    assert!(!names.contains(&"safe_delete"));
+    assert_eq!(
+        names
             .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            names.contains(&crate::plugin_gateway::PLUGIN_TOOL_NAME),
-            "stable gateway missing on {surface:?}"
-        );
-        assert!(
-            !names.contains(&"safe_delete"),
-            "provider-local name leaked into outer MCP on {surface:?}"
-        );
-        // A provider-local collision with a built-in is legal because the
-        // provider tool never contributes a second outer ToolSpec.
-        assert_eq!(
-            names
-                .iter()
-                .filter(|name| **name == "runtime_status")
-                .count(),
-            usize::from(surface != ModelSurface::LocalCoding)
-        );
-    }
+            .filter(|name| **name == "runtime_status")
+            .count(),
+        1
+    );
 
     let specs = registered_tool_specs();
     assert_eq!(
@@ -1818,7 +1830,7 @@ async fn provider_tool_names_never_enter_outer_mcp_inventory_on_any_model_surfac
 
 #[tokio::test]
 async fn outer_direct_provider_tool_call_is_never_plugin_dispatch() {
-    let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+    let runtime = test_runtime();
     let auth = plugin_auth(true);
     register_plugin_runner(
         &runtime,
@@ -1873,7 +1885,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
         (705, crate::auth::SCOPE_PLUGIN_INVOKE),
         (706, crate::auth::SCOPE_PLUGIN_MANAGE),
     ] {
-        let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+        let runtime = test_runtime();
         register_plugin_runner(
             &runtime,
             "runner-a",
@@ -1906,7 +1918,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
 
 #[tokio::test]
 async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner_inventory() {
-    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[
         crate::auth::SCOPE_PLUGIN_INSPECT,
         crate::auth::SCOPE_RUNTIME_READ,
