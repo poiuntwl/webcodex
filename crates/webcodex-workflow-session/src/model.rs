@@ -16,9 +16,9 @@ pub use webcodex_core::workflow_session_contract::{
     MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS, SESSION_ID_PREFIX,
     SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
     TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD,
-    TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
-    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
-    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
+    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTED_FAILURE_FIELD,
+    TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
 
 pub const EVENT_ID_PREFIX: &str = "evt_";
@@ -27,7 +27,10 @@ pub const LOGICAL_INVOCATION_ID_PREFIX: &str = "wc_inv_";
 pub const LOGICAL_INVOCATION_ROLE_RECORDER: &str = "recorder";
 pub const LOGICAL_INVOCATION_ROLE_BUSINESS: &str = "business";
 pub const DEFAULT_MAX_SESSIONS: usize = 100;
-pub const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 200;
+/// Durable per-Session event retention. This is intentionally larger than the
+/// model-facing summary ceiling: long-running coding Sessions keep forensic and
+/// recovery evidence without forcing that history into one model response.
+pub const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 2000;
 /// Exact terminal-validation Job identities retained per Workflow Session. This
 /// matches the Runner's authoritative terminal Job inventory bound: while a
 /// terminal Job can still be a reconciliation candidate, one of these bounded
@@ -40,6 +43,8 @@ pub const MAX_MATERIALIZED_VALIDATION_JOB_IDS: usize =
 /// while keeping every event independently bounded.
 pub const MAX_OBSERVED_PATHS_PER_EVENT: usize = 201;
 pub const DEFAULT_SUMMARY_LIMIT: usize = 50;
+/// Maximum event tail projected by one model-facing Session summary. Durable
+/// retention is independently bounded by `DEFAULT_MAX_EVENTS_PER_SESSION`.
 pub const MAX_SUMMARY_LIMIT: usize = 200;
 pub const MAX_SUMMARY_STRING_CHARS: usize = 240;
 pub const MAX_INPUT_STRING_CHARS: usize = 120;
@@ -146,8 +151,8 @@ pub struct SessionRecord {
     /// than are retained now". The persisted counterpart carries the additive
     /// serde default; the in-memory record is always constructed explicitly.
     pub events_observed: u64,
-    /// Durable Session-local model-facing continuity watermark. This advances
-    /// exactly once for each recorded ToolResult returned to the model;
+    /// Durable Server-owned checkpoint ordering watermark. This advances
+    /// once for each consequential model-facing result selected by tool policy;
     /// generic/background Session events never advance it.
     pub context_revision: u64,
     /// Git tree captured exactly once when a fresh coding Workflow Session is
@@ -541,9 +546,7 @@ pub struct ToolCallStart {
     pub started_instant: Instant,
     pub permission: Option<PermissionDecision>,
     pub expectation: ToolCallExpectation,
-    pub pre_call_context_revision: u64,
     pub advances_context_checkpoint: bool,
-    pub ack_session_context_revision: SessionContextRevisionAck,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,38 +583,6 @@ pub struct ToolCallRecorderMetadata {
     pub expectation: ToolCallExpectation,
     pub ack_session_message_ids: Vec<String>,
     pub session_message_resolution: Option<ToolCallSessionMessageResolution>,
-    pub ack_session_context_revision: SessionContextRevisionAck,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SessionContextRevisionAck {
-    /// The current tool/surface does not accept the context-continuity ACK
-    /// protocol. Checkpoint advancement is a separate ToolDefinition policy and
-    /// may still advance the cross-surface watermark.
-    #[default]
-    Unsupported,
-    Unacknowledged,
-    Revision(u64),
-    Invalid,
-}
-
-#[derive(Debug, Clone)]
-pub struct RecordedModelFacingToolCall {
-    pub session_id: String,
-    pub context_revision: u64,
-    /// Session checkpoint watermark immediately before the current model-facing
-    /// result was recorded. This must not be inferred from `context_revision - 1`
-    /// because continuity-aware recovery calls may not advance a checkpoint.
-    pub pre_response_context_revision: u64,
-    pub checkpoint_advanced: bool,
-    pub pre_call_context_revision: u64,
-    pub ack_session_context_revision: SessionContextRevisionAck,
-    /// Retained model-facing results strictly after a caller's explicitly proven
-    /// revision and before the current ToolResult. Unknown caller state keeps this
-    /// empty and requests explicit current-state recovery instead of revision-zero
-    /// replay. The current ToolResult is always excluded from this history delta.
-    pub recovery_events: Vec<SessionEvent>,
-    pub history_lost: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -693,8 +664,7 @@ pub struct SessionEvent {
     /// started/background/system events leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_revision: Option<u64>,
-    /// Closed, bounded consequence projection used only for model-context
-    /// recovery. It never stores arbitrary ToolResult bodies.
+    /// Closed, bounded durable consequence evidence for diagnostic recovery. It never stores arbitrary ToolResult bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_result_summary: Option<Value>,
     pub timestamp: i64,
@@ -893,7 +863,7 @@ pub struct CompleteSessionMessageInput {
     pub completion_id: String,
     pub author_session_id: Option<String>,
     /// Required opaque semantic snapshot fence returned by get_session_assignment.
-    /// It is independent of completion idempotency, observation, and context ACKs.
+    /// It is independent of completion idempotency, observation, and collaboration ACKs.
     pub expected_assignment_fence: String,
 }
 
@@ -1100,26 +1070,36 @@ pub struct SessionSummary {
     pub updated_at: i64,
     pub counts: SessionCounts,
     pub events: Vec<SessionEvent>,
-    /// Total number of events retained in the durable ledger for the session
-    /// *before* the returned window was sliced. This is the source of truth for
-    /// whether older events (e.g. an attempt boundary `task_instruction`) were
-    /// evicted by the per-session event cap. Older persisted sessions that predate
-    /// these additive fields deserialize to 0/0/true and are treated as the
-    /// returned window being the whole retained ledger (no eviction observed).
+    /// Total events ever observed for this Session, including events already
+    /// evicted by the bounded durable ledger.
     #[serde(default)]
     pub events_total: usize,
-    /// Number of events actually returned in `events` (the retained tail).
+    /// Events currently retained in the durable ledger before model-facing tail
+    /// slicing is applied.
+    #[serde(default)]
+    pub events_retained: usize,
+    /// Events already evicted by the durable per-Session retention bound.
+    #[serde(default)]
+    pub events_evicted: usize,
+    /// True only when durable Session history has actually been evicted. This is
+    /// distinct from `events_truncated`, which may be true solely because one
+    /// model-facing summary returns at most `MAX_SUMMARY_LIMIT` events.
+    #[serde(default)]
+    pub retention_truncated: bool,
+    /// 0-based sequence of the first event still present in the durable ledger.
+    #[serde(default)]
+    pub ledger_first_retained_sequence: usize,
+    /// Number of events actually returned in `events` (the bounded tail).
     #[serde(default)]
     pub events_returned: usize,
-    /// True when the durable ledger retained more events than were returned
-    /// (`events_total > events_returned`), i.e. the returned window is a tail
-    /// slice and older events are not present.
+    /// True when the Session has more observed events than this response returns.
+    /// This covers both ordinary model-facing tail slicing and durable eviction;
+    /// use `retention_truncated` to distinguish actual history loss.
     #[serde(default)]
     pub events_truncated: bool,
-    /// 0-based sequence of the first returned event within the retained ledger
-    /// (`events_total - events_returned`). `0` means the returned window starts
-    /// at the ledger head. Read-only projections use this to avoid mistaking a
-    /// truncated tail for the session start.
+    /// 0-based absolute sequence of the first event returned in `events`.
+    /// The legacy field name is retained for compatibility with continuation
+    /// consumers that already interpret it as the returned-window base.
     #[serde(default)]
     pub first_retained_sequence: usize,
     pub messages: SessionMessagesSummary,

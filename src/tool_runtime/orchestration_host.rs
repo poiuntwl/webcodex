@@ -16,9 +16,9 @@ use tokio::sync::{
 };
 use webcodex_core::workflow_session_contract::{
     TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD,
-    TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
-    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
-    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
+    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTED_FAILURE_FIELD,
+    TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
 use webcodex_tool_contracts::{
     runtime_tool_composition_policy, runtime_tool_execution_contract, runtime_tool_metadata,
@@ -143,7 +143,6 @@ const SERVER_OWNED_ARGUMENT_FIELDS: &[&str] = &[
     TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
     TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
     TOOL_CALL_CONTEXT_REQUEST_FIELD,
-    TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD,
     TOOL_EXPECTED_FAILURE_FIELD,
     TOOL_EXPECTED_FAILURE_KIND_FIELD,
     TOOL_RESULT_EXPECTATION_FIELD,
@@ -166,6 +165,7 @@ pub(crate) struct OrchestrationCompositionSummary {
     pub(crate) max_in_flight: usize,
     pub(crate) duration_ms: u64,
     pub(crate) slot_wait_ms: u64,
+    pub(crate) input_bytes: usize,
     pub(crate) returned_bytes: usize,
     pub(crate) nested_raw_result_bytes_total: usize,
     pub(crate) nested_tool_counts: BTreeMap<String, usize>,
@@ -213,6 +213,7 @@ impl OrchestrationCompositionAccumulator {
     fn summary(
         &self,
         duration_ms: u64,
+        input_bytes: usize,
         returned_bytes: usize,
         slot_wait_ms: u64,
     ) -> OrchestrationCompositionSummary {
@@ -223,6 +224,7 @@ impl OrchestrationCompositionAccumulator {
             max_in_flight: self.max_in_flight,
             duration_ms,
             slot_wait_ms,
+            input_bytes,
             returned_bytes,
             nested_raw_result_bytes_total: self.nested_raw_result_bytes_total,
             nested_tool_counts: self.nested_tool_counts.clone(),
@@ -579,6 +581,7 @@ impl CanonicalOrchestrationHost {
     pub(crate) fn composition_summary(
         &self,
         duration_ms: u64,
+        input_bytes: usize,
         returned_bytes: usize,
         slot_wait_ms: u64,
     ) -> OrchestrationCompositionSummary {
@@ -587,7 +590,7 @@ impl CanonicalOrchestrationHost {
             .composition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .summary(duration_ms, returned_bytes, slot_wait_ms);
+            .summary(duration_ms, input_bytes, returned_bytes, slot_wait_ms);
         summary.consequential_calls = effects.consequential_calls;
         summary.known_results = effects.known_results;
         summary.job_handoffs = effects.job_handoffs;

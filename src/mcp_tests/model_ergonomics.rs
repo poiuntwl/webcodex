@@ -321,7 +321,7 @@ async fn http_mcp_work_on_project_preferences_persist_without_private_request_va
     assert_eq!(events[0].operation.as_deref(), Some("work_on_project"));
     let summary: Value = serde_json::from_str(&events[0].summary_json).unwrap();
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["schema_version"], 5);
+    assert_eq!(telemetry["schema_version"], 6);
     let facts = &telemetry["work_on_project"];
     assert_eq!(facts["resume_requested"], true);
     assert_eq!(facts["source"], "invalid");
@@ -476,6 +476,7 @@ async fn http_mcp_code_mode_persists_only_bounded_composition_telemetry() {
     assert_eq!(composition["nested_tool_counts"], json!({}));
     assert!(composition["duration_ms"].is_u64());
     assert!(composition["slot_wait_ms"].is_u64());
+    assert_eq!(composition["input_bytes"], private_source.len());
     assert!(composition["returned_bytes"].is_u64());
     assert!(composition["nested_raw_result_bytes_total"].is_u64());
     let mut keys = composition
@@ -490,6 +491,7 @@ async fn http_mcp_code_mode_persists_only_bounded_composition_telemetry() {
         [
             "consequential_calls",
             "duration_ms",
+            "input_bytes",
             "job_handoffs",
             "known_results",
             "max_in_flight",

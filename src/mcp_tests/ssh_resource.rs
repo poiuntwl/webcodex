@@ -534,14 +534,6 @@ async fn ssh_resource_accepts_collaboration_ack_but_rejects_other_stateless_wrap
 
     for (id, arguments) in [
         (
-            812,
-            json!({
-                "action":"list",
-                "runner":"runner-a",
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 7
-            }),
-        ),
-        (
             813,
             json!({
                 "action":"list",

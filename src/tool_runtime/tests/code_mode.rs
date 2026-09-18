@@ -736,9 +736,8 @@ async fn e2a_denies_mutation_shell_recursion_and_invalid_validator_before_busine
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2a_parent_continuity_uses_latest_session_revision_after_child_evidence() {
+async fn e2a_parent_and_child_advance_internal_checkpoints_without_overlays() {
     use crate::tool_runtime::kernel::{ToolInvocationMetadata, ToolProtocolCapabilities};
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
 
     let client_id = "code-mode-e2a-session-continuity";
     let (runtime, project, session_id) = e2a_validation_runtime(client_id).await;
@@ -770,14 +769,9 @@ async fn e2a_parent_continuity_uses_latest_session_revision_after_child_evidence
                     record_oauth_scope_denials: true,
                     host_file_import_trust: HostFileImportTrust::Untrusted,
                 },
-                ToolInvocationMetadata {
-                    ack_session_context_revision: SessionContextRevisionAck::Revision(
-                        initial_revision,
-                    ),
-                    ..Default::default()
-                },
+                ToolInvocationMetadata::default(),
                 ToolProtocolCapabilities {
-                    context_continuity: true,
+
                     ..Default::default()
                 },
             )
@@ -811,12 +805,8 @@ async fn e2a_parent_continuity_uses_latest_session_revision_after_child_evidence
         .context_revision(&session_id)
         .expect("latest Session context revision");
     assert!(latest_revision > initial_revision);
-    assert_eq!(
-        result.output["session_context_revision"].as_u64(),
-        Some(latest_revision),
-        "parent continuity must be projected after nested child and parent evidence are recorded"
-    );
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
+    assert!(result.output.get("session_context_revision").is_none());
+    assert!(result.output.get("session_continuity").is_none());
     assert_eq!(result.output["effect_receipt"]["job_handoffs"], 1);
 
     runtime
@@ -970,13 +960,14 @@ async fn canonical_orchestration_host_runs_without_the_v8_frontend() {
 
     let response = task.await.unwrap().expect("canonical nested read");
     assert!(response.success, "{response:?}");
-    let composition = host.composition_summary(17, 123, 5);
+    let composition = host.composition_summary(17, 77, 123, 5);
     assert_eq!(composition.nested_calls, 1);
     assert_eq!(composition.nested_successes, 1);
     assert_eq!(composition.nested_failures, 0);
     assert_eq!(composition.max_in_flight, 1);
     assert_eq!(composition.duration_ms, 17);
     assert_eq!(composition.slot_wait_ms, 5);
+    assert_eq!(composition.input_bytes, 77);
     assert_eq!(composition.returned_bytes, 123);
     assert!(composition.nested_raw_result_bytes_total > 0);
     assert_eq!(composition.nested_tool_counts.get("read_files"), Some(&1));
@@ -1039,7 +1030,6 @@ async fn canonical_orchestration_host_rejects_server_owned_metadata_without_fron
         ("project", json!("agent:other:demo")),
         ("session_id", json!("wc_sess_0000000000000000")),
         ("recording_session_id", json!("wc_sess_0000000000000000")),
-        ("ack_session_context_revision", json!(1)),
         ("ack_session_message_ids", json!([])),
         ("context_request", json!(["webcodex.workflow"])),
         (
@@ -1062,7 +1052,7 @@ async fn canonical_orchestration_host_rejects_server_owned_metadata_without_fron
             .expect_err("server-owned nested metadata must fail before canonical dispatch");
         assert!(error.into_message().contains(field), "{field}");
     }
-    let composition = host.composition_summary(0, 0, 0);
+    let composition = host.composition_summary(0, 0, 0, 0);
     assert_eq!(composition.nested_calls, 0);
     assert!(composition.nested_tool_counts.is_empty());
 }
@@ -1124,6 +1114,7 @@ async fn code_mode_binds_exact_project_and_session_through_real_canonical_reads(
         .clone()
         .expect("outer Code Mode composition diagnostic");
     assert_eq!(composition.nested_calls, 3);
+    assert_eq!(composition.input_bytes, source.len());
     assert_eq!(composition.nested_successes, 3);
     assert_eq!(composition.nested_failures, 0);
     assert!(composition.max_in_flight >= 2);
