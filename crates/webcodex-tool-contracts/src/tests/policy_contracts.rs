@@ -525,7 +525,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
             "complete_session_message",
             "session_discussion_summary",
             "session_handoff_summary",
-            #[cfg(feature = "experimental-code-mode")]
+            #[cfg(feature = "experimental-code-mode-e1")]
             "code_mode_exec",
             #[cfg(feature = "experimental-code-mode")]
             "code_mode_exec_effectful",

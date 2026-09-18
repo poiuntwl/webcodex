@@ -121,7 +121,7 @@ pub struct ToolRuntime {
     pub(crate) read_revisions: Arc<super::read_revisions::ReadRevisionRegistry>,
     /// Process-local Project mutation serialization used only by orchestration
     /// frontends. Direct first-class mutations deliberately bypass this registry.
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     pub(crate) orchestration_mutation_fences:
         Arc<super::orchestration_host::OrchestrationMutationFenceRegistry>,
     /// One deadline shared by every item in a `read_files` batch.
@@ -212,7 +212,7 @@ impl ToolRuntime {
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
             read_revisions: Arc::new(super::read_revisions::ReadRevisionRegistry::new()),
-            #[cfg(feature = "experimental-code-mode")]
+            #[cfg(feature = "experimental-code-mode-e1")]
             orchestration_mutation_fences: Arc::new(
                 super::orchestration_host::OrchestrationMutationFenceRegistry::default(),
             ),

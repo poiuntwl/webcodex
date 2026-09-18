@@ -12,11 +12,11 @@ mod cargo_tools;
 mod changes;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 mod code_mode;
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 mod orchestration_host;
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 pub(crate) use code_mode::is_admitted_nested_tool as code_mode_nested_tool_is_admitted;
 mod coding_agent;
 mod coding_task;

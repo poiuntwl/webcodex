@@ -388,7 +388,7 @@ struct RuntimeConsoleWindowActivity {
     project: Option<String>,
     status: String,
     meaningful: bool,
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     code_mode_composition: Option<RuntimeConsoleCodeModeComposition>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,7 +413,7 @@ struct RuntimeConsoleWindowActivitySession {
     relation: String,
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeConsoleCodeModeComposition {
@@ -434,7 +434,7 @@ struct RuntimeConsoleCodeModeComposition {
     outcome_unknown: usize,
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 fn project_code_mode_composition(value: &Value) -> Option<RuntimeConsoleCodeModeComposition> {
     let projection =
         serde_json::from_value::<RuntimeConsoleCodeModeComposition>(value.clone()).ok()?;
@@ -1591,7 +1591,7 @@ async fn project_visible_window_activity(
     event: webcodex_store::models::WindowActivityEventRecord,
     timing: WindowActivityTimingProjection,
 ) -> RuntimeConsoleWindowActivity {
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     let code_mode_composition = event
         .code_mode_composition
         .as_ref()
@@ -1637,7 +1637,7 @@ async fn project_visible_window_activity(
         // Persisted event-time truth: never recompute historical meaningfulness
         // from the current ToolDefinition activity policy.
         meaningful: event.meaningful,
-        #[cfg(feature = "experimental-code-mode")]
+        #[cfg(feature = "experimental-code-mode-e1")]
         code_mode_composition,
         recorder_gap_session_id: event.recorder_gap_session_id,
         server_trace_id: event.server_trace_id,
@@ -1702,13 +1702,13 @@ async fn visible_window_summary_for_auth(
         .window_activity_db
         .as_ref()
         .ok_or(RuntimeConsoleError::Internal)?;
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     let events = db.list_window_activity_events_with_code_mode_composition(
         window_key,
         principal,
         MAX_WINDOW_ACTIVITY_LIMIT,
     );
-    #[cfg(not(feature = "experimental-code-mode"))]
+    #[cfg(not(feature = "experimental-code-mode-e1"))]
     let events = db.list_window_activity_events(window_key, principal, MAX_WINDOW_ACTIVITY_LIMIT);
     let events = events.map_err(|_| RuntimeConsoleError::Internal)?;
     let mut source = None;
@@ -2013,13 +2013,13 @@ async fn window_for_auth(
     } else {
         MAX_WINDOW_ACTIVITY_LIMIT
     };
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     let raw_activity = db.list_window_activity_events_with_code_mode_composition(
         &input.client_window_key,
         principal_ref,
         activity_scan_limit,
     );
-    #[cfg(not(feature = "experimental-code-mode"))]
+    #[cfg(not(feature = "experimental-code-mode-e1"))]
     let raw_activity = db.list_window_activity_events(
         &input.client_window_key,
         principal_ref,
@@ -2206,13 +2206,13 @@ async fn workflow_session_detail_with_windows(
         if link.recorder_gap_count == 0 {
             continue;
         }
-        #[cfg(feature = "experimental-code-mode")]
+        #[cfg(feature = "experimental-code-mode-e1")]
         let events = db.list_window_activity_events_with_code_mode_composition(
             &link.client_window_key,
             principal_ref,
             32,
         );
-        #[cfg(not(feature = "experimental-code-mode"))]
+        #[cfg(not(feature = "experimental-code-mode-e1"))]
         let events = db.list_window_activity_events(&link.client_window_key, principal_ref, 32);
         let events = events.map_err(|_| RuntimeConsoleError::Internal)?;
         for event in events {
@@ -4130,7 +4130,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     #[tokio::test]
     async fn code_mode_composition_projects_on_one_outer_window_activity() {
         let (_tmp, db, runtime) = test_runtime_with_window_db();

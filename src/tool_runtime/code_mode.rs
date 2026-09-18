@@ -6,9 +6,11 @@ use super::{ResolvedProject, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use serde_json::json;
 use std::sync::Arc;
+#[cfg(feature = "experimental-code-mode")]
+use webcodex_code_mode::CodeModeTerminationMode;
 use webcodex_code_mode::{
     CodeModeExecuteRequest, CodeModeHost, CodeModeHostError, CodeModeHostFuture,
-    CodeModeTerminationMode, CodeModeToolRequest, CodeModeToolResponse,
+    CodeModeToolRequest, CodeModeToolResponse,
 };
 
 pub(crate) use super::orchestration_host::OrchestrationCompositionSummary as CodeModeCompositionSummary;
@@ -27,6 +29,7 @@ pub(crate) const READ_ONLY_NESTED_TOOLS: &[&str] = &[
     "show_changes",
 ];
 
+#[cfg(feature = "experimental-code-mode")]
 pub(crate) const E2A_NESTED_TOOLS: &[&str] = &[
     "read_files",
     "search_project_texts",
@@ -41,6 +44,7 @@ pub(crate) const E2A_NESTED_TOOLS: &[&str] = &[
     "cargo_test",
 ];
 
+#[cfg(feature = "experimental-code-mode")]
 pub(crate) const E2B_NESTED_TOOLS: &[&str] = &[
     "read_files",
     "search_project_texts",
@@ -70,6 +74,7 @@ const CODE_MODE_E1_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     max_mutation_calls: None,
 };
 
+#[cfg(feature = "experimental-code-mode")]
 const CODE_MODE_E2A_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     frontend: "code_mode_v8_effectful",
     policy_name: "Code Mode E2a",
@@ -80,6 +85,7 @@ const CODE_MODE_E2A_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     max_mutation_calls: None,
 };
 
+#[cfg(feature = "experimental-code-mode")]
 const CODE_MODE_E2B_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     frontend: "code_mode_v8_mutating",
     policy_name: "Code Mode E2b",
@@ -95,6 +101,7 @@ pub(crate) fn is_admitted_nested_tool(tool_name: &str) -> bool {
 }
 
 pub(crate) const MAX_MODEL_ERROR_BYTES: usize = 16 * 1024;
+#[cfg(feature = "experimental-code-mode")]
 const CONSEQUENTIAL_MAX_STARTED_CHILD_DRAIN_MS: u64 = 5_000;
 
 fn bounded_model_error(message: &str) -> String {
@@ -239,6 +246,7 @@ impl ToolRuntime {
         (result, composition)
     }
 
+    #[cfg(feature = "experimental-code-mode")]
     pub(crate) async fn code_mode_exec_effectful(
         &self,
         project: ResolvedProject,
@@ -348,6 +356,7 @@ impl ToolRuntime {
         );
         (result, composition)
     }
+    #[cfg(feature = "experimental-code-mode")]
     pub(crate) async fn code_mode_exec_mutating(
         &self,
         project: ResolvedProject,

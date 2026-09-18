@@ -34,7 +34,7 @@ async fn adaptive_tools_list_exposes_ranked_direct_tools_and_gateway() {
     };
     let names = tool_names(&value);
     assert!(names.contains(&crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     {
         const MAX_EXPERIMENTAL_CODE_MODE_TOOL_BYTES: usize = 4 * 1024;
         let code_mode = value["result"]["tools"]
@@ -43,6 +43,19 @@ async fn adaptive_tools_list_exposes_ranked_direct_tools_and_gateway() {
             .iter()
             .find(|tool| tool["name"] == "code_mode_exec")
             .expect("experimental Code Mode feature must expose code_mode_exec directly");
+        let description = code_mode["description"]
+            .as_str()
+            .expect("code_mode_exec description");
+        for phrase in [
+            "Prefer this tool when an investigation needs multiple read-only steps",
+            "later search/read choices depend on earlier results",
+            "one simple observation or a fully predetermined batch",
+        ] {
+            assert!(
+                description.contains(phrase),
+                "missing Code Mode selection guidance: {phrase}"
+            );
+        }
         let code_mode_bytes = serde_json::to_vec(code_mode).unwrap().len();
         assert!(
             code_mode_bytes <= MAX_EXPERIMENTAL_CODE_MODE_TOOL_BYTES,

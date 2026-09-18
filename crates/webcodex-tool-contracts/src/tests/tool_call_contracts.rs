@@ -34,7 +34,7 @@ fn from_tool_name_parses_unit_tools_with_empty_object() {
     assert!(matches!(call, ToolCall::ListTools { .. }));
 }
 
-#[cfg(not(feature = "experimental-code-mode"))]
+#[cfg(not(feature = "experimental-code-mode-e1"))]
 #[test]
 fn code_mode_exec_is_not_a_tool_call_without_feature() {
     let error = ToolCall::from_tool_name(
@@ -1664,7 +1664,7 @@ fn observe_jobs_wake_policy_defaults_and_validates() {
     }
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[test]
 fn code_mode_exec_parses_outer_authority() {
     const PRIVATE_SOURCE: &str = "const secret = 'NEVER_PERSIST_CODE_MODE_SOURCE'; text(secret);";

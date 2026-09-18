@@ -1559,7 +1559,7 @@ pub enum ToolCall {
     /// Execute one bounded read-only JavaScript orchestration cell. Project and
     /// Workflow Session are mandatory outer authority targets; nested calls may
     /// not select either target.
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     CodeModeExec {
         /// Required Project target. Nested JavaScript tool calls cannot select or override Project authority.
         project: String,
@@ -4904,7 +4904,7 @@ impl ToolCall {
             Self::WorkspaceCheckpointRestore { .. } => "workspace_checkpoint_restore",
             #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointDelete { .. } => "workspace_checkpoint_delete",
-            #[cfg(feature = "experimental-code-mode")]
+            #[cfg(feature = "experimental-code-mode-e1")]
             Self::CodeModeExec { .. } => "code_mode_exec",
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExecEffectful { .. } => "code_mode_exec_effectful",
@@ -5056,9 +5056,10 @@ impl ToolCall {
 
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            #[cfg(feature = "experimental-code-mode-e1")]
+            Self::CodeModeExec { session_id, .. } => Some(session_id.as_str()),
             #[cfg(feature = "experimental-code-mode")]
-            Self::CodeModeExec { session_id, .. }
-            | Self::CodeModeExecEffectful { session_id, .. }
+            Self::CodeModeExecEffectful { session_id, .. }
             | Self::CodeModeExecMutating { session_id, .. } => Some(session_id.as_str()),
             Self::RunProcess { session_id, .. }
             | Self::RunDetachedProcess { session_id, .. }
@@ -5195,9 +5196,10 @@ impl ToolCall {
 
     pub fn project(&self) -> Option<&str> {
         match self {
+            #[cfg(feature = "experimental-code-mode-e1")]
+            Self::CodeModeExec { project, .. } => Some(project.as_str()),
             #[cfg(feature = "experimental-code-mode")]
-            Self::CodeModeExec { project, .. }
-            | Self::CodeModeExecEffectful { project, .. }
+            Self::CodeModeExecEffectful { project, .. }
             | Self::CodeModeExecMutating { project, .. } => Some(project.as_str()),
             Self::RunProcess { project, .. }
             | Self::RunDetachedProcess { project, .. }

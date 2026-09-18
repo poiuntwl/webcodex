@@ -1903,7 +1903,7 @@ impl ToolRuntime {
                 self.dispatch_workspace_checkpoint_tool(call).await
             }
 
-            #[cfg(feature = "experimental-code-mode")]
+            #[cfg(feature = "experimental-code-mode-e1")]
             ToolCall::CodeModeExec {
                 project: _,
                 session_id,

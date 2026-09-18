@@ -53,9 +53,9 @@ fn tool_definitions_cover_known_names_and_public_specs() {
     assert_eq!(registered_tool_names(), visible_definition_order);
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[test]
-fn experimental_code_mode_is_visible_read_only_and_feature_scoped() {
+fn experimental_code_mode_e1_is_visible_read_only_and_feature_scoped() {
     let definition = lookup_tool_definition("code_mode_exec").expect("code_mode_exec definition");
     let metadata = definition.metadata();
     assert!(definition.visibility.is_model_visible());
@@ -157,7 +157,7 @@ fn experimental_code_mode_mutating_has_conservative_e2b_envelope() {
     assert!(is_adaptive_runtime_direct_tool("code_mode_exec_mutating"));
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[test]
 fn code_mode_composition_policy_is_canonical_closed_and_independent_from_frontend_admission() {
     const E1_TOOLS: &[&str] = &[
@@ -217,9 +217,9 @@ fn code_mode_composition_policy_is_canonical_closed_and_independent_from_fronten
     );
 }
 
-#[cfg(not(feature = "experimental-code-mode"))]
+#[cfg(not(feature = "experimental-code-mode-e1"))]
 #[test]
-fn experimental_code_mode_is_absent_without_feature() {
+fn experimental_code_mode_is_absent_without_e1_feature() {
     for name in [
         "code_mode_exec",
         "code_mode_exec_effectful",
@@ -247,6 +247,23 @@ fn experimental_code_mode_is_absent_without_feature() {
             TOOL_RECOMMENDED_FLOWS
                 .iter()
                 .all(|flow| !flow.tools.contains(&name)),
+            "{name}"
+        );
+        assert!(!is_adaptive_runtime_direct_tool(name), "{name}");
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-code-mode-e1",
+    not(feature = "experimental-code-mode")
+))]
+#[test]
+fn e1_only_keeps_effectful_and_mutating_code_mode_absent() {
+    for name in ["code_mode_exec_effectful", "code_mode_exec_mutating"] {
+        assert!(lookup_tool_definition(name).is_none(), "{name}");
+        assert!(!known_tool_names().any(|known| known == name), "{name}");
+        assert!(
+            !registered_tool_specs().iter().any(|spec| spec.name == name),
             "{name}"
         );
         assert!(!is_adaptive_runtime_direct_tool(name), "{name}");

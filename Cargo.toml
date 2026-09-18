@@ -34,9 +34,14 @@ edition.workspace = true
 
 [features]
 default = []
-experimental-code-mode = [
+experimental-code-mode-e1 = [
     "dep:webcodex-code-mode",
     "webcodex-code-mode/v8-runtime",
+    "webcodex-tool-contracts/experimental-code-mode-e1",
+    "webcodex-tool-runtime-contracts/experimental-code-mode-e1",
+]
+experimental-code-mode = [
+    "experimental-code-mode-e1",
     "webcodex-tool-contracts/experimental-code-mode",
     "webcodex-tool-runtime-contracts/experimental-code-mode",
 ]

@@ -108,7 +108,7 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 13);
+    assert_eq!(workflow["version"], 14);
     assert_eq!(workflow["authority"], "model_guidance_only");
     assert!(workflow["role_selection"]
         .as_str()
@@ -184,7 +184,6 @@ fn assert_builtin_workflow(output: &Value) {
         "Native commands are first-class",
         "bounded deterministic Python/run_shell",
         "Batch predetermined observations",
-        "adaptive follow-ups stay sequential",
         "bounded targeted reads",
         "files/count/small-context search",
         "Validation failure is evidence, not queue cleanliness",
@@ -197,6 +196,24 @@ fn assert_builtin_workflow(output: &Value) {
     ] {
         assert!(defaults.contains(phrase), "workflow guidance: {phrase}");
     }
+
+    #[cfg(feature = "experimental-code-mode-e1")]
+    for phrase in [
+        "code_mode_exec",
+        "adaptive read-only inspection",
+        "multiple model/tool round trips",
+        "One simple observation or fully predetermined batch stays direct",
+        "search -> select relevant ranges -> targeted reads -> emit evidence",
+    ] {
+        assert!(
+            defaults.contains(phrase),
+            "Code Mode workflow guidance: {phrase}"
+        );
+    }
+
+    #[cfg(not(feature = "experimental-code-mode-e1"))]
+    assert!(defaults.contains("adaptive follow-ups stay sequential"));
+
     let persistent_shell_guidance = workflow["model_protocol"]["persistent_shell"]
         .as_str()
         .expect("persistent shell guidance");

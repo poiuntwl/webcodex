@@ -94,7 +94,7 @@ pub(crate) trait RuntimeMetrics: std::fmt::Debug + Send + Sync {
     fn observe_mcp_call(&self, observation: McpCallMetricObservation);
     fn observe_skill_source(&self, observation: SkillSourceMetricObservation);
     fn observe_window_transition(&self, transition: WindowLoopTransition);
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     fn observe_code_mode_composition(
         &self,
         observation: &super::code_mode::CodeModeCompositionSummary,
@@ -138,7 +138,7 @@ pub(crate) fn observe_window_transition(
     });
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 pub(crate) fn observe_code_mode_composition(
     metrics: &dyn RuntimeMetrics,
     observation: &super::code_mode::CodeModeCompositionSummary,
@@ -288,7 +288,7 @@ impl RuntimeMetrics for TracingRuntimeMetrics {
         }
     }
 
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     fn observe_code_mode_composition(
         &self,
         observation: &super::code_mode::CodeModeCompositionSummary,
@@ -385,7 +385,7 @@ mod tests {
             panic!("test metrics sink failure");
         }
 
-        #[cfg(feature = "experimental-code-mode")]
+        #[cfg(feature = "experimental-code-mode-e1")]
         fn observe_code_mode_composition(
             &self,
             _observation: &super::super::code_mode::CodeModeCompositionSummary,
@@ -405,7 +405,7 @@ mod tests {
         assert!(!observation.ordinary_completed_response());
     }
 
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     #[test]
     fn code_mode_metrics_sink_failure_is_fail_open() {
         let observation = super::super::code_mode::CodeModeCompositionSummary {

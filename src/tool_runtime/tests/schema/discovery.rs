@@ -250,7 +250,7 @@ fn expected_cross_listed_discovery_groups(tool: &str) -> Option<&'static [&'stat
         "cargo_check" => Some(&["shell", "validation"]),
         "cargo_fmt" => Some(&["shell", "validation"]),
         "cargo_test" => Some(&["shell", "validation"]),
-        #[cfg(feature = "experimental-code-mode")]
+        #[cfg(feature = "experimental-code-mode-e1")]
         "code_mode_exec" => Some(&["inspect", "runtime"]),
         "discard_untracked" => Some(&["cleanup", "git"]),
         "finish_coding_task" => Some(&["review", "runtime"]),
@@ -404,7 +404,7 @@ fn tool_discovery_groups_drive_tool_categories() {
         "cargo_check",
         "cargo_fmt",
         "cargo_test",
-        #[cfg(feature = "experimental-code-mode")]
+        #[cfg(feature = "experimental-code-mode-e1")]
         "code_mode_exec",
         "discard_untracked",
         "finish_coding_task",

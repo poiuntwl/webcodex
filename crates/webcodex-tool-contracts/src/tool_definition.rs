@@ -11,7 +11,7 @@ mod artifacts;
 mod browser;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 mod code_mode;
 mod coding_agents;
 mod communication;
@@ -1287,7 +1287,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     #[cfg(feature = "workspace-checkpoints")]
     checkpoints::DEFINITIONS,
     coding_agents::DEFINITIONS,
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     code_mode::DEFINITIONS,
     browser::DEFINITIONS,
     computer::DEFINITIONS,

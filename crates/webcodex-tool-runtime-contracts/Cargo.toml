@@ -6,7 +6,11 @@ edition.workspace = true
 
 [features]
 default = []
-experimental-code-mode = ["webcodex-tool-contracts/experimental-code-mode"]
+experimental-code-mode-e1 = ["webcodex-tool-contracts/experimental-code-mode-e1"]
+experimental-code-mode = [
+    "experimental-code-mode-e1",
+    "webcodex-tool-contracts/experimental-code-mode",
+]
 workspace-checkpoints = ["webcodex-tool-contracts/workspace-checkpoints"]
 
 [dependencies]

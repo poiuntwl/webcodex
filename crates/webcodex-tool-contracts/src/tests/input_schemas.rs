@@ -888,7 +888,7 @@ fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
     }
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[test]
 fn code_mode_exec_schema_keeps_authority_outer_bound_and_source_bounded() {
     let specs = registered_tool_specs();

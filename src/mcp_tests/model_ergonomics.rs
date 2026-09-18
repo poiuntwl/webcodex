@@ -350,7 +350,7 @@ async fn http_mcp_work_on_project_preferences_persist_without_private_request_va
     }
 }
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_code_mode_persists_only_bounded_composition_telemetry() {
     let config = test_config(Some("secret"));

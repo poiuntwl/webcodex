@@ -3662,14 +3662,19 @@ pub trait ToolCallAuditProjection {
 impl ToolCallAuditProjection for ToolCall {
     fn session_log_arguments(&self) -> Value {
         match self {
-            #[cfg(feature = "experimental-code-mode")]
+            #[cfg(feature = "experimental-code-mode-e1")]
             Self::CodeModeExec {
                 project,
                 source,
                 timeout_ms,
                 ..
-            }
-            | Self::CodeModeExecEffectful {
+            } => serde_json::json!({
+                "project": project,
+                "source_bytes": source.len(),
+                "timeout_ms": timeout_ms,
+            }),
+            #[cfg(feature = "experimental-code-mode")]
+            Self::CodeModeExecEffectful {
                 project,
                 source,
                 timeout_ms,

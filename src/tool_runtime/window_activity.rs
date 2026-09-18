@@ -52,7 +52,7 @@ pub(crate) struct ToolCallCorrelation {
     pub(crate) resolved_project: Option<String>,
     pub(crate) workflow_sessions: Vec<WorkflowSessionCorrelation>,
     pub(crate) recorder_gap_session_id: Option<String>,
-    #[cfg(feature = "experimental-code-mode")]
+    #[cfg(feature = "experimental-code-mode-e1")]
     pub(crate) code_mode_composition: Option<super::code_mode::CodeModeCompositionSummary>,
 }
 
@@ -71,14 +71,14 @@ impl ToolCallCorrelation {
     /// Bounded diagnostic-only composition projection for outer ActionAudit.
     /// The feature-off build deliberately exposes no new durable shape.
     pub(crate) fn code_mode_composition_audit_summary(&self) -> Option<serde_json::Value> {
-        #[cfg(feature = "experimental-code-mode")]
+        #[cfg(feature = "experimental-code-mode-e1")]
         {
             return self
                 .code_mode_composition
                 .as_ref()
                 .and_then(|summary| serde_json::to_value(summary).ok());
         }
-        #[cfg(not(feature = "experimental-code-mode"))]
+        #[cfg(not(feature = "experimental-code-mode-e1"))]
         {
             None
         }

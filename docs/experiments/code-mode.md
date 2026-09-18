@@ -17,17 +17,21 @@ The experiment is disabled by default.
 ```bash
 cargo check -p webcodex-code-mode
 cargo test -p webcodex-code-mode --features v8-runtime
+cargo check --features experimental-code-mode-e1 --all-targets
 cargo check --features experimental-code-mode --all-targets
 ```
 
-The root `experimental-code-mode` feature enables:
+The root `experimental-code-mode-e1` feature enables only the read-only E1 surface:
 
 - the optional `webcodex-code-mode` dependency;
 - `webcodex-code-mode/v8-runtime`;
-- `webcodex-tool-contracts/experimental-code-mode`;
-- `webcodex-tool-runtime-contracts/experimental-code-mode`.
+- `webcodex-tool-contracts/experimental-code-mode-e1`;
+- `webcodex-tool-runtime-contracts/experimental-code-mode-e1`;
+- model-visible `code_mode_exec`.
 
-Without that feature, `code_mode_exec`, `code_mode_exec_effectful`, and `code_mode_exec_mutating` are absent from the canonical `ToolDefinition`, `ToolSpec`, `ToolCall`, discovery, Adaptive Runtime, OpenAPI, and MCP surfaces. The default `webcodex-code-mode` crate contains only lightweight transport-neutral contracts and does not compile or link V8.
+The root `experimental-code-mode` feature depends on `experimental-code-mode-e1` and additionally enables the E2a/E2b `code_mode_exec_effectful` and `code_mode_exec_mutating` surfaces.
+
+Without either feature, all three Code Mode tools are absent from the canonical `ToolDefinition`, `ToolSpec`, `ToolCall`, discovery, Adaptive Runtime, OpenAPI, and MCP surfaces. With only `experimental-code-mode-e1`, the E2a/E2b tools remain absent. The default `webcodex-code-mode` crate contains only lightweight transport-neutral contracts and does not compile or link V8.
 
 ## Architecture
 
@@ -227,7 +231,7 @@ The current server-owned E1 limits are intentionally simple and bounded:
 
 The V8 runtime runs on its own OS thread. A Tokio timeout is not treated as proof that CPU-bound JavaScript stopped. At the deadline, the async driver calls `v8::IsolateHandle::terminate_execution()`, signals the runtime thread, joins it, and returns a bounded timeout failure. A regression test covers `while (true) {}`.
 
-E1 V8 execution is **Server-side**, not Runner-side. The process admits two simultaneously active Code Mode executions by default; `WEBCODEX_CODE_MODE_MAX_CONCURRENT_EXECUTIONS` may raise or lower this process-local limit within 1..64 for host-specific dogfood capacity. Waiting for a slot consumes the same wall-clock deadline. Nested Project observations still execute on the owning Runner through canonical ToolRuntime dispatch. Therefore dogfood requires a Server binary built with `--features experimental-code-mode`; existing compatible Runners do not need the feature or a protocol upgrade. Rebuilding a Runner from the same source commit is optional when exact source-alignment telemetry is desired.
+E1 V8 execution is **Server-side**, not Runner-side. The process admits two simultaneously active Code Mode executions by default; `WEBCODEX_CODE_MODE_MAX_CONCURRENT_EXECUTIONS` may raise or lower this process-local limit within 1..64 for host-specific dogfood capacity. Waiting for a slot consumes the same wall-clock deadline. Nested Project observations still execute on the owning Runner through canonical ToolRuntime dispatch. Therefore E1 dogfood requires a Server binary built with `--features experimental-code-mode-e1` (or the broader `experimental-code-mode` bundle); existing compatible Runners do not need the feature or a protocol upgrade. Rebuilding a Runner from the same source commit is optional when exact source-alignment telemetry is desired.
 
 ## Outer result
 

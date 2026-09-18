@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-code-mode"))]
 use tokio::sync::Semaphore;
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -33,9 +33,9 @@ use webcodex_tool_contracts::{
 #[derive(Debug)]
 pub(crate) struct OrchestrationMutationFenceRegistry {
     projects: Mutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-code-mode"))]
     acquire_attempted: Semaphore,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-code-mode"))]
     acquired: Semaphore,
 }
 
@@ -43,9 +43,9 @@ impl Default for OrchestrationMutationFenceRegistry {
     fn default() -> Self {
         Self {
             projects: Mutex::new(BTreeMap::new()),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-code-mode"))]
             acquire_attempted: Semaphore::new(0),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "experimental-code-mode"))]
             acquired: Semaphore::new(0),
         }
     }
@@ -69,20 +69,20 @@ impl OrchestrationMutationFenceRegistry {
 
     async fn acquire(&self, project: &str) -> OwnedMutexGuard<()> {
         let fence = self.fence(project);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "experimental-code-mode"))]
         self.acquire_attempted.add_permits(1);
         let guard = fence.lock_owned().await;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "experimental-code-mode"))]
         self.acquired.add_permits(1);
         guard
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-code-mode"))]
     pub(crate) async fn hold_project_for_test(&self, project: &str) -> OwnedMutexGuard<()> {
         self.fence(project).lock_owned().await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-code-mode"))]
     pub(crate) async fn wait_for_acquire_attempt_for_test(&self) {
         self.acquire_attempted
             .acquire()
@@ -91,7 +91,7 @@ impl OrchestrationMutationFenceRegistry {
             .forget();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-code-mode"))]
     pub(crate) async fn wait_for_acquired_for_test(&self) {
         self.acquired
             .acquire()
@@ -539,7 +539,7 @@ impl CanonicalOrchestrationHost {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "experimental-code-mode"))]
     pub(crate) async fn assert_scheduling_policy_fences_for_test(&self) {
         let first_parallel = self
             .acquire_scheduling_guard("read_files")

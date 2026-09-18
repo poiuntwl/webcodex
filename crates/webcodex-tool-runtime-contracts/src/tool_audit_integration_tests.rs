@@ -4,7 +4,7 @@ use crate::ToolCallAuditProjection;
 use serde_json::json;
 use webcodex_tool_contracts::{ObserveJobsWakeOn, ToolCall};
 
-#[cfg(feature = "experimental-code-mode")]
+#[cfg(feature = "experimental-code-mode-e1")]
 #[test]
 fn code_mode_exec_parses_outer_authority_and_omits_source_from_audit() {
     const PRIVATE_SOURCE: &str = "const secret = 'NEVER_PERSIST_CODE_MODE_SOURCE'; text(secret);";

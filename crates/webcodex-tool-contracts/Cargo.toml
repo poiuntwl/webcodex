@@ -6,7 +6,8 @@ edition.workspace = true
 
 [features]
 default = []
-experimental-code-mode = []
+experimental-code-mode-e1 = []
+experimental-code-mode = ["experimental-code-mode-e1"]
 root-test-support = []
 workspace-checkpoints = []
 
